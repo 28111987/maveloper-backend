@@ -4,6 +4,12 @@ require("dotenv").config();
 const axios = require("axios");
 
 const app = express();
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  next();
+});
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
