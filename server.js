@@ -11,73 +11,25 @@ app.use(express.json({ limit: "50mb" }));
 
 const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 
-const SYSTEM_PROMPT = `You will receive one or more images showing pages of an email design PDF. Your task is to generate production-ready HTML email code that visually matches the design exactly.
+const SYSTEM_PROMPT = `You are an expert email developer at Mavlers. You will receive one or more images showing pages of an email design PDF. Your task is to generate production-ready HTML email code that visually matches the design exactly.
 
 CRITICAL VISUAL FIDELITY RULES:
 1. Match the exact visual hierarchy, spacing, padding, and proportions shown in the images. Do not approximate or improve the design.
 2. Extract ALL visible text verbatim from the images. Do not paraphrase, summarize, or invent copy. Preserve capitalization, punctuation, and line breaks.
-3. Identify the column structure of each section (1-column, 2-column, 3-column) and use the em_ th-based stacking pattern from the framework.
-4. Identify all CTAs as bulletproof table-cell buttons per the framework, matching colors, padding, and corner radius from the design.
+3. Identify the column structure of each section (1-column, 2-column, 3-column) and use th-based stacking for responsive behavior.
+4. Identify all CTAs as bulletproof table-cell buttons, matching colors, padding, and corner radius from the design.
 5. Output only the final HTML — no markdown fences, no explanations, no commentary.
 
----const express = require("express");
-const cors = require("cors");
-require("dotenv").config();
-const axios = require("axios");
-
-const app = express();
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  next();
-});
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-
-app.post("/generate", async (req, res) => {
-  try {
-    const { pdfBase64, brandName } = req.body;
-
-    const response = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 4000,
-        messages: [
-          {
-            role: "user",
-            content: `Convert this PDF into email HTML. Brand: ${brandName}. PDF: ${pdfBase64}`
-          }
-        ]
-      },
-      {
-        headers: {
-          "x-api-key": process.env.CLAUDE_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json"
-        }
-      }
-    );
-
-    res.json({
-      html: response.data.content[0].text
-    });
-
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({
-  error: "Failed",
-  details: err.response?.data || err.message
-});
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
-});`;
+TECHNICAL FRAMEWORK (Mavlers standard):
+- DOCTYPE: XHTML 1.0 Transitional with VML/Office namespaces
+- Class naming: use em_ prefix (em_main_table, em_wrapper, em_body, em_hide, em_full_img, em_dark, em_mob_block, em_hauto)
+- Table widths: 600-700px max, table-layout: fixed
+- Responsive: th-based fluid-hybrid stacking, breakpoints at 599px and 667px
+- Outlook reset: capital-M Margin and capital-P Padding
+- Dark mode: prefers-color-scheme meta tag plus class overrides (em_dark, em_dm_txt_white)
+- CTAs: bulletproof table-cell with bgcolor and border-radius, VML fallback for Outlook
+- Use role="presentation" on all layout tables
+- Inline all CSS for maximum client compatibility`;
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
