@@ -44,7 +44,10 @@ app.post("/generate", async (req, res) => {
 
   } catch (err) {
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Failed" });
+    res.status(500).json({
+  error: "Failed",
+  details: err.response?.data || err.message
+});
   }
 });
 
