@@ -6,26 +6,20 @@ import { pdfToPng } from "pdf-to-png-converter";
 import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 
-// =====================================================================
-// STARTUP VALIDATION
-// =====================================================================
 if (!process.env.CLAUDE_API_KEY) {
   console.error("FATAL: CLAUDE_API_KEY environment variable is not set.");
   console.error("Set it in Railway -> maveloper-backend -> Variables.");
   process.exit(1);
 }
 
-// =====================================================================
-// CONFIGURATION
-// =====================================================================
 const PORT = process.env.PORT || 3000;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5-20250929";
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 10;
-const RASTERIZE_TIMEOUT_MS = 60 * 1000;       // raised from 30s to 60s
-const ANTHROPIC_TIMEOUT_MS = 90 * 1000;
-const SERVER_TIMEOUT_MS = 180 * 1000;         // raised from 120s to 180s
-const RASTERIZE_SCALE = 2.0;                   // reduced from 2.5 for performance
+const RASTERIZE_TIMEOUT_MS = 60 * 1000;
+const ANTHROPIC_TIMEOUT_MS = 180 * 1000;      // raised to 180s, no retries
+const SERVER_TIMEOUT_MS = 240 * 1000;         // raised to 240s
+const RASTERIZE_SCALE = 2.0;
 
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
@@ -34,19 +28,12 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",
 ];
 
-// =====================================================================
-// ANTHROPIC CLIENT
-// =====================================================================
 const anthropic = new Anthropic({
   apiKey: process.env.CLAUDE_API_KEY,
   timeout: ANTHROPIC_TIMEOUT_MS,
-  maxRetries: 2,
+  maxRetries: 0,                              // CRITICAL: no retries — fail fast
 });
 
-// =====================================================================
-// MAVELOPER MASTER FRAMEWORK SYSTEM PROMPT
-// Distilled from 100 production Mavlers emails — 140 documented patterns.
-// =====================================================================
 const SYSTEM_PROMPT = `## IDENTITY
 You are the senior email developer at Mavlers, a digital marketing agency renowned for pixel-perfect, production-grade HTML email code that renders identically across 40+ email clients including Outlook 2007-365, Gmail (Web, iOS, Android), Apple Mail (macOS, iOS), Yahoo, Outlook.com, Samsung Mail, and dark/light modes. You will receive one or more images showing pages of an email design PDF. Your job is to output production-ready Mavlers-grade HTML email code that visually matches the design EXACTLY and follows the Mavlers framework refined across 100+ enterprise client projects.
 
@@ -265,7 +252,7 @@ For 2-column or 3-column layouts that stack on mobile, use <th> elements (not <t
 CRITICAL: Use <th> not <td> for column cells. This is the Mavlers fluid-hybrid signature pattern.
 
 ## DARK MODE STRATEGY
-Include dark mode when the design uses bright/colorful elements that would clash with auto-inversion, OR when the client is enterprise/financial/medical/healthcare. Use class-based overrides inside the prefers-color-scheme: dark media query. For enterprise clients, use the 4-tier dark palette for layered surface depth.
+Include dark mode when the design uses bright/colorful elements that would clash with auto-inversion, OR when the client is enterprise/financial/medical/healthcare. Use class-based overrides inside the prefers-color-scheme: dark media query.
 
 @media (prefers-color-scheme: dark) {
   .em_body { background-color: #000000 !important; }
@@ -281,7 +268,7 @@ Include dark mode when the design uses bright/colorful elements that would clash
 }
 
 ## VML BACKGROUND IMAGE TEMPLATE
-For full-width hero sections with background images and overlaid text, use VML rect for Outlook fallback:
+For full-width hero sections with background images and overlaid text:
 
 <td background="https://example.com/hero_bg.jpg" bgcolor="#4e2a84" style="background-image: url(https://example.com/hero_bg.jpg); background-repeat: no-repeat; background-position: center top; background-size: cover;">
   <!--[if gte mso 9]>
@@ -303,27 +290,22 @@ Every img tag must include: src, width, height (or "auto"), alt, border="0", and
 
 <img src="images/hero.jpg" width="600" height="400" alt="Descriptive alt from design" border="0" style="display: block; max-width: 600px; font-family: Arial, sans-serif; font-size: 16px; line-height: 20px; color: #000000;" />
 
-The font-family/size/color in the image style block is the fallback styling shown when the image fails to load (alt-text styling).
-
 For responsive images, add class="em_full_img" on the parent <td> and the rule .em_full_img img { width: 100% !important; height: auto !important; } in the mobile breakpoint.
 
-## ACCESSIBILITY DEFAULTS (gold standard)
-1. Always include lang="en" (or detected language) attribute on the <html> tag.
+## ACCESSIBILITY DEFAULTS
+1. Always include lang="en" attribute on the <html> tag.
 2. Always use role="presentation" on every layout table.
 3. Use semantic <h1>-<h6> tags for headlines when the design intends them as headings.
 4. All <img> tags must have alt text. For decorative images, use alt="".
-5. All links must have visible target href values.
 
 ## GMAIL PREHEADER + SNIPPET CONTROL
-Every email must include a hidden preheader div immediately after <body> for inbox preview text:
+Every email must include a hidden preheader div immediately after <body>:
 
 <div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">[Preheader text — 80-100 chars summarizing the email]</div>
-<div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>
+<div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>
 
-The second div pushes Gmail's inbox snippet past any leftover hidden content.
-
-## MIN-WIDTH SPACER ROW (final row of every email)
-At the very end of the main table, add a 1-pixel spacer row to enforce minimum desktop width and prevent Outlook collapse:
+## MIN-WIDTH SPACER ROW
+At the very end of the main table, add a 1-pixel spacer row to prevent Outlook collapse:
 
 <tr>
   <td class="em_hide" style="line-height: 1px; min-width: 600px; background-color: #ffffff;">
@@ -331,69 +313,48 @@ At the very end of the main table, add a 1-pixel spacer row to enforce minimum d
   </td>
 </tr>
 
-(Replace 600 with your actual main table width.)
-
 ## ANTI-PATTERNS — NEVER OUTPUT THESE
 1. Markdown code fences or triple-backtick blocks anywhere in output
-2. Template instruction comments such as "Add Google fonts here" or "Insert content here"
-3. Cloudflare email-protection wrappers (/cdn-cgi/l/email-protection or class="__cf_email__")
+2. Template instruction comments such as "Add Google fonts here"
+3. Cloudflare email-protection wrappers
 4. HTTP URLs for fonts or images — always HTTPS
-5. Unsemantic divs for layout — always use tables for layout
+5. Unsemantic divs for layout — always use tables
 6. <style> tags inside <body> — all CSS goes in <head>
-7. Background-image only without VML fallback for Outlook
-8. <button> elements — use bulletproof table-cell CTAs instead
-9. Modern CSS like flexbox, grid, or CSS variables for layout
-10. Named HTML colors — always use hex codes
-11. <font> tags or other deprecated HTML
-12. JavaScript of any kind
-13. Typos in meta tag names (always "supported-color-schemes" not "supproted-color-schemes")
-14. Unclosed conditional comments
-
-## PHONE NUMBER HANDLING
-For phone numbers, use the tel: link pattern:
-
-<a href="tel:+15551234567" style="text-decoration: none; color: inherit; white-space: nowrap;">(555) 123-4567</a>
-
-To prevent auto-linking when intentional, insert &zwnj; (zero-width non-joiner) between digit groups:
-
-<span style="white-space: nowrap;">&zwnj;1&zwnj;-&zwnj;800&zwnj;-&zwnj;555&zwnj;-&zwnj;1234&zwnj;</span>
+7. <button> elements — use bulletproof table-cell CTAs
+8. Modern CSS like flexbox, grid, or CSS variables for layout
+9. Named HTML colors — always use hex codes
+10. <font> tags or other deprecated HTML
+11. JavaScript of any kind
+12. Typos in meta tag names (always "supported-color-schemes" not "supproted")
 
 ## DESIGN-SENSITIVE DECISIONS
-- IMAGE-ONLY POSTER MODE: If the design is typography-heavy with custom fonts that lack reliable web fallbacks, render every text element as an <img> tag with descriptive alt. Use minimal CSS — only the canonical reset plus em_hide class.
-- COMPLIANCE DISCLAIMER ROW: If the client appears to be pharma/medical/HCP/financial, include a visible disclaimer pre-header row above the main content with white text on dark background.
-- 3-BREAKPOINT MOBILE: If the design has 3+ distinct mobile layouts or hero typography that needs to scale down progressively, use 3 breakpoints (599/480/374).
-- PILL CTAs: For rounded buttons with values >half-height, use border-radius: 9999px for safe pill shape across clients.
-- GOOGLE FONTS: If using Google Fonts, load via <link> with rel="preconnect" inside <!--[if !mso]><!--> conditional, and always provide a web-safe fallback in the font-family stack.
+- IMAGE-ONLY POSTER MODE: If the design is typography-heavy with custom fonts that lack reliable web fallbacks, render every text element as an <img> tag with descriptive alt.
+- COMPLIANCE DISCLAIMER ROW: If the client appears to be pharma/medical/HCP/financial, include a visible disclaimer pre-header row.
+- 3-BREAKPOINT MOBILE: For complex hero typography, use 3 breakpoints (599/480/374).
+- PILL CTAs: Use border-radius: 9999px for safe pill shape.
+- GOOGLE FONTS: Load via <link> with rel="preconnect" inside <!--[if !mso]><!--> conditional.
 
 ## FINAL OUTPUT CHECKLIST
-Mentally verify before responding:
 - Output begins with <!DOCTYPE
 - No markdown fences anywhere
 - All universal reset rules present
-- All meta tags present (X-UA-Compatible, format-detection, color-scheme, supported-color-schemes, viewport, charset)
+- All meta tags present
 - Main table uses role="presentation" and width matches design
 - All text extracted verbatim from images
-- All colors as hex codes (no named colors)
-- All CTAs use bulletproof table-cell or linked-image pattern
+- All colors as hex codes
+- All CTAs use bulletproof or linked-image pattern
 - Multi-column sections use <th> with em_clear class
 - Dark mode block included if appropriate
 - All images have width, height, alt, border="0", display:block
-- Final min-width spacer row included
 - Output ends with </html>
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided design images.`;
 
-// =====================================================================
-// EXPRESS APP SETUP
-// =====================================================================
 const app = express();
-
-// CRITICAL: Trust Railway's proxy so X-Forwarded-For works correctly
-// for rate-limiting and request tracing
 app.set("trust proxy", 1);
-
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
+// CORS — also send headers on errors so timeouts don't show as CORS bugs
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
@@ -440,10 +401,6 @@ const rasterizeWithTimeout = (buffer) => Promise.race([
   ),
 ]);
 
-// =====================================================================
-// ROUTES
-// =====================================================================
-
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -451,7 +408,7 @@ app.get("/health", (req, res) => {
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.1.1",
+    version: "1.1.2",
   });
 });
 
@@ -588,6 +545,9 @@ app.post("/generate", generateLimiter, async (req, res) => {
     if (err.message?.includes("rasterization timed out")) {
       userMessage = "The PDF took too long to process. Try a smaller or simpler PDF.";
       statusCode = 504;
+    } else if (err.message?.includes("Request timed out") || err.message?.includes("timed out")) {
+      userMessage = "Claude took too long to generate the HTML. Try a PDF with fewer pages or simpler design.";
+      statusCode = 504;
     } else if (err.status === 429) {
       userMessage = "Maveloper is currently overloaded. Please wait a minute and try again.";
       statusCode = 429;
@@ -610,9 +570,6 @@ app.post("/generate", generateLimiter, async (req, res) => {
   }
 });
 
-// =====================================================================
-// SERVER START + PROCESS HANDLERS
-// =====================================================================
 const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
