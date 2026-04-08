@@ -22,9 +22,10 @@ const PORT = process.env.PORT || 3000;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5-20250929";
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 10;
-const RASTERIZE_TIMEOUT_MS = 30 * 1000;
+const RASTERIZE_TIMEOUT_MS = 60 * 1000;       // raised from 30s to 60s
 const ANTHROPIC_TIMEOUT_MS = 90 * 1000;
-const SERVER_TIMEOUT_MS = 120 * 1000;
+const SERVER_TIMEOUT_MS = 180 * 1000;         // raised from 120s to 180s
+const RASTERIZE_SCALE = 2.0;                   // reduced from 2.5 for performance
 
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
@@ -317,7 +318,7 @@ For responsive images, add class="em_full_img" on the parent <td> and the rule .
 Every email must include a hidden preheader div immediately after <body> for inbox preview text:
 
 <div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">[Preheader text — 80-100 chars summarizing the email]</div>
-<div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>
+<div style="display: none; max-height: 0px; overflow: hidden; mso-hide: all;">&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>
 
 The second div pushes Gmail's inbox snippet past any leftover hidden content.
 
@@ -387,6 +388,10 @@ Generate the most accurate, production-ready, Mavlers-grade HTML email code poss
 // =====================================================================
 const app = express();
 
+// CRITICAL: Trust Railway's proxy so X-Forwarded-For works correctly
+// for rate-limiting and request tracing
+app.set("trust proxy", 1);
+
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
 app.use(cors({
@@ -423,13 +428,13 @@ const generateLimiter = rateLimit({
 
 const rasterizeWithTimeout = (buffer) => Promise.race([
   pdfToPng(buffer, {
-    viewportScale: 2.5,
+    viewportScale: RASTERIZE_SCALE,
     disableFontFace: false,
     useSystemFonts: false,
   }),
   new Promise((_, reject) =>
     setTimeout(
-      () => reject(new Error("PDF rasterization timed out after 30s")),
+      () => reject(new Error(`PDF rasterization timed out after ${RASTERIZE_TIMEOUT_MS / 1000}s`)),
       RASTERIZE_TIMEOUT_MS
     )
   ),
@@ -446,7 +451,7 @@ app.get("/health", (req, res) => {
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.1.0",
+    version: "1.1.1",
   });
 });
 
@@ -486,6 +491,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Rasterizing PDF", {
       requestId: req.id,
       sizeKB: Math.round(pdfBuffer.length / 1024),
+      scale: RASTERIZE_SCALE,
     });
 
     const pngPages = await rasterizeWithTimeout(pdfBuffer);
@@ -501,6 +507,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Sending to Claude", {
       requestId: req.id,
       pageCount: pngPages.length,
+      rasterizeMs: Date.now() - startTime,
     });
 
     const imageBlocks = pngPages.map((page) => ({
@@ -610,6 +617,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
+    rasterizeScale: RASTERIZE_SCALE,
   });
 });
 
