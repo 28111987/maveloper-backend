@@ -13,13 +13,13 @@ if (!process.env.CLAUDE_API_KEY) {
 }
 
 const PORT = process.env.PORT || 3000;
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5-20250929";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
 const ANTHROPIC_TIMEOUT_MS = 180 * 1000;      // raised to 180s, no retries
 const SERVER_TIMEOUT_MS = 240 * 1000;         // raised to 240s
-const RASTERIZE_SCALE = 2.0;
+const RASTERIZE_SCALE = 1.6;
 
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
@@ -408,7 +408,7 @@ app.get("/health", (req, res) => {
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.1.2",
+    version: "1.1.3",
   });
 });
 
@@ -478,7 +478,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 16000,
+      max_tokens: 8000,
       system: SYSTEM_PROMPT,
       messages: [
         {
