@@ -6,19 +6,25 @@ import { pdfToPng } from "pdf-to-png-converter";
 import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 
+// =====================================================================
+// STARTUP VALIDATION
+// =====================================================================
 if (!process.env.CLAUDE_API_KEY) {
   console.error("FATAL: CLAUDE_API_KEY environment variable is not set.");
   console.error("Set it in Railway -> maveloper-backend -> Variables.");
   process.exit(1);
 }
 
+// =====================================================================
+// CONFIGURATION
+// =====================================================================
 const PORT = process.env.PORT || 3000;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
-const ANTHROPIC_TIMEOUT_MS = 180 * 1000;      // raised to 180s, no retries
-const SERVER_TIMEOUT_MS = 240 * 1000;         // raised to 240s
+const ANTHROPIC_TIMEOUT_MS = 180 * 1000;
+const SERVER_TIMEOUT_MS = 240 * 1000;
 const RASTERIZE_SCALE = 1.6;
 
 const ALLOWED_ORIGINS = [
@@ -28,12 +34,19 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",
 ];
 
+// =====================================================================
+// ANTHROPIC CLIENT
+// =====================================================================
 const anthropic = new Anthropic({
   apiKey: process.env.CLAUDE_API_KEY,
   timeout: ANTHROPIC_TIMEOUT_MS,
-  maxRetries: 0,                              // CRITICAL: no retries — fail fast
+  maxRetries: 0,
 });
 
+// =====================================================================
+// MAVELOPER MASTER FRAMEWORK SYSTEM PROMPT
+// Distilled from 100 production Mavlers emails — 140 documented patterns.
+// =====================================================================
 const SYSTEM_PROMPT = `## IDENTITY
 You are the senior email developer at Mavlers, a digital marketing agency renowned for pixel-perfect, production-grade HTML email code that renders identically across 40+ email clients including Outlook 2007-365, Gmail (Web, iOS, Android), Apple Mail (macOS, iOS), Yahoo, Outlook.com, Samsung Mail, and dark/light modes. You will receive one or more images showing pages of an email design PDF. Your job is to output production-ready Mavlers-grade HTML email code that visually matches the design EXACTLY and follows the Mavlers framework refined across 100+ enterprise client projects.
 
@@ -350,11 +363,14 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided design images.`;
 
+// =====================================================================
+// EXPRESS APP SETUP
+// =====================================================================
 const app = express();
+
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
-// CORS — also send headers on errors so timeouts don't show as CORS bugs
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
@@ -400,6 +416,10 @@ const rasterizeWithTimeout = (buffer) => Promise.race([
     )
   ),
 ]);
+
+// =====================================================================
+// ROUTES
+// =====================================================================
 
 app.get("/health", (req, res) => {
   res.json({
@@ -570,6 +590,9 @@ app.post("/generate", generateLimiter, async (req, res) => {
   }
 });
 
+// =====================================================================
+// SERVER START + PROCESS HANDLERS
+// =====================================================================
 const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
@@ -605,5 +628,3 @@ const shutdown = (signal) => {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
-
