@@ -120,9 +120,22 @@ async function uploadToDropbox(filePath, fileBuffer) {
   }
 
   // Convert to direct-access URL
-  const directUrl = sharedUrl.replace("www.dropbox.com", "dl.dropboxusercontent.com").replace("?dl=0", "");
+  // Modern Dropbox shared links: https://www.dropbox.com/scl/fi/HASH/filename.jpg?rlkey=KEY&st=TOKEN&dl=0
+  // Direct access: replace dl=0 with dl=1 (or raw=1) and swap domain
+  let directUrl = sharedUrl;
+  
+  // Method 1: Replace dl=0 with raw=1 (keeps all other params intact)
+  if (directUrl.includes("dl=0")) {
+    directUrl = directUrl.replace("dl=0", "raw=1");
+  } else {
+    // If no dl param, append raw=1
+    directUrl += (directUrl.includes("?") ? "&" : "?") + "raw=1";
+  }
+  
+  // Swap to direct download domain
+  directUrl = directUrl.replace("www.dropbox.com", "dl.dropboxusercontent.com");
 
-  return { dropboxPath: uploadResult.result.path_display, directUrl };
+  return { dropboxPath: uploadResult.result.path_display, directUrl, sharedUrl };
 }
 
 /**
@@ -142,7 +155,8 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
     const results = await Promise.all(
       batch.map(async (img) => {
         const dropboxFilePath = `${folderPath}/images/${img.filename}`;
-        const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
+        const { directUrl, sharedUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
+        logFn("info", `Dropbox URL for ${img.filename}`, { sharedUrl, directUrl });
         return { filename: img.filename, directUrl };
       })
     );
@@ -879,7 +893,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.3",
+    version: "1.3.4",
   });
 });
 
@@ -1343,7 +1357,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.3",
+    version: "1.3.4",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
