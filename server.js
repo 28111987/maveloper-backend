@@ -879,7 +879,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.1",
+    version: "1.3.3",
   });
 });
 
@@ -1165,6 +1165,32 @@ app.post("/generate", generateLimiter, async (req, res) => {
       htmlLength: html.length,
     });
 
+    // --- Step 7: Ensure imageUrlMap is populated ---
+    // Fallback: if imageUrlMap is empty but the HTML contains Dropbox URLs, extract them
+    if (Object.keys(imageUrlMap).length === 0 && html.includes("dl.dropboxusercontent.com")) {
+      log("warn", "imageUrlMap was empty but HTML contains Dropbox URLs — extracting from HTML", { requestId: req.id });
+      const urlRegex = /https:\/\/dl\.dropboxusercontent\.com\/[^\s"'<>]+/g;
+      const foundUrls = html.match(urlRegex) || [];
+      for (const url of foundUrls) {
+        // Extract filename from the URL path
+        const urlPath = new URL(url).pathname;
+        const filename = path.basename(urlPath);
+        if (filename && !imageUrlMap[filename]) {
+          imageUrlMap[filename] = url;
+        }
+      }
+      log("info", "Extracted imageUrlMap from HTML", {
+        requestId: req.id,
+        recoveredCount: Object.keys(imageUrlMap).length,
+      });
+    }
+
+    log("info", "Sending response to frontend", {
+      requestId: req.id,
+      imageUrlMapKeys: Object.keys(imageUrlMap),
+      imageUrlMapSize: Object.keys(imageUrlMap).length,
+    });
+
     // --- Return response for preview ---
     res.json({
       html,
@@ -1246,28 +1272,26 @@ app.post("/approve", generateLimiter, async (req, res) => {
     }
 
     if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
-      return res.status(400).json({
-        error: "No images available",
-        details: "Cannot build ZIP without image data. Please regenerate first.",
-        requestId: req.id,
-      });
+      log("warn", "No imageUrlMap provided to /approve — building ZIP with HTML only", { requestId: req.id, orderId });
     }
 
     log("info", "Building delivery ZIP", { requestId: req.id, orderId });
 
     // Download images from Dropbox URLs to include in ZIP
     const images = [];
-    for (const [filename, url] of Object.entries(imageUrlMap)) {
-      try {
-        const response = await fetch(url);
-        if (response.ok) {
-          const arrayBuffer = await response.arrayBuffer();
-          images.push({ filename, buffer: Buffer.from(arrayBuffer) });
-        } else {
-          log("warn", `Failed to download image: ${filename}`, { requestId: req.id, status: response.status });
+    if (imageUrlMap && Object.keys(imageUrlMap).length > 0) {
+      for (const [filename, url] of Object.entries(imageUrlMap)) {
+        try {
+          const response = await fetch(url);
+          if (response.ok) {
+            const arrayBuffer = await response.arrayBuffer();
+            images.push({ filename, buffer: Buffer.from(arrayBuffer) });
+          } else {
+            log("warn", `Failed to download image: ${filename}`, { requestId: req.id, status: response.status });
+          }
+        } catch (dlErr) {
+          log("warn", `Failed to download image: ${filename}`, { requestId: req.id, error: dlErr.message });
         }
-      } catch (dlErr) {
-        log("warn", `Failed to download image: ${filename}`, { requestId: req.id, error: dlErr.message });
       }
     }
 
@@ -1319,7 +1343,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.1",
+    version: "1.3.3",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
