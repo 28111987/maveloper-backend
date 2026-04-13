@@ -648,15 +648,17 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 - PILL CTAs: Use border-radius: 9999px for safe pill shape.
 - GOOGLE FONTS: Load via <link> with rel="preconnect" inside <!--[if !mso]><!--> conditional.
 
-## IMAGE URL HANDLING (when image map is provided in user message)
-The user may provide a list of available image URLs in the format:
-"Available images: filename.jpg → https://..."
-When this list is present:
-1. Use ONLY these exact URLs in the output HTML for ALL img src attributes.
-2. Match each image in the design to the most appropriate filename based on visible context, position, and content.
-3. If an image in the design has no matching file in the provided list, use a descriptive alt text and set src to a 1x1 transparent placeholder.
-4. NEVER fabricate image URLs — only use URLs from the provided list.
-5. NEVER use relative paths like "images/hero.jpg" when a URL map is provided — always use the full Dropbox URL.
+## IMAGE URL HANDLING (when image assets are provided)
+You will receive the PDF design pages FOLLOWED BY individual image asset files. You can SEE both the design and each individual image.
+When image assets and their URLs are provided:
+1. VISUALLY MATCH each image asset to its correct position in the design by comparing what the image depicts (logo, person photo, banner, icon, product shot) to where that visual appears in the PDF.
+2. Use ONLY the provided Dropbox URLs in the output HTML for ALL img src attributes.
+3. A small rectangular image showing a logo MUST go in the logo position — not in the hero banner.
+4. A photograph of a person MUST go where that person appears in the design — not in unrelated sections.
+5. A wide/tall decorative or hero image MUST go in the corresponding hero/banner area.
+6. If an image in the design has no matching asset, use a descriptive alt text and set src to a 1x1 transparent placeholder.
+7. NEVER fabricate image URLs — only use URLs from the provided list.
+8. NEVER use relative paths like "images/hero.jpg" when URLs are provided — always use the full Dropbox URL.
 
 ## FINAL OUTPUT CHECKLIST
 - Output begins with <!DOCTYPE
@@ -670,7 +672,7 @@ When this list is present:
 - Multi-column sections use <th> with em_clear class
 - Dark mode block included if appropriate
 - All images have width, height, alt, border="0", display:block
-- If image URL map was provided, all img src use the provided URLs
+- If image assets were provided, all img src use the provided URLs matched by VISUAL CONTENT
 - Output ends with </html>
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided design images.`;
@@ -742,7 +744,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.0",
+    version: "1.2.1",
   });
 });
 
@@ -872,8 +874,8 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     }
 
-    // --- Step 4: Build prompt with image map ---
-    const imageBlocks = pngPages.map((page) => ({
+    // --- Step 4: Build prompt with image map + visual image blocks ---
+    const pdfImageBlocks = pngPages.map((page) => ({
       type: "image",
       source: {
         type: "base64",
@@ -882,20 +884,72 @@ app.post("/generate", generateLimiter, async (req, res) => {
       },
     }));
 
-    let userPrompt = "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.";
+    // Build content array: PDF pages first, then extracted images with labels, then text prompt
+    const contentBlocks = [
+      ...pdfImageBlocks,
+      { type: "text", text: "--- The above images show the email design PDF pages. Below are the individual image assets extracted/uploaded for this email. Study each one carefully to understand what it depicts (logo, photo, icon, banner, etc.) before matching them to the design. ---" },
+    ];
+
+    // Add each extracted image as a visual block so Claude can SEE them and match accurately
+    if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
+      // Get dimensions for each image using Sharp
+      const imageMeta = await Promise.all(
+        images.map(async (img) => {
+          try {
+            const metadata = await sharp(img.buffer).metadata();
+            return { filename: img.filename, width: metadata.width, height: metadata.height };
+          } catch {
+            return { filename: img.filename, width: "unknown", height: "unknown" };
+          }
+        })
+      );
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const meta = imageMeta[i];
+        const url = imageUrlMap[img.filename];
+
+        // Determine media type from extension
+        const ext = path.extname(img.filename).toLowerCase();
+        const mediaTypeMap = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
+        const mediaType = mediaTypeMap[ext] || "image/jpeg";
+
+        // Add a label before each image
+        contentBlocks.push({
+          type: "text",
+          text: `Image asset ${i + 1}: "${img.filename}" (${meta.width}×${meta.height}px) → URL: ${url}`,
+        });
+
+        // Add the actual image so Claude can see it
+        contentBlocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mediaType,
+            data: img.buffer.toString("base64"),
+          },
+        });
+      }
+    }
+
+    // Build the final text prompt
+    let userPrompt = "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the PDF page images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.";
 
     if (Object.keys(imageUrlMap).length > 0) {
       const imageListStr = Object.entries(imageUrlMap)
         .map(([filename, url]) => `${filename} → ${url}`)
         .join("\n");
 
-      userPrompt += `\n\nAvailable images (USE THESE EXACT URLs for all img src attributes):\n${imageListStr}\n\nIMPORTANT: Use the above Dropbox URLs as the src for every image in the HTML. Match each image to the appropriate design element by filename. Do NOT use relative paths — use the full URLs provided above.`;
+      userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have been shown the PDF design AND each individual image asset above. You can SEE what each image looks like. Match each image to the correct position in the email design by comparing what the image shows (photo of a person, logo, icon, banner, etc.) to where that visual appears in the PDF design.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by their VISUAL CONTENT — look at what each image depicts and place it where that visual appears in the PDF design.\n2. A small image with a logo should go in the logo position, not the hero banner.\n3. A photo of a person should go in the section where that person's photo appears in the design.\n4. A wide banner/hero image should go at the top hero section.\n5. Use the full Dropbox URL for every img src — NEVER use relative paths.\n6. If an image cannot be matched to any design element, do not use it.`;
     }
+
+    contentBlocks.push({ type: "text", text: userPrompt });
 
     // --- Step 5: Send to Claude ---
     log("info", "Sending to Claude", {
       requestId: req.id,
       pageCount: pngPages.length,
+      extractedImageCount: images.length,
       imageUrlCount: Object.keys(imageUrlMap).length,
       rasterizeMs: Date.now() - startTime,
     });
@@ -907,10 +961,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       messages: [
         {
           role: "user",
-          content: [
-            ...imageBlocks,
-            { type: "text", text: userPrompt },
-          ],
+          content: contentBlocks,
         },
       ],
     });
@@ -1105,7 +1156,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.0",
+    version: "1.2.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
