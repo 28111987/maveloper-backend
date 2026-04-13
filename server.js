@@ -181,11 +181,12 @@ async function uploadZipToDropbox(orderId, zipBuffer, logFn) {
 
 /**
  * Attempt to extract embedded raster images from a PDF buffer.
- * This uses a heuristic approach — scanning for JPEG and PNG markers in the PDF stream.
+ * Uses heuristic byte-marker scanning, then validates each image with Sharp
+ * to filter out screenshots, PDF artifacts, and non-email-asset images.
  * Returns array of { filename, buffer } or empty array if extraction fails.
  */
-function extractImagesFromPdf(pdfBuffer) {
-  const images = [];
+async function extractImagesFromPdf(pdfBuffer) {
+  const rawImages = [];
   let imgIndex = 0;
 
   // --- JPEG extraction ---
@@ -210,7 +211,7 @@ function extractImagesFromPdf(pdfBuffer) {
     if (jpegLen > 2048) {
       imgIndex++;
       const imgBuffer = pdfBuffer.subarray(soiPos, jpegEnd);
-      images.push({
+      rawImages.push({
         filename: `img-${String(imgIndex).padStart(2, "0")}.jpg`,
         buffer: Buffer.from(imgBuffer),
       });
@@ -240,7 +241,7 @@ function extractImagesFromPdf(pdfBuffer) {
     if (pngLen > 2048) {
       imgIndex++;
       const imgBuffer = pdfBuffer.subarray(sigPos, pngEnd);
-      images.push({
+      rawImages.push({
         filename: `img-${String(imgIndex).padStart(2, "0")}.png`,
         buffer: Buffer.from(imgBuffer),
       });
@@ -249,7 +250,60 @@ function extractImagesFromPdf(pdfBuffer) {
     searchStart = pngEnd;
   }
 
-  return images;
+  // --- Validate each extracted image using Sharp ---
+  const validatedImages = [];
+  const MAX_EMAIL_IMAGE_WIDTH = 1200;   // Email images are never wider than ~1200px
+  const MAX_EMAIL_IMAGE_HEIGHT = 2000;  // Email images are rarely taller than 2000px
+  const MIN_IMAGE_SIZE = 5 * 1024;      // Skip images under 5KB (icons/spacers extracted as noise)
+  // Common screenshot aspect ratios to reject (16:10, 16:9, and close variants)
+  const SCREENSHOT_RATIOS = [
+    { ratio: 16 / 10, tolerance: 0.05 },  // 1440x900, 1280x800
+    { ratio: 16 / 9, tolerance: 0.05 },   // 1920x1080, 1366x768
+    { ratio: 4 / 3, tolerance: 0.05 },    // 1024x768 (if >1000px wide, likely screenshot)
+  ];
+
+  for (const img of rawImages) {
+    try {
+      const metadata = await sharp(img.buffer).metadata();
+      const { width, height, size } = metadata;
+
+      if (!width || !height) continue;
+
+      // Filter 1: Skip images smaller than 5KB (noise, spacers, artifacts)
+      if (img.buffer.length < MIN_IMAGE_SIZE) continue;
+
+      // Filter 2: Skip images wider than 1200px (screenshots, full-page captures)
+      if (width > MAX_EMAIL_IMAGE_WIDTH) continue;
+
+      // Filter 3: Skip images taller than 2000px (full-page screenshots)
+      if (height > MAX_EMAIL_IMAGE_HEIGHT) continue;
+
+      // Filter 4: Skip images with screenshot-like dimensions
+      // Screenshots are typically >900px wide AND match common screen ratios
+      if (width > 900) {
+        const aspectRatio = width / height;
+        const isScreenshotRatio = SCREENSHOT_RATIOS.some(
+          (sr) => Math.abs(aspectRatio - sr.ratio) < sr.tolerance
+        );
+        if (isScreenshotRatio) continue;
+      }
+
+      // Filter 5: Skip very large file sizes (>500KB) combined with large dimensions
+      // These are usually high-res screenshots or full-page captures
+      if (img.buffer.length > 500 * 1024 && width > 800 && height > 600) continue;
+
+      validatedImages.push(img);
+    } catch {
+      // If Sharp can't read the image, skip it (corrupted or not a real image)
+      continue;
+    }
+  }
+
+  // Re-number the validated images sequentially
+  return validatedImages.map((img, idx) => ({
+    filename: `img-${String(idx + 1).padStart(2, "0")}${path.extname(img.filename)}`,
+    buffer: img.buffer,
+  }));
 }
 
 /**
@@ -744,7 +798,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.2",
+    version: "1.2.3",
   });
 });
 
@@ -847,7 +901,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     } else {
       // Attempt auto-extraction from PDF
-      images = extractImagesFromPdf(pdfBuffer);
+      images = await extractImagesFromPdf(pdfBuffer);
       imageSource = images.length > 0 ? "pdf-auto" : "none";
       log("info", "PDF image extraction result", {
         requestId: req.id,
@@ -1156,7 +1210,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.2",
+    version: "1.2.3",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
