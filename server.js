@@ -744,7 +744,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.1",
+    version: "1.2.2",
   });
 });
 
@@ -956,7 +956,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 8000,
+      max_tokens: 16000,
       system: SYSTEM_PROMPT,
       messages: [
         {
@@ -1156,7 +1156,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.1",
+    version: "1.2.2",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
