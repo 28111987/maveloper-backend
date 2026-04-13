@@ -5,6 +5,9 @@ import rateLimit from "express-rate-limit";
 import { pdfToPng } from "pdf-to-png-converter";
 import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
+import AdmZip from "adm-zip";
+import { Dropbox } from "dropbox";
+import path from "path";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -15,17 +18,30 @@ if (!process.env.CLAUDE_API_KEY) {
   process.exit(1);
 }
 
+const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
+const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
+const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
+
+const dropboxConfigured = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET && DROPBOX_REFRESH_TOKEN);
+
+if (!dropboxConfigured) {
+  console.warn("WARNING: Dropbox credentials not fully configured. Image upload and ZIP delivery will be disabled.");
+  console.warn("Set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN in Railway Variables.");
+}
+
 // =====================================================================
 // CONFIGURATION
 // =====================================================================
 const PORT = process.env.PORT || 3000;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
-const MAX_PDF_BYTES = 5 * 1024 * 1024;
+const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
+const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
 const ANTHROPIC_TIMEOUT_MS = 180 * 1000;
 const SERVER_TIMEOUT_MS = 240 * 1000;
 const RASTERIZE_SCALE = 1.6;
+const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
@@ -42,6 +58,291 @@ const anthropic = new Anthropic({
   timeout: ANTHROPIC_TIMEOUT_MS,
   maxRetries: 0,
 });
+
+// =====================================================================
+// DROPBOX CLIENT
+// =====================================================================
+let dbx = null;
+if (dropboxConfigured) {
+  dbx = new Dropbox({
+    clientId: DROPBOX_APP_KEY,
+    clientSecret: DROPBOX_APP_SECRET,
+    refreshToken: DROPBOX_REFRESH_TOKEN,
+  });
+}
+
+// =====================================================================
+// DROPBOX HELPERS
+// =====================================================================
+
+/**
+ * Get the Dropbox folder path for an order.
+ * Format: /maveloper/MM-YYYY/ORDER_ID
+ */
+function getDropboxFolderPath(orderId) {
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  return `/maveloper/${mm}-${yyyy}/${orderId}`;
+}
+
+/**
+ * Upload a single file buffer to Dropbox and return its direct URL.
+ */
+async function uploadToDropbox(filePath, fileBuffer) {
+  const uploadResult = await dbx.filesUpload({
+    path: filePath,
+    contents: fileBuffer,
+    mode: { ".tag": "overwrite" },
+    mute: true,
+  });
+
+  // Create a shared link
+  let sharedUrl;
+  try {
+    const linkResult = await dbx.sharingCreateSharedLinkWithSettings({
+      path: filePath,
+      settings: { requested_visibility: { ".tag": "public" }, audience: { ".tag": "public" } },
+    });
+    sharedUrl = linkResult.result.url;
+  } catch (linkErr) {
+    // If link already exists, retrieve it
+    if (linkErr?.error?.error?.[".tag"] === "shared_link_already_exists") {
+      const existing = await dbx.sharingListSharedLinks({ path: filePath, direct_only: true });
+      if (existing.result.links.length > 0) {
+        sharedUrl = existing.result.links[0].url;
+      } else {
+        throw new Error(`Could not retrieve existing shared link for ${filePath}`);
+      }
+    } else {
+      throw linkErr;
+    }
+  }
+
+  // Convert to direct-access URL
+  const directUrl = sharedUrl.replace("www.dropbox.com", "dl.dropboxusercontent.com").replace("?dl=0", "");
+
+  return { dropboxPath: uploadResult.result.path_display, directUrl };
+}
+
+/**
+ * Upload all images to Dropbox for a given order.
+ * Returns a map: { "hero.jpg": "https://dl.dropboxusercontent.com/..." }
+ */
+async function uploadImagesToDropbox(orderId, images, logFn) {
+  const folderPath = getDropboxFolderPath(orderId);
+  const imageUrlMap = {};
+
+  for (const img of images) {
+    const dropboxFilePath = `${folderPath}/images/${img.filename}`;
+    logFn("info", `Uploading image to Dropbox: ${dropboxFilePath}`, { filename: img.filename, sizeKB: Math.round(img.buffer.length / 1024) });
+
+    const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
+    imageUrlMap[img.filename] = directUrl;
+  }
+
+  return imageUrlMap;
+}
+
+/**
+ * Upload the final ZIP to Dropbox and return the shareable link.
+ */
+async function uploadZipToDropbox(orderId, zipBuffer, logFn) {
+  const folderPath = getDropboxFolderPath(orderId);
+  const zipPath = `${folderPath}.zip`;
+
+  logFn("info", `Uploading ZIP to Dropbox: ${zipPath}`, { sizeKB: Math.round(zipBuffer.length / 1024) });
+
+  const { directUrl } = await uploadToDropbox(zipPath, zipBuffer);
+
+  // For the ZIP we want the regular Dropbox share link (nicer UX), not direct download
+  let shareUrl;
+  try {
+    const linkResult = await dbx.sharingCreateSharedLinkWithSettings({
+      path: zipPath,
+      settings: { requested_visibility: { ".tag": "public" }, audience: { ".tag": "public" } },
+    });
+    shareUrl = linkResult.result.url;
+  } catch (linkErr) {
+    if (linkErr?.error?.error?.[".tag"] === "shared_link_already_exists") {
+      const existing = await dbx.sharingListSharedLinks({ path: zipPath, direct_only: true });
+      shareUrl = existing.result.links.length > 0 ? existing.result.links[0].url : directUrl;
+    } else {
+      shareUrl = directUrl;
+    }
+  }
+
+  return shareUrl;
+}
+
+// =====================================================================
+// IMAGE EXTRACTION FROM PDF
+// =====================================================================
+
+/**
+ * Attempt to extract embedded raster images from a PDF buffer.
+ * This uses a heuristic approach — scanning for JPEG and PNG markers in the PDF stream.
+ * Returns array of { filename, buffer } or empty array if extraction fails.
+ */
+function extractImagesFromPdf(pdfBuffer) {
+  const images = [];
+  let imgIndex = 0;
+
+  // --- JPEG extraction ---
+  const JPEG_SOI = Buffer.from([0xFF, 0xD8, 0xFF]);
+  const JPEG_EOI = Buffer.from([0xFF, 0xD9]);
+  let searchStart = 0;
+
+  while (searchStart < pdfBuffer.length - 3) {
+    const soiPos = pdfBuffer.indexOf(JPEG_SOI, searchStart);
+    if (soiPos === -1) break;
+
+    const eoiPos = pdfBuffer.indexOf(JPEG_EOI, soiPos + 3);
+    if (eoiPos === -1) {
+      searchStart = soiPos + 3;
+      continue;
+    }
+
+    const jpegEnd = eoiPos + 2;
+    const jpegLen = jpegEnd - soiPos;
+
+    // Only keep images larger than 2KB (skip tiny thumbnails/artifacts)
+    if (jpegLen > 2048) {
+      imgIndex++;
+      const imgBuffer = pdfBuffer.subarray(soiPos, jpegEnd);
+      images.push({
+        filename: `img-${String(imgIndex).padStart(2, "0")}.jpg`,
+        buffer: Buffer.from(imgBuffer),
+      });
+    }
+
+    searchStart = jpegEnd;
+  }
+
+  // --- PNG extraction ---
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  const PNG_IEND = Buffer.from([0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
+  searchStart = 0;
+
+  while (searchStart < pdfBuffer.length - 8) {
+    const sigPos = pdfBuffer.indexOf(PNG_SIG, searchStart);
+    if (sigPos === -1) break;
+
+    const iendPos = pdfBuffer.indexOf(PNG_IEND, sigPos + 8);
+    if (iendPos === -1) {
+      searchStart = sigPos + 8;
+      continue;
+    }
+
+    const pngEnd = iendPos + 8;
+    const pngLen = pngEnd - sigPos;
+
+    if (pngLen > 2048) {
+      imgIndex++;
+      const imgBuffer = pdfBuffer.subarray(sigPos, pngEnd);
+      images.push({
+        filename: `img-${String(imgIndex).padStart(2, "0")}.png`,
+        buffer: Buffer.from(imgBuffer),
+      });
+    }
+
+    searchStart = pngEnd;
+  }
+
+  return images;
+}
+
+/**
+ * Extract images from a user-uploaded ZIP file.
+ * Returns array of { filename, buffer }.
+ */
+function extractImagesFromZip(zipBase64) {
+  const zipBuffer = Buffer.from(zipBase64.replace(/^data:[^;]+;base64,/, ""), "base64");
+
+  if (zipBuffer.length > MAX_ZIP_BYTES) {
+    throw new Error(`ZIP file too large. Maximum is ${MAX_ZIP_BYTES / 1024 / 1024} MB.`);
+  }
+
+  const zip = new AdmZip(zipBuffer);
+  const entries = zip.getEntries();
+  const images = [];
+
+  for (const entry of entries) {
+    if (entry.isDirectory) continue;
+
+    const ext = path.extname(entry.entryName).toLowerCase();
+    if (!ALLOWED_IMAGE_EXTS.includes(ext)) continue;
+
+    // Get just the filename, stripping any nested folder paths
+    const filename = path.basename(entry.entryName);
+
+    // Skip macOS resource fork files
+    if (filename.startsWith("._") || entry.entryName.includes("__MACOSX")) continue;
+
+    const buffer = entry.getData();
+    if (buffer.length > 0) {
+      images.push({ filename, buffer });
+    }
+  }
+
+  if (images.length === 0) {
+    throw new Error("No valid images found in ZIP. Supported formats: JPG, PNG, GIF, WEBP.");
+  }
+
+  return images;
+}
+
+// =====================================================================
+// ZIP PACKAGING
+// =====================================================================
+
+/**
+ * Build the final deliverable ZIP containing:
+ * - ORDER_ID.html (with relative image paths)
+ * - images/ folder with all image files
+ */
+function buildDeliveryZip(orderId, htmlWithDropboxUrls, imageUrlMap, images) {
+  const zip = new AdmZip();
+
+  // Swap Dropbox URLs back to relative paths in the HTML
+  let localHtml = htmlWithDropboxUrls;
+  for (const [filename, dropboxUrl] of Object.entries(imageUrlMap)) {
+    // Replace all occurrences of the Dropbox URL with relative path
+    localHtml = localHtml.split(dropboxUrl).join(`images/${filename}`);
+  }
+
+  // Add HTML file
+  zip.addFile(`${orderId}.html`, Buffer.from(localHtml, "utf-8"));
+
+  // Add images
+  for (const img of images) {
+    zip.addFile(`images/${img.filename}`, img.buffer);
+  }
+
+  return zip.toBuffer();
+}
+
+// =====================================================================
+// ORDER ID EXTRACTION
+// =====================================================================
+
+/**
+ * Extract Order ID from the uploaded PDF filename.
+ * Expected format: "OID9924641912.pdf" → "OID9924641912"
+ * Also accepts: "OID9924641912" (without extension)
+ */
+function extractOrderId(filename) {
+  if (!filename || typeof filename !== "string") return null;
+
+  // Strip .pdf extension
+  const name = filename.replace(/\.pdf$/i, "").trim();
+
+  // Reject generic/empty filenames
+  const genericNames = ["design", "untitled", "document", "file", "upload", "email", "test", "sample", "new"];
+  if (!name || genericNames.includes(name.toLowerCase())) return null;
+
+  return name;
+}
 
 // =====================================================================
 // MAVELOPER MASTER FRAMEWORK SYSTEM PROMPT
@@ -347,6 +648,16 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 - PILL CTAs: Use border-radius: 9999px for safe pill shape.
 - GOOGLE FONTS: Load via <link> with rel="preconnect" inside <!--[if !mso]><!--> conditional.
 
+## IMAGE URL HANDLING (when image map is provided in user message)
+The user may provide a list of available image URLs in the format:
+"Available images: filename.jpg → https://..."
+When this list is present:
+1. Use ONLY these exact URLs in the output HTML for ALL img src attributes.
+2. Match each image in the design to the most appropriate filename based on visible context, position, and content.
+3. If an image in the design has no matching file in the provided list, use a descriptive alt text and set src to a 1x1 transparent placeholder.
+4. NEVER fabricate image URLs — only use URLs from the provided list.
+5. NEVER use relative paths like "images/hero.jpg" when a URL map is provided — always use the full Dropbox URL.
+
 ## FINAL OUTPUT CHECKLIST
 - Output begins with <!DOCTYPE
 - No markdown fences anywhere
@@ -359,6 +670,7 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 - Multi-column sections use <th> with em_clear class
 - Dark mode block included if appropriate
 - All images have width, height, alt, border="0", display:block
+- If image URL map was provided, all img src use the provided URLs
 - Output ends with </html>
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided design images.`;
@@ -381,7 +693,8 @@ app.use(cors({
   credentials: false,
 }));
 
-app.use(express.json({ limit: "8mb" }));
+// Increased from 8mb to 35mb to accommodate PDF (5MB) + ZIP (25MB) after base64 inflation
+app.use(express.json({ limit: "35mb" }));
 
 app.use((req, res, next) => {
   req.id = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -426,21 +739,46 @@ app.get("/health", (req, res) => {
     status: "ok",
     uptime: process.uptime(),
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
+    dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.1.3",
+    version: "1.2.0",
   });
 });
 
+// -----------------------------------------------------------------
+// POST /generate — Main pipeline
+// Accepts: { pdfBase64, pdfFilename, assetsZipBase64? }
+// Returns: { html, orderId, pageCount, pageImages, imageUrlMap, requestId }
+// -----------------------------------------------------------------
 app.post("/generate", generateLimiter, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { pdfBase64 } = req.body;
+    const { pdfBase64, pdfFilename, assetsZipBase64 } = req.body;
 
+    // --- Validate PDF ---
     if (!pdfBase64) {
       return res.status(400).json({
         error: "Missing pdfBase64",
         details: "Request body must include a pdfBase64 field.",
+        requestId: req.id,
+      });
+    }
+
+    if (!pdfFilename) {
+      return res.status(400).json({
+        error: "Missing pdfFilename",
+        details: "Request body must include a pdfFilename field (e.g., 'OID9924641912.pdf').",
+        requestId: req.id,
+      });
+    }
+
+    // --- Extract Order ID from filename ---
+    const orderId = extractOrderId(pdfFilename);
+    if (!orderId) {
+      return res.status(400).json({
+        error: "Invalid filename",
+        details: "Please rename your PDF with the Order ID (e.g., 'OID9924641912.pdf'). Generic filenames like 'design.pdf' are not accepted.",
         requestId: req.id,
       });
     }
@@ -465,12 +803,15 @@ app.post("/generate", generateLimiter, async (req, res) => {
       });
     }
 
-    log("info", "Rasterizing PDF", {
+    log("info", "Processing request", {
       requestId: req.id,
-      sizeKB: Math.round(pdfBuffer.length / 1024),
-      scale: RASTERIZE_SCALE,
+      orderId,
+      pdfSizeKB: Math.round(pdfBuffer.length / 1024),
+      hasAssetsZip: Boolean(assetsZipBase64),
     });
 
+    // --- Step 1: Rasterize PDF for Claude Vision ---
+    log("info", "Rasterizing PDF", { requestId: req.id, scale: RASTERIZE_SCALE });
     const pngPages = await rasterizeWithTimeout(pdfBuffer);
 
     if (pngPages.length > MAX_PAGES) {
@@ -481,12 +822,57 @@ app.post("/generate", generateLimiter, async (req, res) => {
       });
     }
 
-    log("info", "Sending to Claude", {
-      requestId: req.id,
-      pageCount: pngPages.length,
-      rasterizeMs: Date.now() - startTime,
-    });
+    // --- Step 2: Extract or receive images ---
+    let images = [];
+    let imageSource = "none";
 
+    if (assetsZipBase64) {
+      // User provided images via ZIP upload
+      try {
+        images = extractImagesFromZip(assetsZipBase64);
+        imageSource = "zip";
+        log("info", "Extracted images from ZIP", {
+          requestId: req.id,
+          imageCount: images.length,
+          filenames: images.map((i) => i.filename),
+        });
+      } catch (zipErr) {
+        return res.status(400).json({
+          error: "ZIP extraction failed",
+          details: zipErr.message,
+          requestId: req.id,
+        });
+      }
+    } else {
+      // Attempt auto-extraction from PDF
+      images = extractImagesFromPdf(pdfBuffer);
+      imageSource = images.length > 0 ? "pdf-auto" : "none";
+      log("info", "PDF image extraction result", {
+        requestId: req.id,
+        imageCount: images.length,
+        source: imageSource,
+      });
+    }
+
+    // --- Step 3: Upload images to Dropbox (if we have images and Dropbox is configured) ---
+    let imageUrlMap = {};
+    if (images.length > 0 && dropboxConfigured) {
+      try {
+        imageUrlMap = await uploadImagesToDropbox(orderId, images, log);
+        log("info", "Images uploaded to Dropbox", {
+          requestId: req.id,
+          imageCount: Object.keys(imageUrlMap).length,
+        });
+      } catch (dbxErr) {
+        log("error", "Dropbox upload failed", {
+          requestId: req.id,
+          error: dbxErr.message,
+        });
+        // Non-fatal: continue without Dropbox URLs, Claude will use placeholder paths
+      }
+    }
+
+    // --- Step 4: Build prompt with image map ---
     const imageBlocks = pngPages.map((page) => ({
       type: "image",
       source: {
@@ -495,6 +881,24 @@ app.post("/generate", generateLimiter, async (req, res) => {
         data: page.content.toString("base64"),
       },
     }));
+
+    let userPrompt = "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.";
+
+    if (Object.keys(imageUrlMap).length > 0) {
+      const imageListStr = Object.entries(imageUrlMap)
+        .map(([filename, url]) => `${filename} → ${url}`)
+        .join("\n");
+
+      userPrompt += `\n\nAvailable images (USE THESE EXACT URLs for all img src attributes):\n${imageListStr}\n\nIMPORTANT: Use the above Dropbox URLs as the src for every image in the HTML. Match each image to the appropriate design element by filename. Do NOT use relative paths — use the full URLs provided above.`;
+    }
+
+    // --- Step 5: Send to Claude ---
+    log("info", "Sending to Claude", {
+      requestId: req.id,
+      pageCount: pngPages.length,
+      imageUrlCount: Object.keys(imageUrlMap).length,
+      rasterizeMs: Date.now() - startTime,
+    });
 
     const message = await anthropic.messages.create({
       model: CLAUDE_MODEL,
@@ -505,10 +909,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
           role: "user",
           content: [
             ...imageBlocks,
-            {
-              type: "text",
-              text: "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.",
-            },
+            { type: "text", text: userPrompt },
           ],
         },
       ],
@@ -529,6 +930,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     const html = textBlock.text;
 
+    // --- Step 6: Generate preview images ---
     const previewImages = await Promise.all(
       pngPages.map(async (page) => {
         const jpeg = await sharp(page.content)
@@ -540,15 +942,24 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     log("info", "Generation complete", {
       requestId: req.id,
+      orderId,
       pageCount: pngPages.length,
+      imageSource,
+      imageCount: images.length,
+      dropboxUrls: Object.keys(imageUrlMap).length,
       durationMs: Date.now() - startTime,
       htmlLength: html.length,
     });
 
+    // --- Return response for preview ---
     res.json({
       html,
+      orderId,
       pageCount: pngPages.length,
       pageImages: previewImages,
+      imageUrlMap,
+      imageSource,
+      imageCount: images.length,
       requestId: req.id,
     });
 
@@ -580,11 +991,108 @@ app.post("/generate", generateLimiter, async (req, res) => {
     } else if (err.message?.includes("Not allowed by CORS")) {
       userMessage = "Request blocked by CORS policy.";
       statusCode = 403;
+    } else if (err.message?.includes("ZIP")) {
+      userMessage = err.message;
+      statusCode = 400;
     }
 
     res.status(statusCode).json({
       error: "Generation failed",
       details: userMessage,
+      requestId: req.id,
+    });
+  }
+});
+
+// -----------------------------------------------------------------
+// POST /approve — Package ZIP and upload to Dropbox
+// Called after dev reviews preview and clicks "Approve & Upload"
+// Accepts: { orderId, html, imageUrlMap, images? }
+// Returns: { dropboxUrl, orderId, requestId }
+// -----------------------------------------------------------------
+app.post("/approve", generateLimiter, async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { orderId, html, imageUrlMap } = req.body;
+
+    if (!orderId || !html) {
+      return res.status(400).json({
+        error: "Missing required fields",
+        details: "Request must include orderId and html.",
+        requestId: req.id,
+      });
+    }
+
+    if (!dropboxConfigured) {
+      return res.status(503).json({
+        error: "Dropbox not configured",
+        details: "Dropbox credentials are not set. Contact the Maveloper admin.",
+        requestId: req.id,
+      });
+    }
+
+    if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
+      return res.status(400).json({
+        error: "No images available",
+        details: "Cannot build ZIP without image data. Please regenerate first.",
+        requestId: req.id,
+      });
+    }
+
+    log("info", "Building delivery ZIP", { requestId: req.id, orderId });
+
+    // Download images from Dropbox URLs to include in ZIP
+    const images = [];
+    for (const [filename, url] of Object.entries(imageUrlMap)) {
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          const arrayBuffer = await response.arrayBuffer();
+          images.push({ filename, buffer: Buffer.from(arrayBuffer) });
+        } else {
+          log("warn", `Failed to download image: ${filename}`, { requestId: req.id, status: response.status });
+        }
+      } catch (dlErr) {
+        log("warn", `Failed to download image: ${filename}`, { requestId: req.id, error: dlErr.message });
+      }
+    }
+
+    // Build ZIP
+    const zipBuffer = buildDeliveryZip(orderId, html, imageUrlMap, images);
+
+    log("info", "ZIP built", {
+      requestId: req.id,
+      orderId,
+      zipSizeKB: Math.round(zipBuffer.length / 1024),
+      imageCount: images.length,
+    });
+
+    // Upload ZIP to Dropbox
+    const dropboxUrl = await uploadZipToDropbox(orderId, zipBuffer, log);
+
+    log("info", "ZIP uploaded to Dropbox", {
+      requestId: req.id,
+      orderId,
+      durationMs: Date.now() - startTime,
+    });
+
+    res.json({
+      dropboxUrl,
+      orderId,
+      zipSizeKB: Math.round(zipBuffer.length / 1024),
+      requestId: req.id,
+    });
+
+  } catch (err) {
+    log("error", "Approve/upload error", {
+      requestId: req.id,
+      error: err.message,
+      durationMs: Date.now() - startTime,
+    });
+
+    res.status(500).json({
+      error: "Upload failed",
+      details: "Failed to package and upload to Dropbox. Please try again.",
       requestId: req.id,
     });
   }
@@ -597,6 +1105,8 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
+    version: "1.2.0",
+    dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
 });
