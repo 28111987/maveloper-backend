@@ -38,8 +38,8 @@ const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
 const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
-const ANTHROPIC_TIMEOUT_MS = 180 * 1000;
-const SERVER_TIMEOUT_MS = 240 * 1000;
+const ANTHROPIC_TIMEOUT_MS = 300 * 1000;   // 5 min — image-heavy emails with 15+ visual blocks need more time
+const SERVER_TIMEOUT_MS = 360 * 1000;      // 6 min — must exceed Anthropic timeout + Dropbox upload time
 const RASTERIZE_SCALE = 1.6;
 const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
@@ -127,20 +127,31 @@ async function uploadToDropbox(filePath, fileBuffer) {
 
 /**
  * Upload all images to Dropbox for a given order.
+ * Uploads in parallel batches of 5 for speed without hitting rate limits.
  * Returns a map: { "hero.jpg": "https://dl.dropboxusercontent.com/..." }
  */
 async function uploadImagesToDropbox(orderId, images, logFn) {
   const folderPath = getDropboxFolderPath(orderId);
   const imageUrlMap = {};
+  const BATCH_SIZE = 5;
 
-  for (const img of images) {
-    const dropboxFilePath = `${folderPath}/images/${img.filename}`;
-    logFn("info", `Uploading image to Dropbox: ${dropboxFilePath}`, { filename: img.filename, sizeKB: Math.round(img.buffer.length / 1024) });
+  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${BATCH_SIZE})`, { orderId });
 
-    const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-    imageUrlMap[img.filename] = directUrl;
+  for (let i = 0; i < images.length; i += BATCH_SIZE) {
+    const batch = images.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (img) => {
+        const dropboxFilePath = `${folderPath}/images/${img.filename}`;
+        const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
+        return { filename: img.filename, directUrl };
+      })
+    );
+    for (const { filename, directUrl } of results) {
+      imageUrlMap[filename] = directUrl;
+    }
   }
 
+  logFn("info", `All ${images.length} images uploaded to Dropbox`, { orderId });
   return imageUrlMap;
 }
 
@@ -416,12 +427,60 @@ You are the senior email developer at Mavlers, a digital marketing agency renown
 ## ABSOLUTE VISUAL FIDELITY RULES
 1. Match the design EXACTLY. Do not approximate, simplify, modernize, or improve anything. The design is the law.
 2. Extract ALL visible text VERBATIM from the images. Every word, capitalization, punctuation, and line break. Never paraphrase, summarize, abbreviate, or invent copy.
-3. Match exact colors using hex codes derived from the design. Never use named colors.
-4. Match exact spacing — padding, margins, gaps — in pixels as shown.
-5. Match exact typography — font family, size, weight, line-height, letter-spacing, text-transform.
+3. Match EXACT hex color codes from the design. NEVER approximate. If a green looks like #0BB68A, do NOT output #1BB292. If a dark looks like #042624, do NOT output #0A3832. Pay extreme attention to subtle color differences — two similar greens are likely two different hex values. When in doubt, favor the darker/more saturated reading.
+4. Match EXACT spacing in pixels as shown. Do NOT round to convenient multiples of 10 or 20. If the design shows 31px padding, use 31. If 42px, use 42. If 17px between items, use 17. Mavlers emails use precise, non-round pixel values — that precision is what makes them pixel-perfect.
+5. Match EXACT typography — font family (including Google Fonts), font size, font weight, line-height, letter-spacing, text-transform. NEVER inflate font sizes. If body copy in the design is 14px, use 14px — not 16px. If a CTA button text is font-weight:400, use 400 — not 700.
 6. Match exact column structures (1-col, 2-col, 3-col, asymmetric) with the correct mobile stacking behavior.
-7. Match all decorative elements: dividers, borders, background colors, background images, icons, illustrations.
-8. If text in the design appears in a non-standard font requiring loading, include the appropriate Google Font link OR fall back to image-only rendering for that text block.
+7. Match all decorative elements: dividers (exact thickness, exact color), borders, background colors, background images, icons, illustrations.
+8. If text in the design appears in a non-standard font requiring loading, you MUST include the Google Font (see MANDATORY GOOGLE FONT LOADING section below).
+
+## MANDATORY GOOGLE FONT LOADING
+If ANY text in the design uses a non-system font (check for: Inter, Poppins, Roboto, Open Sans, Montserrat, Lato, Playfair Display, Raleway, Nunito, Work Sans, DM Sans, or any other Google Font), you MUST:
+
+1. Include the font import inside an MSO conditional block, placed AFTER the meta tags and BEFORE the main <style> block:
+
+<!--[if !mso]><!-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+</style>
+<!--<![endif]-->
+
+2. Use the loaded font as the PRIMARY font in ALL font-family declarations throughout the email:
+   font-family: 'Inter', Arial, sans-serif;
+
+3. NEVER fall back to just "Arial, sans-serif" if a Google Font is detected in the design. The font is a critical part of visual fidelity.
+
+4. Adjust the @import URL to match the specific font detected. Common patterns:
+   - Inter: family=Inter:wght@100..900
+   - Poppins: family=Poppins:wght@300;400;500;600;700
+   - Roboto: family=Roboto:wght@300;400;500;700
+
+## EXACT COLOR EXTRACTION RULES
+When extracting colors from the design:
+1. Each distinct section may use slightly different shades — extract each one independently.
+2. Background colors, text colors, CTA colors, divider colors, and accent colors should ALL be extracted separately.
+3. Common Mavlers color precision errors to AVOID:
+   - #0BB68A is NOT #1BB292 (different greens)
+   - #042624 is NOT #0A3832 (different darks)
+   - #C9C9C9 is NOT #E5E5E5 (different grays)
+   - #EFEFEB is NOT #E5E5E5 (different light grays)
+4. When reading colors from a rasterized PDF, err on the side of the MORE saturated / MORE specific reading rather than a washed-out approximation.
+
+## EXACT SPACING AND PADDING RULES
+Mavlers developers use precise, non-round pixel values. Your output must do the same:
+1. NEVER round padding/margin to 10, 20, 30, 40, 50. Real Mavlers emails use values like 31px, 42px, 17px, 19px, 33px, 62px.
+2. Measure spacing by counting pixels from the design image. If a section has 33px top padding and 32px bottom padding, use those EXACT values.
+3. The space between bullet points is often 17-19px, NOT 16px or 20px.
+4. Pre-header bar padding is often asymmetric (e.g., 10px 62px 12px), NOT uniform.
+5. Content section side padding is often 25px or 42px, NOT 20px.
+
+## EXACT LETTER-SPACING RULES
+Mavlers emails frequently use letter-spacing. If text appears tightly or loosely spaced:
+1. Body copy typically uses letter-spacing: -0.42px
+2. Footer/small text typically uses letter-spacing: -0.36px
+3. Headings may use letter-spacing: 0.9px or -0.5px
+4. CTA buttons typically use letter-spacing: -0.42px
+5. ALWAYS include the letter-spacing property when detected. Do not omit it.
 
 ## MANDATORY DOCTYPE + NAMESPACES
 Always use XHTML 1.0 Transitional with VML and Office namespaces. Always include the lang attribute on the html tag.
@@ -582,7 +641,7 @@ IMAGERY: em_full_img, em_full_img1, em_g_img, em_logo
 DARK MODE: em_dark, em_dark1, em_dark2, em_dark3, em_dm_txt_white, em_light
 
 ## MANDATORY BULLETPROOF CTA TEMPLATE
-For every CTA button in the design, use this exact pattern. The line-height = height trick vertically centers without flexbox. The display:block on the anchor makes the entire cell clickable.
+For every CTA button in the design, use this pattern as a STARTING POINT — but you MUST customize every property to match the design exactly:
 
 <table role="presentation" border="0" cellspacing="0" cellpadding="0" align="center" style="background-color: #00388F; border-radius: 30px;" bgcolor="#00388F">
   <tr>
@@ -591,6 +650,18 @@ For every CTA button in the design, use this exact pattern. The line-height = he
     </td>
   </tr>
 </table>
+
+CRITICAL CTA CUSTOMIZATION RULES — match the design EXACTLY:
+1. border-radius: Use the EXACT radius from the design. 40px is NOT 9999px. If the button has slightly rounded corners, use 30-40px. Only use 9999px if the button is a perfect pill/capsule shape.
+2. height: Match the exact button height from the design (often 45px, 48px, or 52px — each is different).
+3. font-size: Match exactly. CTA text is often 14px, not 15px.
+4. font-weight: Match exactly. Many designs use 400 (regular), NOT 700 (bold). If the CTA text is not bold in the design, use 400.
+5. padding: Match exactly. Often 0 30px, not 0 32px.
+6. border: If the design shows a visible border on the button, include it: border: 1px solid #EFEFEB (or whatever color).
+7. background-color: Match the EXACT hex from the design.
+8. letter-spacing: Include if the design shows it (commonly -0.42px).
+9. display: Use display:inline-block on the table for proper centering when the button is left-aligned.
+10. NEVER apply the generic template values blindly — EVERY property must be read from the design.
 
 For pill-shape CTAs use border-radius: 9999px. For complex/intricate buttons (gradients, shadows, custom shapes), use the linked-image CTA pattern instead:
 
@@ -698,9 +769,14 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 ## DESIGN-SENSITIVE DECISIONS
 - IMAGE-ONLY POSTER MODE: If the design is typography-heavy with custom fonts that lack reliable web fallbacks, render every text element as an <img> tag with descriptive alt.
 - COMPLIANCE DISCLAIMER ROW: If the client appears to be pharma/medical/HCP/financial, include a visible disclaimer pre-header row.
-- 3-BREAKPOINT MOBILE: For complex hero typography, use 3 breakpoints (599/480/374).
-- PILL CTAs: Use border-radius: 9999px for safe pill shape.
-- GOOGLE FONTS: Load via <link> with rel="preconnect" inside <!--[if !mso]><!--> conditional.
+- RESPONSIVE BREAKPOINTS: Use 1 breakpoint (599px) for simple emails. Use 3 breakpoints (599/480/374) only for complex hero typography or intricate mobile layouts. Do not over-engineer simple emails.
+- CTA BORDER-RADIUS: Read the EXACT radius from the design. 40px rounded corners ≠ 9999px pill. Only use 9999px if the button is a perfect capsule shape.
+- GOOGLE FONTS: ALWAYS detect and load (see MANDATORY GOOGLE FONT LOADING above). This is NOT optional.
+- BULLET POINTS: If the design uses small icons/dots as bullet markers, prefer using actual small icon images (img tags) over CSS border-radius circles. Image bullets are more reliable across email clients including Outlook.
+- CUSTOM RESPONSIVE CLASSES: For emails with complex section-specific mobile behavior, create custom em_ classes (e.g., em_pad_ET, em_pad_EB, em_f01) in addition to the standard vocabulary. This achieves precise mobile rendering per section.
+- MSO VERTICAL ALIGNMENT: For bullet lists and icon+text layouts, use Outlook-specific spacer rows inside MSO conditionals to achieve precise vertical alignment:
+  <!--[if (gte mso 9)|(IE)]><tr><td height="3" style="height:3px; font-size:0px; line-height:0px;"><img src="spacer.gif" width="1" height="1" alt="" style="display:block;" border="0" /></td></tr><![endif]-->
+- DARK MODE: Only include dark mode CSS when the design specifically requires it or uses bright elements that would clash with auto-inversion. Do NOT include dark mode by default for every email.
 
 ## IMAGE URL HANDLING (when image assets are provided)
 You will receive the PDF design pages FOLLOWED BY individual image asset files. You can SEE both the design and each individual image.
@@ -715,16 +791,21 @@ When image assets and their URLs are provided:
 8. NEVER use relative paths like "images/hero.jpg" when URLs are provided — always use the full Dropbox URL.
 
 ## FINAL OUTPUT CHECKLIST
+Before outputting, verify EVERY item:
 - Output begins with <!DOCTYPE
 - No markdown fences anywhere
 - All universal reset rules present
 - All meta tags present
+- Google Font loaded if non-system font detected in design (<!--[if !mso]><!--> @import block)
+- Font-family declarations use the loaded Google Font, not just Arial
 - Main table uses role="presentation" and width matches design
 - All text extracted verbatim from images
-- All colors as hex codes
-- All CTAs use bulletproof or linked-image pattern
+- All colors as EXACT hex codes from the design (not approximations)
+- All padding/spacing uses EXACT pixel values from design (not rounded to 10/20)
+- Letter-spacing included where visible in the design
+- All CTAs match design EXACTLY: border-radius, height, font-weight, font-size, padding, border, bgcolor
 - Multi-column sections use <th> with em_clear class
-- Dark mode block included if appropriate
+- Dark mode block included ONLY if appropriate for this design
 - All images have width, height, alt, border="0", display:block
 - If image assets were provided, all img src use the provided URLs matched by VISUAL CONTENT
 - Output ends with </html>
@@ -798,7 +879,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.3",
+    version: "1.3.1",
   });
 });
 
@@ -810,7 +891,7 @@ app.get("/health", (req, res) => {
 app.post("/generate", generateLimiter, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { pdfBase64, pdfFilename, assetsZipBase64 } = req.body;
+    const { pdfBase64, pdfFilename, assetsZipBase64, darkMode } = req.body;
 
     // --- Validate PDF ---
     if (!pdfBase64) {
@@ -945,23 +1026,42 @@ app.post("/generate", generateLimiter, async (req, res) => {
     ];
 
     // Add each extracted image as a visual block so Claude can SEE them and match accurately
+    // Only send SIGNIFICANT images as visual blocks — skip tiny icons, spacers, and GIFs
+    // Cap at 10 visual blocks to avoid overloading Claude's context
+    const MAX_VISUAL_BLOCKS = 10;
+    const MIN_VISUAL_SIZE = 3 * 1024; // Skip images under 3KB (spacers, tiny icons)
+
     if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
       // Get dimensions for each image using Sharp
       const imageMeta = await Promise.all(
         images.map(async (img) => {
           try {
             const metadata = await sharp(img.buffer).metadata();
-            return { filename: img.filename, width: metadata.width, height: metadata.height };
+            return { filename: img.filename, width: metadata.width, height: metadata.height, size: img.buffer.length };
           } catch {
-            return { filename: img.filename, width: "unknown", height: "unknown" };
+            return { filename: img.filename, width: 0, height: 0, size: img.buffer.length };
           }
         })
       );
 
-      for (let i = 0; i < images.length; i++) {
+      // Sort images by file size descending — largest (most important) first
+      const sortedIndices = imageMeta
+        .map((meta, idx) => ({ idx, size: meta.size }))
+        .sort((a, b) => b.size - a.size)
+        .map((item) => item.idx);
+
+      let visualBlockCount = 0;
+
+      for (const i of sortedIndices) {
         const img = images[i];
         const meta = imageMeta[i];
         const url = imageUrlMap[img.filename];
+
+        // Always list ALL images in the text map (for URL reference)
+        // But only send significant ones as visual blocks
+
+        if (img.buffer.length < MIN_VISUAL_SIZE) continue; // Skip tiny files
+        if (visualBlockCount >= MAX_VISUAL_BLOCKS) continue; // Cap visual blocks
 
         // Determine media type from extension
         const ext = path.extname(img.filename).toLowerCase();
@@ -971,7 +1071,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
         // Add a label before each image
         contentBlocks.push({
           type: "text",
-          text: `Image asset ${i + 1}: "${img.filename}" (${meta.width}×${meta.height}px) → URL: ${url}`,
+          text: `Image asset: "${img.filename}" (${meta.width}×${meta.height}px) → URL: ${url}`,
         });
 
         // Add the actual image so Claude can see it
@@ -983,7 +1083,16 @@ app.post("/generate", generateLimiter, async (req, res) => {
             data: img.buffer.toString("base64"),
           },
         });
+
+        visualBlockCount++;
       }
+
+      log("info", "Visual blocks prepared for Claude", {
+        requestId: req.id,
+        totalImages: images.length,
+        visualBlocksSent: visualBlockCount,
+        skippedSmall: images.filter((img) => img.buffer.length < MIN_VISUAL_SIZE).length,
+      });
     }
 
     // Build the final text prompt
@@ -1210,7 +1319,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.2.3",
+    version: "1.3.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
