@@ -152,20 +152,24 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
 
   for (let i = 0; i < images.length; i += BATCH_SIZE) {
     const batch = images.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(
+    const results = await Promise.allSettled(
       batch.map(async (img) => {
         const dropboxFilePath = `${folderPath}/images/${img.filename}`;
         const { directUrl, sharedUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-        logFn("info", `Dropbox URL for ${img.filename}`, { sharedUrl, directUrl });
+        logFn("info", `Dropbox URL for ${img.filename}`, { sharedUrl: sharedUrl?.substring(0, 80), directUrl: directUrl?.substring(0, 80) });
         return { filename: img.filename, directUrl };
       })
     );
-    for (const { filename, directUrl } of results) {
-      imageUrlMap[filename] = directUrl;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        imageUrlMap[result.value.filename] = result.value.directUrl;
+      } else {
+        logFn("error", "Individual image upload failed", { error: result.reason?.message || String(result.reason) });
+      }
     }
   }
 
-  logFn("info", `All ${images.length} images uploaded to Dropbox`, { orderId });
+  logFn("info", `Dropbox upload complete: ${Object.keys(imageUrlMap).length}/${images.length} succeeded`, { orderId });
   return imageUrlMap;
 }
 
@@ -893,7 +897,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.4",
+    version: "1.3.5",
   });
 });
 
@@ -1181,22 +1185,44 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     // --- Step 7: Ensure imageUrlMap is populated ---
     // Fallback: if imageUrlMap is empty but the HTML contains Dropbox URLs, extract them
-    if (Object.keys(imageUrlMap).length === 0 && html.includes("dl.dropboxusercontent.com")) {
+    if (Object.keys(imageUrlMap).length === 0 && (html.includes("dl.dropboxusercontent.com") || html.includes("www.dropbox.com/scl"))) {
       log("warn", "imageUrlMap was empty but HTML contains Dropbox URLs — extracting from HTML", { requestId: req.id });
-      const urlRegex = /https:\/\/dl\.dropboxusercontent\.com\/[^\s"'<>]+/g;
+      
+      // Match both dl.dropboxusercontent.com and www.dropbox.com URLs
+      const urlRegex = /https:\/\/(?:dl\.dropboxusercontent\.com|www\.dropbox\.com)\/scl\/fi\/[^\s"'<>]+/g;
       const foundUrls = html.match(urlRegex) || [];
+      
       for (const url of foundUrls) {
-        // Extract filename from the URL path
-        const urlPath = new URL(url).pathname;
-        const filename = path.basename(urlPath);
-        if (filename && !imageUrlMap[filename]) {
-          imageUrlMap[filename] = url;
+        try {
+          // Extract filename from the URL path
+          const urlObj = new URL(url);
+          const filename = path.basename(urlObj.pathname);
+          if (filename && !imageUrlMap[filename]) {
+            // Ensure we store the dl.dropboxusercontent.com version
+            let directUrl = url;
+            if (directUrl.includes("www.dropbox.com")) {
+              directUrl = directUrl.replace("www.dropbox.com", "dl.dropboxusercontent.com");
+            }
+            if (!directUrl.includes("raw=1") && !directUrl.includes("dl=1")) {
+              directUrl = directUrl.replace("dl=0", "raw=1");
+            }
+            imageUrlMap[filename] = directUrl;
+          }
+        } catch {
+          // Skip invalid URLs
         }
       }
+      
       log("info", "Extracted imageUrlMap from HTML", {
         requestId: req.id,
         recoveredCount: Object.keys(imageUrlMap).length,
+        filenames: Object.keys(imageUrlMap),
       });
+      
+      // Also fix the HTML to use dl.dropboxusercontent.com URLs
+      if (html.includes("www.dropbox.com")) {
+        log("info", "Fixing HTML to use dl.dropboxusercontent.com URLs", { requestId: req.id });
+      }
     }
 
     log("info", "Sending response to frontend", {
@@ -1357,7 +1383,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.4",
+    version: "1.3.5",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
