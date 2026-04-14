@@ -140,13 +140,14 @@ async function uploadToDropbox(filePath, fileBuffer) {
 
 /**
  * Upload all images to Dropbox for a given order.
- * Uploads in parallel batches of 5 for speed without hitting rate limits.
+ * Uploads in parallel batches of 3 with retry logic for rate-limited requests.
  * Returns a map: { "hero.jpg": "https://dl.dropboxusercontent.com/..." }
  */
 async function uploadImagesToDropbox(orderId, images, logFn) {
   const folderPath = getDropboxFolderPath(orderId);
   const imageUrlMap = {};
-  const BATCH_SIZE = 5;
+  const failedImages = [];
+  const BATCH_SIZE = 3;
 
   logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${BATCH_SIZE})`, { orderId });
 
@@ -160,12 +161,33 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
         return { filename: img.filename, directUrl };
       })
     );
-    for (const result of results) {
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
       if (result.status === "fulfilled") {
         imageUrlMap[result.value.filename] = result.value.directUrl;
       } else {
-        logFn("error", "Individual image upload failed", { error: result.reason?.message || String(result.reason) });
+        logFn("warn", `Upload failed for ${batch[j].filename}, queued for retry`, { error: result.reason?.message || String(result.reason) });
+        failedImages.push(batch[j]);
       }
+    }
+  }
+
+  // Retry failed images one at a time with a delay
+  if (failedImages.length > 0) {
+    logFn("info", `Retrying ${failedImages.length} failed uploads after 2s delay`);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    for (const img of failedImages) {
+      try {
+        const dropboxFilePath = `${folderPath}/images/${img.filename}`;
+        const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
+        imageUrlMap[img.filename] = directUrl;
+        logFn("info", `Retry succeeded for ${img.filename}`);
+      } catch (retryErr) {
+        logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr.message });
+      }
+      // Small delay between retries
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 
@@ -897,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.5",
+    version: "1.3.6",
   });
 });
 
@@ -1383,7 +1405,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.5",
+    version: "1.3.6",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
