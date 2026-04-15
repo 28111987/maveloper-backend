@@ -919,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.4.2",
+    version: "2.0.0",
   });
 });
 
@@ -931,7 +931,23 @@ app.get("/health", (req, res) => {
 app.post("/generate", generateLimiter, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { pdfBase64, pdfFilename, assetsZipBase64, darkMode } = req.body;
+    const { 
+      pdfBase64, 
+      pdfFilename, 
+      assetsZipBase64, 
+      // Developer input fields — these override Claude's guessing
+      emailWidth,        // e.g., 600, 640, 650, 680, 700
+      primaryFont,       // e.g., "Poppins", "Montserrat", "Lato", "Arial"
+      secondaryFont,     // e.g., "Arial", optional
+      espPlatform,       // e.g., "none", "mailchimp", "sfmc", "hubspot", "klaviyo"
+      darkMode,          // true/false
+      primaryColor,      // e.g., "#4F007D"
+      secondaryColor,    // e.g., "#FA9E0D"
+      ctaBgColor,        // e.g., "#000000"
+      ctaTextColor,      // e.g., "#FFFFFF"
+      ctaStyle,          // e.g., "square", "rounded", "pill"
+      ctaBorderRadius,   // e.g., "2px", "6px", "30px"
+    } = req.body;
 
     // --- Validate PDF ---
     if (!pdfBase64) {
@@ -1180,6 +1196,95 @@ app.post("/generate", generateLimiter, async (req, res) => {
     // Build the final text prompt
     let userPrompt = "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the PDF page images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.";
 
+    // --- Inject developer-specified values as HARD OVERRIDES ---
+    const specs = [];
+
+    // Width
+    const width = emailWidth ? parseInt(emailWidth, 10) : null;
+    if (width && [600, 640, 650, 680, 700].includes(width)) {
+      const breakpoint = width - 1;
+      specs.push(`EMAIL WIDTH: Use exactly ${width}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
+    }
+
+    // Fonts
+    if (primaryFont) {
+      const fontStack = secondaryFont 
+        ? `'${primaryFont}', '${secondaryFont}', Arial, sans-serif`
+        : `'${primaryFont}', Arial, sans-serif`;
+      
+      // Determine if Google Font loading is needed
+      const systemFonts = ["arial", "helvetica", "times new roman", "georgia", "verdana", "courier new", "tahoma", "trebuchet ms"];
+      const needsGoogleFont = !systemFonts.includes(primaryFont.toLowerCase());
+      
+      if (needsGoogleFont) {
+        specs.push(`FONT: Load '${primaryFont}' via Google Fonts inside <!--[if !mso]><!--><style>@import url('https://fonts.googleapis.com/css2?family=${encodeURIComponent(primaryFont)}:wght@100..900&display=swap');</style><!--<![endif]-->. Use font-family: ${fontStack} for ALL text elements throughout the email. NEVER fall back to just 'Arial, sans-serif' — the loaded font MUST be the primary in every font-family declaration.`);
+      } else {
+        specs.push(`FONT: Use font-family: ${fontStack} for all text elements. No Google Font loading needed.`);
+      }
+    }
+
+    // ESP Platform
+    if (espPlatform && espPlatform !== "none") {
+      const espInstructions = {
+        mailchimp: `ESP: This is a Mailchimp template. Use these merge tags:
+- Title: *|MC:SUBJECT|*
+- Preview text: *|MC_PREVIEW_TEXT|* inside a hidden span
+- View online link: *|ARCHIVE|*
+- Unsubscribe: *|UNSUB|*
+- Add mc:edit attributes to all editable content cells (e.g., mc:edit="text_01", mc:edit="img_01")
+- Wrap each major section in a <table mc:repeatable mc:variant="Section Name"> for modularity`,
+        sfmc: `ESP: This is a Salesforce Marketing Cloud template. Use these merge tags:
+- Title: %%=v(@subject)=%%
+- View online link: %%view_email_url%%
+- Unsubscribe: %%unsub_center_url%%
+- Add <custom name="opencounter" type="tracking" /> before </body>`,
+        hubspot: `ESP: This is a HubSpot template. Use these merge tags:
+- Unsubscribe: {{ unsubscribe_link }}
+- View online: {{ view_as_page_url }}
+- Company name: {{ site_settings.company_name }}`,
+        klaviyo: `ESP: This is a Klaviyo template. Use these merge tags:
+- Unsubscribe: {% unsubscribe %}
+- View online: {{ message.ViewInBrowserUrl }}
+- Preview text: {{ message.PreviewText }}`,
+      };
+      if (espInstructions[espPlatform]) {
+        specs.push(espInstructions[espPlatform]);
+      }
+    }
+
+    // Dark Mode
+    if (darkMode === true || darkMode === "true") {
+      specs.push(`DARK MODE: Include dark mode support. Add @media (prefers-color-scheme: dark) rules with design-specific dark colors. Use em_dark, em_dark1, em_dark2, em_dark3 classes on sections that need dark background overrides. Use em_dm_txt_white / em_color1 on text that should be white in dark mode. Invert CTA colors in dark mode using .em_cta class.`);
+    } else if (darkMode === false || darkMode === "false") {
+      specs.push(`DARK MODE: Do NOT include any dark mode CSS. No prefers-color-scheme media query. No em_dark classes. The email does not need dark mode support.`);
+    }
+
+    // Colors
+    if (primaryColor) {
+      specs.push(`PRIMARY BRAND COLOR: Use exactly ${primaryColor} for headings, accent elements, section backgrounds, and any primary brand-colored elements in the design. This is the EXACT hex — do not approximate.`);
+    }
+    if (secondaryColor) {
+      specs.push(`SECONDARY BRAND COLOR: Use exactly ${secondaryColor} for secondary accents, dividers, sub-headings, or any secondary colored elements. This is the EXACT hex — do not approximate.`);
+    }
+
+    // CTA
+    if (ctaBgColor || ctaStyle || ctaBorderRadius) {
+      let ctaSpec = "CTA BUTTON STYLE: ";
+      if (ctaBgColor) ctaSpec += `Background color: exactly ${ctaBgColor}. `;
+      if (ctaTextColor) ctaSpec += `Text color: exactly ${ctaTextColor}. `;
+      if (ctaStyle === "square") ctaSpec += "Border-radius: 0px (sharp corners). ";
+      else if (ctaStyle === "rounded") ctaSpec += `Border-radius: ${ctaBorderRadius || "6px"}. `;
+      else if (ctaStyle === "pill") ctaSpec += "Border-radius: 9999px (pill shape). ";
+      else if (ctaBorderRadius) ctaSpec += `Border-radius: ${ctaBorderRadius}. `;
+      ctaSpec += "Match ALL CTA properties exactly from the design — height, font-size, font-weight, padding, border.";
+      specs.push(ctaSpec);
+    }
+
+    // Inject all specs into the prompt
+    if (specs.length > 0) {
+      userPrompt += "\n\n=== DEVELOPER-SPECIFIED DESIGN VALUES (MANDATORY — these override any visual interpretation) ===\n" + specs.join("\n\n") + "\n=== END DEVELOPER SPECIFICATIONS ===";
+    }
+
     if (Object.keys(imageUrlMap).length > 0) {
       const imageListStr = Object.entries(imageUrlMap)
         .map(([filename, url]) => `${filename} → ${url}`)
@@ -1201,6 +1306,11 @@ app.post("/generate", generateLimiter, async (req, res) => {
       pageCount: pngPages.length,
       extractedImageCount: images.length,
       imageUrlCount: Object.keys(imageUrlMap).length,
+      devSpecs: specs.length,
+      emailWidth: width || "auto",
+      primaryFont: primaryFont || "auto",
+      espPlatform: espPlatform || "none",
+      darkMode: darkMode || "auto",
       rasterizeMs: Date.now() - startTime,
     });
 
@@ -1454,7 +1564,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.4.2",
+    version: "2.0.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
