@@ -919,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.6",
+    version: "1.3.7",
   });
 });
 
@@ -1050,12 +1050,27 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     // --- Step 4: Build prompt with image map + visual image blocks ---
-    const pdfImageBlocks = pngPages.map((page) => ({
+    // Compress PDF pages for Claude Vision (resize to max 800px width)
+    const compressedPdfPages = await Promise.all(
+      pngPages.map(async (page) => {
+        try {
+          const metadata = await sharp(page.content).metadata();
+          if (metadata.width > 800) {
+            return await sharp(page.content).resize(800).png({ quality: 80 }).toBuffer();
+          }
+          return page.content;
+        } catch {
+          return page.content;
+        }
+      })
+    );
+
+    const pdfImageBlocks = compressedPdfPages.map((buf) => ({
       type: "image",
       source: {
         type: "base64",
         media_type: "image/png",
-        data: page.content.toString("base64"),
+        data: buf.toString("base64"),
       },
     }));
 
@@ -1066,9 +1081,9 @@ app.post("/generate", generateLimiter, async (req, res) => {
     ];
 
     // Add each extracted image as a visual block so Claude can SEE them and match accurately
-    // Only send SIGNIFICANT images as visual blocks — skip tiny icons, spacers, and GIFs
-    // Cap at 10 visual blocks to avoid overloading Claude's context
-    const MAX_VISUAL_BLOCKS = 10;
+    // Compress to max 400px width for visual matching (full-res stays on Dropbox)
+    // Cap at 8 visual blocks to stay within API limits
+    const MAX_VISUAL_BLOCKS = 8;
     const MIN_VISUAL_SIZE = 3 * 1024; // Skip images under 3KB (spacers, tiny icons)
 
     if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
@@ -1108,19 +1123,33 @@ app.post("/generate", generateLimiter, async (req, res) => {
         const mediaTypeMap = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
         const mediaType = mediaTypeMap[ext] || "image/jpeg";
 
+        // Compress image for Claude Vision (max 400px width — enough to identify content)
+        let visualBuffer = img.buffer;
+        try {
+          const imgMeta = await sharp(img.buffer).metadata();
+          if (imgMeta.width > 400) {
+            visualBuffer = await sharp(img.buffer)
+              .resize(400)
+              .jpeg({ quality: 70 })
+              .toBuffer();
+          }
+        } catch {
+          // Use original if compression fails
+        }
+
         // Add a label before each image
         contentBlocks.push({
           type: "text",
           text: `Image asset: "${img.filename}" (${meta.width}×${meta.height}px) → URL: ${url}`,
         });
 
-        // Add the actual image so Claude can see it
+        // Add the compressed image so Claude can see it
         contentBlocks.push({
           type: "image",
           source: {
             type: "base64",
-            media_type: mediaType,
-            data: img.buffer.toString("base64"),
+            media_type: visualBuffer === img.buffer ? mediaType : "image/jpeg",
+            data: visualBuffer.toString("base64"),
           },
         });
 
@@ -1405,7 +1434,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.6",
+    version: "1.3.7",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
