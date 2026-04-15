@@ -38,8 +38,8 @@ const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
 const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
-const ANTHROPIC_TIMEOUT_MS = 300 * 1000;   // 5 min — image-heavy emails with 15+ visual blocks need more time
-const SERVER_TIMEOUT_MS = 360 * 1000;      // 6 min — must exceed Anthropic timeout + Dropbox upload time
+const ANTHROPIC_TIMEOUT_MS = 480 * 1000;   // 8 min — complex emails with 32K max_tokens need more time
+const SERVER_TIMEOUT_MS = 600 * 1000;      // 10 min — must exceed Anthropic timeout + Dropbox upload time
 const RASTERIZE_SCALE = 1.6;
 const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
@@ -919,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.4.1",
+    version: "1.4.2",
   });
 });
 
@@ -1454,7 +1454,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.4.1",
+    version: "1.4.2",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
