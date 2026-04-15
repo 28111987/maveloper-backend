@@ -455,112 +455,79 @@ function extractOrderId(filename) {
 // Developer-specified values (width, font, ESP, dark mode) are injected at call time
 // to override Claude's visual guesses with known-correct values.
 // =====================================================================
-const STAGE1_PROMPT = `You are a senior email design analyst at Mavlers. You will receive one or more images showing pages of an email design PDF. Your ONLY job is to analyze the design and output a JSON specification. Do NOT generate any HTML. Do NOT add any explanation.
+const STAGE1_PROMPT = `You are an email design analyst. Analyze the email design image and output a compact JSON specification. No HTML. No explanation. No markdown fences.
 
-IMPORTANT: Analyze the design SECTION BY SECTION from top to bottom. For each section, capture:
-- Type (preheader, logo, navigation, hero_image, heading, body_text, cta, multi_column, divider, spacer, footer, social_icons, disclaimer, image_row, etc.)
-- All visual properties you can detect (colors, alignment, approximate spacing)
-- Text content VERBATIM — every word, every line, as it appears
+Respond with ONLY a JSON object. Start with { end with }.
 
-OUTPUT FORMAT: Respond with ONLY a valid JSON object. No markdown fences. No explanation. Start with { and end with }.
-
-JSON SCHEMA:
+SCHEMA — keep it FLAT and COMPACT. Omit empty/null fields:
 {
-  "design_analysis": {
-    "overall": {
-      "estimated_width": <number — 600, 640, 650, 680, or 700>,
-      "outer_background_color": "<hex>",
-      "content_background_color": "<hex>",
-      "estimated_font_body": "<best guess or 'unknown-sans-serif' / 'unknown-serif'>",
-      "estimated_font_heading": "<best guess or same as body>"
-    },
-    "sections": [
-      {
-        "order": <1-based position from top>,
-        "type": "<section type>",
-        "background_color": "<hex or 'transparent'>",
-        "padding": {
-          "top": "<estimated px>",
-          "right": "<estimated px>",
-          "bottom": "<estimated px>",
-          "left": "<estimated px>"
-        },
-        "content": [
-          {
-            "element": "<text|image|cta|divider|spacer|icon_row|social_links|columns>",
-            "text": "<verbatim text if applicable>",
-            "font_size": "<estimated px>",
-            "font_weight": "<100-900>",
-            "line_height": "<estimated px>",
-            "color": "<hex>",
-            "alignment": "<left|center|right>",
-            "letter_spacing": "<estimated px or 'normal'>",
-            "text_transform": "<none|uppercase|lowercase|capitalize>",
-            "link_url": "<if element is a link or CTA>",
-            "image_description": "<what the image shows — for matching to uploaded assets>",
-            "image_estimated_width": "<px>",
-            "image_estimated_height": "<px>",
-            "cta_style": {
-              "background_color": "<hex>",
-              "text_color": "<hex>",
-              "border_radius": "<estimated px — 0 for square, 5-6 for slightly rounded, 20-30 for rounded, 9999 for pill>",
-              "height": "<estimated px>",
-              "font_size": "<px>",
-              "font_weight": "<100-900>",
-              "horizontal_padding": "<estimated px>",
-              "has_border": <true|false>,
-              "border_color": "<hex if has_border>",
-              "border_width": "<px if has_border>"
-            },
-            "columns": [
-              {
-                "width_percent": "<estimated %>",
-                "content": [ "<nested content elements>" ]
-              }
-            ]
-          }
-        ]
-      }
-    ],
-    "image_positions": [
-      {
-        "position_in_design": <1-based from top>,
-        "section_order": <which section this image belongs to>,
-        "description": "<what the image shows: logo, hero banner, headshot, product photo, icon, etc.>",
-        "estimated_width": "<px>",
-        "estimated_height": "<px>",
-        "alignment": "<left|center|right>",
-        "is_full_width": <true|false>,
-        "is_background_image": <true|false>
-      }
-    ],
-    "color_palette": {
-      "primary_brand": "<hex>",
-      "secondary_brand": "<hex>",
-      "text_primary": "<hex>",
-      "text_heading": "<hex>",
-      "cta_primary_bg": "<hex>",
-      "cta_primary_text": "<hex>",
-      "divider": "<hex if visible>"
-    },
-    "features": {
-      "has_vml_background": <true if text overlays a background image>,
-      "has_multi_column": <true|false>,
-      "total_cta_count": <number>,
-      "total_image_count": <number>
+  "width": 600,
+  "bg_outer": "#hex",
+  "bg_content": "#hex",
+  "font_body": "font name or unknown-sans",
+  "font_heading": "font name or same as body",
+  "sections": [
+    {
+      "n": 1,
+      "type": "preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image",
+      "bg": "#hex",
+      "pad": "T R B L",
+      "align": "left|center|right",
+      "content": [
+        {
+          "el": "text|image|cta|divider|spacer|link|social_icons|columns",
+          "text": "VERBATIM text here",
+          "size": 16,
+          "weight": 400,
+          "lh": 24,
+          "color": "#hex",
+          "align": "center",
+          "transform": "uppercase",
+          "img_desc": "what the image shows",
+          "img_w": 600,
+          "img_h": 400,
+          "cta_bg": "#hex",
+          "cta_color": "#hex",
+          "cta_radius": 6,
+          "cta_h": 45,
+          "cta_size": 16,
+          "cta_weight": 600,
+          "cta_pad": 30,
+          "cta_border": "1px solid #hex",
+          "cols": [
+            { "w": "50%", "content": [] }
+          ]
+        }
+      ]
     }
-  }
+  ],
+  "images": [
+    { "n": 1, "section": 3, "desc": "company logo top center", "w": 184, "h": 60, "full_width": false, "is_bg": false }
+  ],
+  "colors": {
+    "brand1": "#hex",
+    "brand2": "#hex",
+    "text": "#hex",
+    "heading": "#hex",
+    "cta_bg": "#hex",
+    "cta_text": "#hex"
+  },
+  "has_vml": false,
+  "has_multicol": false,
+  "cta_count": 2,
+  "img_count": 8
 }
 
-CRITICAL RULES:
-1. Extract ALL visible text VERBATIM. Every word, every line break, every piece of punctuation. This is the MOST important part — Stage 2 generates HTML from YOUR text extraction. If you miss text, it will be missing from the final email.
-2. For colors, give your best hex estimate. Be specific — #231F20 is different from #000000. #F4F4F4 is different from #F5F5F5.
-3. For spacing, estimate in pixels. Be precise — 33px is different from 30px. Do NOT round to multiples of 10.
-4. Count sections from top to bottom. Miss nothing.
-5. For images, describe WHAT the image shows (not where it is) — this helps match uploaded assets.
-6. If you see text overlaid on a background image, set has_vml_background: true.
-7. Output ONLY the JSON object. No markdown fences. No explanation before or after. Start with { end with }.
-8. Keep the JSON COMPACT — use short keys, omit null/empty fields, don't repeat data.`;
+RULES:
+1. TEXT IS KING — ZERO TOLERANCE FOR FABRICATION: Extract ALL visible text VERBATIM — every single word, line, punctuation mark, exactly as shown. NEVER paraphrase. NEVER rewrite. NEVER invent text that is not visible in the image. If you cannot read a word clearly, use "[unclear]" — do NOT guess or substitute. A fabricated sentence is WORSE than a missing one. Copy the text EXACTLY as it appears.
+2. SECTION ORDER: Analyze top-to-bottom. Every section in the design must appear in the JSON in the same order. Do NOT rearrange, merge, or skip sections.
+3. COLORS: Best hex estimate. #231F20 ≠ #000000. #F4F4F4 ≠ #F5F5F5. Dark charcoal is NOT pure black. Light gray is NOT white.
+4. SPACING: Estimate px. 33px ≠ 30px. Use "pad": "20 25 15 25" format (top right bottom left).
+5. IMAGES: Describe WHAT it shows (logo, headshot, banner, phone mockup, book cover) — not where it is.
+6. VML: Set has_vml: true if text overlays a background image.
+7. COMPACT: Short keys. Omit null/default fields. No redundant data.
+8. METADATA: Do NOT include order IDs, filenames, or any text from the file metadata as email content. Only extract text that is VISIBLE in the actual email design.
+9. NO markdown fences. NO backticks. NO explanation. ONLY the JSON object.`;
 
 // =====================================================================
 // STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
@@ -580,10 +547,11 @@ You are the senior email developer at Mavlers, a digital marketing agency renown
 
 ## ABSOLUTE VISUAL FIDELITY RULES
 1. The JSON spec IS the design. Use EVERY value from the spec exactly as specified. Do not approximate, simplify, modernize, or improve anything.
-2. Use ALL text from the spec VERBATIM. Every word, capitalization, punctuation, and line break. Never paraphrase, summarize, abbreviate, or invent copy.
-3. Use EXACT hex color codes from the spec's color_palette and per-section colors. NEVER substitute generic colors.
+2. Use ALL text from the spec VERBATIM. Every word, capitalization, punctuation, and line break. Never paraphrase, summarize, abbreviate, or invent copy. NEVER replace spec text with your own words. If the spec says "Kenect's AI-powered tools help your team respond faster, automate follow-ups ..." then output EXACTLY that — not a rewritten version.
+3. Use EXACT hex color codes from the spec's color_palette and per-section colors. NEVER substitute generic colors. #231F20 is NOT #000000. Use the spec's colors, not generic black/white.
 4. Use EXACT spacing in pixels from the spec's padding values. Do NOT round to convenient multiples of 10 or 20.
 5. Use EXACT typography — font family, font size, font weight, line-height, letter-spacing, text-transform — all from the spec.
+6. SECTION ORDER: Output sections in the EXACT order they appear in the spec's sections array. Do NOT rearrange, merge, or skip sections.
 6. Match exact column structures (1-col, 2-col, 3-col, asymmetric) with the correct mobile stacking behavior.
 7. Match all decorative elements: dividers (exact thickness, exact color), borders, background colors, background images, icons, illustrations.
 8. If text in the design appears in a non-standard font requiring loading, you MUST include the Google Font (see MANDATORY GOOGLE FONT LOADING section below).
@@ -1116,7 +1084,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.2.1",
+    version: "2.3.0",
   });
 });
 
@@ -1262,13 +1230,15 @@ app.post("/generate", generateLimiter, async (req, res) => {
     // Claude returns a structured JSON spec of the design.
     // =================================================================
 
-    // Compress PDF pages for Claude Vision (JPEG, max 600px width, quality 50)
+    // Stage 1 needs HIGH QUALITY images — text extraction requires readable text.
+    // 1200px width, JPEG Q75 gives Claude enough resolution to read 14-18px body text.
+    // (Stage 2 doesn't receive images at all, so this only affects Stage 1 API cost.)
     const compressedPdfPages = await Promise.all(
       pngPages.map(async (page) => {
         try {
           return await sharp(page.content)
-            .resize(600, null, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: 50 })
+            .resize(1200, null, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 75 })
             .toBuffer();
         } catch {
           return page.content;
@@ -1276,7 +1246,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       })
     );
 
-    log("info", "PDF pages compressed for Stage 1", {
+    log("info", "PDF pages prepared for Stage 1 (high quality for text extraction)", {
       requestId: req.id,
       originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
       compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
@@ -1317,7 +1287,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     const stage1Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 32000,
+      max_tokens: 16000,
       system: STAGE1_PROMPT,
       messages: [{ role: "user", content: stage1Content }],
     });
@@ -1411,10 +1381,10 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Stage 1 complete: design spec parsed", {
       requestId: req.id,
       stage1DurationMs: Date.now() - stage1StartTime,
-      sectionCount: designSpec?.design_analysis?.sections?.length || 0,
-      imagePositions: designSpec?.design_analysis?.image_positions?.length || 0,
-      specWidth: designSpec?.design_analysis?.overall?.estimated_width,
-      specFont: designSpec?.design_analysis?.overall?.estimated_font_body,
+      sectionCount: designSpec?.sections?.length || 0,
+      imagePositions: designSpec?.images?.length || 0,
+      specWidth: designSpec?.width,
+      specFont: designSpec?.font_body,
     });
 
     // =================================================================
@@ -1427,13 +1397,13 @@ app.post("/generate", generateLimiter, async (req, res) => {
     const specs = [];
 
     // Width — developer override wins, then fall back to Stage 1 detection
-    const finalWidth = width || designSpec?.design_analysis?.overall?.estimated_width || 600;
+    const finalWidth = width || designSpec?.width || 600;
     const breakpoint = finalWidth - 1;
     specs.push(`EMAIL WIDTH: Use exactly ${finalWidth}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
 
     // Fonts — developer override wins, then fall back to Stage 1 detection
-    const finalFont = primaryFont || designSpec?.design_analysis?.overall?.estimated_font_body || "Arial";
-    const finalSecondaryFont = secondaryFont || designSpec?.design_analysis?.overall?.estimated_font_heading;
+    const finalFont = primaryFont || designSpec?.font_body || "Arial";
+    const finalSecondaryFont = secondaryFont || designSpec?.font_heading;
     const fontStack = (finalSecondaryFont && finalSecondaryFont !== finalFont)
       ? `'${finalFont}', '${finalSecondaryFont}', Arial, sans-serif`
       : `'${finalFont}', Arial, sans-serif`;
@@ -1535,7 +1505,7 @@ ${specs.join("\n\n")}
 
     log("info", "Stage 2: Sending spec to Claude for HTML generation", {
       requestId: req.id,
-      specSections: designSpec?.design_analysis?.sections?.length || 0,
+      specSections: designSpec?.sections?.length || 0,
       imageUrls: Object.keys(imageUrlMap).length,
       devSpecs: specs.length,
       finalWidth,
@@ -1595,7 +1565,7 @@ ${specs.join("\n\n")}
       dropboxUrls: Object.keys(imageUrlMap).length,
       totalDurationMs: Date.now() - startTime,
       htmlLength: html.length,
-      specSections: designSpec?.design_analysis?.sections?.length || 0,
+      specSections: designSpec?.sections?.length || 0,
     });
 
     // --- Step 7: Ensure imageUrlMap is populated ---
@@ -1801,7 +1771,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.2.1",
+    version: "2.3.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
