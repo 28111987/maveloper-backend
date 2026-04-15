@@ -535,55 +535,32 @@ JSON SCHEMA:
       }
     ],
     "color_palette": {
-      "primary_brand": "<hex — dominant brand color>",
-      "secondary_brand": "<hex — secondary accent if visible>",
-      "background_outer": "<hex>",
-      "background_content": "<hex>",
-      "text_primary": "<hex — main body text color>",
-      "text_secondary": "<hex — lighter/secondary text>",
+      "primary_brand": "<hex>",
+      "secondary_brand": "<hex>",
+      "text_primary": "<hex>",
       "text_heading": "<hex>",
       "cta_primary_bg": "<hex>",
       "cta_primary_text": "<hex>",
-      "footer_bg": "<hex>",
-      "footer_text": "<hex>",
-      "divider": "<hex if visible>",
-      "preheader_bg": "<hex if visible>",
-      "preheader_text": "<hex if visible>"
+      "divider": "<hex if visible>"
     },
-    "typography": {
-      "body_size": "<px>",
-      "body_weight": "<100-900>",
-      "body_line_height": "<px>",
-      "heading_size": "<px>",
-      "heading_weight": "<100-900>",
-      "heading_line_height": "<px>",
-      "footer_size": "<px>"
-    },
-    "features_detected": {
-      "has_preheader_bar": <true|false>,
-      "has_navigation": <true|false>,
-      "has_hero_image": <true|false>,
-      "has_vml_background_needed": <true|false — true if text overlays a background image>,
+    "features": {
+      "has_vml_background": <true if text overlays a background image>,
       "has_multi_column": <true|false>,
-      "column_count": <2|3|0>,
-      "has_social_icons": <true|false>,
-      "has_footer_links": <true|false>,
-      "has_compliance_disclaimer": <true|false>,
       "total_cta_count": <number>,
-      "total_image_count": <number>,
-      "text_over_image_sections": <number — sections where text sits on top of an image background>
+      "total_image_count": <number>
     }
   }
 }
 
 CRITICAL RULES:
-1. Extract ALL visible text VERBATIM. Every word, every line break, every piece of punctuation.
-2. For colors, give your best hex estimate. Be specific — #231F20 is different from #000000.
-3. For spacing, estimate in pixels. Be precise — 33px is different from 30px.
+1. Extract ALL visible text VERBATIM. Every word, every line break, every piece of punctuation. This is the MOST important part — Stage 2 generates HTML from YOUR text extraction. If you miss text, it will be missing from the final email.
+2. For colors, give your best hex estimate. Be specific — #231F20 is different from #000000. #F4F4F4 is different from #F5F5F5.
+3. For spacing, estimate in pixels. Be precise — 33px is different from 30px. Do NOT round to multiples of 10.
 4. Count sections from top to bottom. Miss nothing.
 5. For images, describe WHAT the image shows (not where it is) — this helps match uploaded assets.
-6. If you see text overlaid on a background image, mark has_vml_background_needed: true for that section.
-7. Output ONLY the JSON. No markdown. No explanation.`;
+6. If you see text overlaid on a background image, set has_vml_background: true.
+7. Output ONLY the JSON object. No markdown fences. No explanation before or after. Start with { end with }.
+8. Keep the JSON COMPACT — use short keys, omit null/empty fields, don't repeat data.`;
 
 // =====================================================================
 // STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
@@ -1139,7 +1116,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.2.0",
+    version: "2.2.1",
   });
 });
 
@@ -1340,7 +1317,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     const stage1Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 16000,
+      max_tokens: 32000,
       system: STAGE1_PROMPT,
       messages: [{ role: "user", content: stage1Content }],
     });
@@ -1355,22 +1332,74 @@ app.post("/generate", generateLimiter, async (req, res) => {
       });
     }
 
-    // Parse the JSON spec from Stage 1
+    // Check if Stage 1 hit the token limit (truncated JSON)
+    const stage1StopReason = stage1Response.stop_reason;
+    if (stage1StopReason === "max_tokens") {
+      log("warn", "Stage 1: Response was truncated (hit max_tokens)", {
+        requestId: req.id,
+        responseLength: stage1TextBlock.text.length,
+      });
+    }
+
+    // Parse the JSON spec from Stage 1 — resilient extraction
     let designSpec;
     try {
-      // Strip any markdown fences if Claude wrapped the JSON
       let jsonText = stage1TextBlock.text.trim();
-      if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
-      if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
-      if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
-      jsonText = jsonText.trim();
+
+      // Strip markdown fences
+      jsonText = jsonText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+
+      // If Claude added preamble text before the JSON, find the first {
+      const firstBrace = jsonText.indexOf("{");
+      if (firstBrace > 0) {
+        jsonText = jsonText.substring(firstBrace);
+      }
+
+      // If truncated (no closing brace), attempt to repair
+      if (stage1StopReason === "max_tokens" || !jsonText.endsWith("}")) {
+        log("warn", "Stage 1: Attempting to repair truncated JSON", { requestId: req.id });
+
+        // Strategy: find the last complete section by looking for the last valid closing brace
+        // Count braces to find where JSON is still balanced
+        let braceDepth = 0;
+        let lastBalancedPos = -1;
+        for (let i = 0; i < jsonText.length; i++) {
+          if (jsonText[i] === "{") braceDepth++;
+          if (jsonText[i] === "}") {
+            braceDepth--;
+            if (braceDepth === 0) {
+              lastBalancedPos = i;
+            }
+          }
+        }
+
+        if (lastBalancedPos > 0) {
+          // Found a balanced closing point — truncate there
+          jsonText = jsonText.substring(0, lastBalancedPos + 1);
+        } else {
+          // No balanced point found — close all open braces/brackets
+          // Remove the last incomplete value and close the structure
+          // Trim trailing comma and incomplete key-value pairs
+          jsonText = jsonText.replace(/,\s*"[^"]*"?\s*:?\s*[^,}\]]*$/, "");
+          // Close any open brackets/braces
+          const openBraces = (jsonText.match(/{/g) || []).length;
+          const closeBraces = (jsonText.match(/}/g) || []).length;
+          const openBrackets = (jsonText.match(/\[/g) || []).length;
+          const closeBrackets = (jsonText.match(/]/g) || []).length;
+          jsonText += "]".repeat(Math.max(0, openBrackets - closeBrackets));
+          jsonText += "}".repeat(Math.max(0, openBraces - closeBraces));
+        }
+      }
 
       designSpec = JSON.parse(jsonText);
     } catch (parseErr) {
       log("error", "Stage 1: Failed to parse JSON from Claude", {
         requestId: req.id,
         error: parseErr.message,
-        rawResponse: stage1TextBlock.text.substring(0, 500),
+        stopReason: stage1StopReason,
+        rawResponseLength: stage1TextBlock.text.length,
+        rawResponseStart: stage1TextBlock.text.substring(0, 300),
+        rawResponseEnd: stage1TextBlock.text.substring(stage1TextBlock.text.length - 300),
       });
       return res.status(502).json({
         error: "Design analysis failed",
@@ -1772,7 +1801,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.2.0",
+    version: "2.2.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
