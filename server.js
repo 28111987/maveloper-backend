@@ -1084,7 +1084,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.3.0",
+    version: "2.4.0",
   });
 });
 
@@ -1230,15 +1230,48 @@ app.post("/generate", generateLimiter, async (req, res) => {
     // Claude returns a structured JSON spec of the design.
     // =================================================================
 
-    // Stage 1 needs HIGH QUALITY images — text extraction requires readable text.
-    // 1200px width, JPEG Q75 gives Claude enough resolution to read 14-18px body text.
-    // (Stage 2 doesn't receive images at all, so this only affects Stage 1 API cost.)
+    // Adaptive image compression for Stage 1.
+    // Text extraction requires readable text, but the Anthropic API has input size limits.
+    // Strategy: choose resolution/quality based on page count + total original size.
+    //
+    // History of what failed:
+    //   600px Q50  → text was unreadable, Claude hallucinated body copy
+    //   1200px Q75 → 780KB single image, API rejected with 400 (payload too large)
+    //   1000px Q65 → untested, may still be too large for long single-page PDFs
+    //
+    // Adaptive tiers (tested against Kenect email — 2537KB single-page PNG):
+    const totalOriginalSizeKB = pngPages.reduce((sum, p) => sum + p.content.length, 0) / 1024;
+    const pageCount = pngPages.length;
+
+    let targetWidth, targetQuality;
+    if (pageCount === 1 && totalOriginalSizeKB < 2000) {
+      // Short single-page email — maximize quality
+      targetWidth = 1000; targetQuality = 65;
+    } else if (pageCount === 1) {
+      // Long single-page email (like Kenect — 2500KB+ PNG)
+      targetWidth = 900; targetQuality = 55;
+    } else if (pageCount <= 3) {
+      // Multi-page (2-3 pages)
+      targetWidth = 800; targetQuality = 55;
+    } else {
+      // 4+ pages — aggressive compression to stay within limits
+      targetWidth = 700; targetQuality = 50;
+    }
+
+    log("info", "Adaptive compression selected for Stage 1", {
+      requestId: req.id,
+      pageCount,
+      totalOriginalSizeKB: Math.round(totalOriginalSizeKB),
+      targetWidth,
+      targetQuality,
+    });
+
     const compressedPdfPages = await Promise.all(
       pngPages.map(async (page) => {
         try {
           return await sharp(page.content)
-            .resize(1200, null, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: 75 })
+            .resize(targetWidth, null, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: targetQuality })
             .toBuffer();
         } catch {
           return page.content;
@@ -1246,7 +1279,23 @@ app.post("/generate", generateLimiter, async (req, res) => {
       })
     );
 
-    log("info", "PDF pages prepared for Stage 1 (high quality for text extraction)", {
+    // Safety check: if any single compressed page > 4MB, re-compress at lower quality
+    const MAX_PAGE_BYTES = 4 * 1024 * 1024;
+    for (let i = 0; i < compressedPdfPages.length; i++) {
+      if (compressedPdfPages[i].length > MAX_PAGE_BYTES) {
+        log("warn", `Page ${i + 1} still too large (${Math.round(compressedPdfPages[i].length / 1024)}KB), re-compressing`, { requestId: req.id });
+        try {
+          compressedPdfPages[i] = await sharp(pngPages[i].content)
+            .resize(700, null, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 45 })
+            .toBuffer();
+        } catch {
+          // Keep the original compression if re-compress fails
+        }
+      }
+    }
+
+    log("info", "PDF pages compressed for Stage 1", {
       requestId: req.id,
       originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
       compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
@@ -1771,7 +1820,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.3.0",
+    version: "2.4.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
