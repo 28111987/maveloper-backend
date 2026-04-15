@@ -919,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.7",
+    version: "1.3.8",
   });
 });
 
@@ -1082,11 +1082,18 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
     // Add each extracted image as a visual block so Claude can SEE them and match accurately
     // Compress to max 400px width for visual matching (full-res stays on Dropbox)
-    // Cap at 8 visual blocks to stay within API limits
-    const MAX_VISUAL_BLOCKS = 8;
+    // For emails with 15+ images, skip visual blocks entirely — use text-only URL map
+    const MAX_VISUAL_BLOCKS = 5;
     const MIN_VISUAL_SIZE = 3 * 1024; // Skip images under 3KB (spacers, tiny icons)
+    const SKIP_VISUAL_THRESHOLD = 15; // Too many images — text-only matching
 
-    if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
+    if (images.length >= SKIP_VISUAL_THRESHOLD) {
+      log("info", "Skipping visual blocks — too many images, using text-only URL map", {
+        requestId: req.id,
+        imageCount: images.length,
+        threshold: SKIP_VISUAL_THRESHOLD,
+      });
+    } else if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
       // Get dimensions for each image using Sharp
       const imageMeta = await Promise.all(
         images.map(async (img) => {
@@ -1172,7 +1179,12 @@ app.post("/generate", generateLimiter, async (req, res) => {
         .map(([filename, url]) => `${filename} → ${url}`)
         .join("\n");
 
-      userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have been shown the PDF design AND each individual image asset above. You can SEE what each image looks like. Match each image to the correct position in the email design by comparing what the image shows (photo of a person, logo, icon, banner, etc.) to where that visual appears in the PDF design.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by their VISUAL CONTENT — look at what each image depicts and place it where that visual appears in the PDF design.\n2. A small image with a logo should go in the logo position, not the hero banner.\n3. A photo of a person should go in the section where that person's photo appears in the design.\n4. A wide banner/hero image should go at the top hero section.\n5. Use the full Dropbox URL for every img src — NEVER use relative paths.\n6. If an image cannot be matched to any design element, do not use it.`;
+      if (images.length >= SKIP_VISUAL_THRESHOLD) {
+        // Text-only matching — no visual blocks sent
+        userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have NOT been shown individual image assets (too many images for visual matching). Match each image to the correct position in the email design using the FILENAME as a hint.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by FILENAME — "logo" goes in the logo position, "hero" or "banner" goes in the hero section, "founder" goes with the founder bio, "product" images go in product sections.\n2. Use the full Dropbox URL for every img src — NEVER use relative paths.\n3. If a filename cannot be matched to any design element, skip it.\n4. Preserve the original image dimensions from the design.`;
+      } else {
+        userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have been shown the PDF design AND each individual image asset above. You can SEE what each image looks like. Match each image to the correct position in the email design by comparing what the image shows (photo of a person, logo, icon, banner, etc.) to where that visual appears in the PDF design.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by their VISUAL CONTENT — look at what each image depicts and place it where that visual appears in the PDF design.\n2. A small image with a logo should go in the logo position, not the hero banner.\n3. A photo of a person should go in the section where that person's photo appears in the design.\n4. A wide banner/hero image should go at the top hero section.\n5. Use the full Dropbox URL for every img src — NEVER use relative paths.\n6. If an image cannot be matched to any design element, do not use it.`;
+      }
     }
 
     contentBlocks.push({ type: "text", text: userPrompt });
@@ -1434,7 +1446,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.7",
+    version: "1.3.8",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
