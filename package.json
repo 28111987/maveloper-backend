@@ -1,6 +1,6 @@
 {
   "name": "maveloper-backend",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "Maveloper backend — PDF to HTML email code generator using Claude Vision",
   "type": "module",
   "main": "server.js",
@@ -8,13 +8,14 @@
   "scripts": { "start": "node server.js" },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
-    "adm-zip": "^0.5.16",
     "cors": "^2.8.5",
-    "dropbox": "^10.34.0",
     "express": "^4.21.0",
     "express-rate-limit": "^7.4.0",
     "helmet": "^8.0.0",
     "pdf-to-png-converter": "^3.3.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "adm-zip": "^0.5.16",
+    "dropbox": "^10.34.0",
+    "pdf-parse": "^1.1.1"
   }
 }
