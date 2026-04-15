@@ -1093,7 +1093,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.0.0",
+    version: "3.1.0",
   });
 });
 
@@ -1332,37 +1332,101 @@ app.post("/generate", generateLimiter, async (req, res) => {
     // This is the KEY innovation: instead of relying on Claude's vision to read
     // tiny compressed text, we extract it directly from the PDF file.
     // Claude's vision only needs to understand LAYOUT (sections, colors, spacing,
-    // image positions) — the actual text content comes from this extraction.
-    let pdfRawText = "";
+    // image positions) — the actual text content comes from text extraction.
+    //
+    // Two extraction methods:
+    // 1. pdf-parse: extracts text stored as text objects in the PDF (fast, reliable)
+    // 2. Tesseract OCR: reads text from the rasterized PNG image (slower, but works
+    //    when designers export PDFs with outlined/vectorized fonts)
+    //
+    // Strategy: try pdf-parse first. If result is too short (<200 chars), the PDF
+    // likely has outlined text, so fall back to Tesseract OCR on the full-res PNG.
+
+    const MIN_USEFUL_TEXT_LENGTH = 200; // Below this, pdf-parse didn't find real text
+    let extractedText = "";
+    let textExtractionMethod = "none";
+
+    // Method 1: pdf-parse (fast — reads PDF text objects directly)
     try {
       const pdfData = await pdfParse(pdfBuffer);
-      pdfRawText = pdfData.text || "";
-      log("info", "PDF text extraction successful", {
+      const pdfText = (pdfData.text || "").trim();
+      log("info", "pdf-parse result", {
         requestId: req.id,
-        textLength: pdfRawText.length,
-        textPreview: pdfRawText.substring(0, 200),
+        textLength: pdfText.length,
+        textPreview: pdfText.substring(0, 200),
       });
-    } catch (extractErr) {
-      log("warn", "PDF text extraction failed — Stage 1 will rely on vision only", {
-        requestId: req.id,
-        error: extractErr.message,
-      });
-      // Non-fatal: Stage 1 will fall back to vision-only (worse quality but still works)
+      if (pdfText.length >= MIN_USEFUL_TEXT_LENGTH) {
+        extractedText = pdfText;
+        textExtractionMethod = "pdf-parse";
+      }
+    } catch (pdfErr) {
+      log("warn", "pdf-parse failed", { requestId: req.id, error: pdfErr.message });
     }
+
+    // Method 2: Tesseract OCR (slower — reads text from rasterized image)
+    // Only used if pdf-parse didn't return enough text
+    if (extractedText.length < MIN_USEFUL_TEXT_LENGTH) {
+      log("info", "pdf-parse returned insufficient text, falling back to Tesseract OCR", {
+        requestId: req.id,
+        pdfParseLength: extractedText.length,
+      });
+      try {
+        const { createWorker } = await import("tesseract.js");
+        const worker = await createWorker("eng");
+
+        // Use the ORIGINAL full-resolution PNG (not compressed) for best OCR quality
+        // Process each page and concatenate
+        const ocrTexts = [];
+        for (let i = 0; i < pngPages.length; i++) {
+          const { data: { text } } = await worker.recognize(pngPages[i].content);
+          ocrTexts.push(text);
+          log("info", `Tesseract OCR page ${i + 1} complete`, {
+            requestId: req.id,
+            textLength: text.length,
+          });
+        }
+        await worker.terminate();
+
+        extractedText = ocrTexts.join("\n\n--- PAGE BREAK ---\n\n").trim();
+        textExtractionMethod = "tesseract-ocr";
+
+        log("info", "Tesseract OCR extraction complete", {
+          requestId: req.id,
+          totalTextLength: extractedText.length,
+          textPreview: extractedText.substring(0, 300),
+        });
+      } catch (ocrErr) {
+        log("error", "Tesseract OCR also failed — Stage 1 will rely on vision only", {
+          requestId: req.id,
+          error: ocrErr.message,
+        });
+      }
+    }
+
+    log("info", "Text extraction result", {
+      requestId: req.id,
+      method: textExtractionMethod,
+      textLength: extractedText.length,
+    });
 
     // Build Stage 1 user message: images + extracted text + developer overrides
     let stage1UserText = "Analyze this email design and output the JSON specification.";
 
-    // Inject the extracted PDF text
-    if (pdfRawText.length > 0) {
-      // Clean up the extracted text: remove excessive whitespace, normalize line breaks
-      const cleanedText = pdfRawText
+    // Inject the extracted text (from whichever method succeeded)
+    if (extractedText.length >= MIN_USEFUL_TEXT_LENGTH) {
+      // Clean up: remove excessive whitespace, normalize line breaks
+      const cleanedText = extractedText
         .replace(/\r\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .replace(/[ \t]{2,}/g, " ")
         .trim();
 
       stage1UserText += `\n\n=== RAW TEXT EXTRACTED FROM PDF (use this VERBATIM — do NOT rewrite) ===\n${cleanedText}\n=== END RAW TEXT ===\n\nIMPORTANT: The text above was extracted directly from the PDF file. Use it EXACTLY as-is for all "text" fields in the JSON. Your job with the IMAGE is to understand the visual layout (which section each text belongs to, colors, spacing, alignment, image positions) — NOT to read the text from the image. The extracted text is the ground truth.`;
+    } else {
+      log("warn", "No usable text extracted — Stage 1 will attempt vision-based text reading", {
+        requestId: req.id,
+      });
+      stage1UserText += `\n\nWARNING: Text extraction from the PDF failed. You must read ALL text from the image carefully and VERBATIM. Do NOT paraphrase or invent text. If you cannot read a word, use [unclear].`;
     }
 
     // If developer specified width/font, tell Stage 1 so it doesn't guess wrong
@@ -1382,8 +1446,8 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Stage 1: Sending design to Claude for analysis", {
       requestId: req.id,
       pageCount: pngPages.length,
-      pdfTextExtracted: pdfRawText.length > 0,
-      pdfTextLength: pdfRawText.length,
+      textExtractionMethod,
+      extractedTextLength: extractedText.length,
       compressedPageSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
       totalCompressedKB: Math.round(compressedPdfPages.reduce((s, b) => s + b.length, 0) / 1024),
       stage1PromptChars: STAGE1_PROMPT.length,
@@ -1932,7 +1996,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.0.0",
+    version: "3.1.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
