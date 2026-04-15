@@ -935,18 +935,12 @@ app.post("/generate", generateLimiter, async (req, res) => {
       pdfBase64, 
       pdfFilename, 
       assetsZipBase64, 
-      // Developer input fields — these override Claude's guessing
+      // Developer input fields — only values Claude CANNOT detect from PDF
       emailWidth,        // e.g., 600, 640, 650, 680, 700
       primaryFont,       // e.g., "Poppins", "Montserrat", "Lato", "Arial"
       secondaryFont,     // e.g., "Arial", optional
       espPlatform,       // e.g., "none", "mailchimp", "sfmc", "hubspot", "klaviyo"
       darkMode,          // true/false
-      primaryColor,      // e.g., "#4F007D"
-      secondaryColor,    // e.g., "#FA9E0D"
-      ctaBgColor,        // e.g., "#000000"
-      ctaTextColor,      // e.g., "#FFFFFF"
-      ctaStyle,          // e.g., "square", "rounded", "pill"
-      ctaBorderRadius,   // e.g., "2px", "6px", "30px"
     } = req.body;
 
     // --- Validate PDF ---
@@ -1259,26 +1253,17 @@ app.post("/generate", generateLimiter, async (req, res) => {
       specs.push(`DARK MODE: Do NOT include any dark mode CSS. No prefers-color-scheme media query. No em_dark classes. The email does not need dark mode support.`);
     }
 
-    // Colors
-    if (primaryColor) {
-      specs.push(`PRIMARY BRAND COLOR: Use exactly ${primaryColor} for headings, accent elements, section backgrounds, and any primary brand-colored elements in the design. This is the EXACT hex — do not approximate.`);
-    }
-    if (secondaryColor) {
-      specs.push(`SECONDARY BRAND COLOR: Use exactly ${secondaryColor} for secondary accents, dividers, sub-headings, or any secondary colored elements. This is the EXACT hex — do not approximate.`);
-    }
+    // Auto-detection reinforcement — tell Claude to be extra precise about colors and CTAs
+    specs.push(`COLOR EXTRACTION: Extract EXACT hex color codes from the design PDF for every element — backgrounds, text, CTAs, dividers, accents. Do NOT approximate. If a purple looks like #4F007D, use #4F007D — not #6b1b9a. If a dark color looks like #231F20, use that — not #000000. Every distinct shade in the design is intentional.`);
 
-    // CTA
-    if (ctaBgColor || ctaStyle || ctaBorderRadius) {
-      let ctaSpec = "CTA BUTTON STYLE: ";
-      if (ctaBgColor) ctaSpec += `Background color: exactly ${ctaBgColor}. `;
-      if (ctaTextColor) ctaSpec += `Text color: exactly ${ctaTextColor}. `;
-      if (ctaStyle === "square") ctaSpec += "Border-radius: 0px (sharp corners). ";
-      else if (ctaStyle === "rounded") ctaSpec += `Border-radius: ${ctaBorderRadius || "6px"}. `;
-      else if (ctaStyle === "pill") ctaSpec += "Border-radius: 9999px (pill shape). ";
-      else if (ctaBorderRadius) ctaSpec += `Border-radius: ${ctaBorderRadius}. `;
-      ctaSpec += "Match ALL CTA properties exactly from the design — height, font-size, font-weight, padding, border.";
-      specs.push(ctaSpec);
-    }
+    specs.push(`CTA BUTTON DETECTION: Study each CTA button in the design carefully and match EVERY property exactly:
+- If corners look sharp/square: use border-radius: 0px or 2px
+- If corners look slightly rounded: use border-radius: 5px or 6px
+- If corners look moderately rounded: use border-radius: 10px to 20px
+- If the button is a full pill/capsule: use border-radius: 9999px
+- Match the EXACT background color, text color, height, font-size, font-weight, and padding from the design
+- If the button has a visible border, include it
+- NEVER default to border-radius: 30px or 9999px unless the button is clearly a pill shape`);
 
     // Inject all specs into the prompt
     if (specs.length > 0) {
