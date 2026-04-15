@@ -919,7 +919,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.8",
+    version: "1.4.0",
   });
 });
 
@@ -1050,26 +1050,32 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     // --- Step 4: Build prompt with image map + visual image blocks ---
-    // Compress PDF pages for Claude Vision (resize to max 800px width)
+    // Compress PDF pages aggressively for Claude Vision (JPEG, max 600px width, quality 50)
     const compressedPdfPages = await Promise.all(
       pngPages.map(async (page) => {
         try {
-          const metadata = await sharp(page.content).metadata();
-          if (metadata.width > 800) {
-            return await sharp(page.content).resize(800).png({ quality: 80 }).toBuffer();
-          }
-          return page.content;
+          return await sharp(page.content)
+            .resize(600, null, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 50 })
+            .toBuffer();
         } catch {
           return page.content;
         }
       })
     );
 
+    // Log compressed sizes for debugging
+    log("info", "PDF pages compressed for Claude", {
+      requestId: req.id,
+      originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
+      compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
+    });
+
     const pdfImageBlocks = compressedPdfPages.map((buf) => ({
       type: "image",
       source: {
         type: "base64",
-        media_type: "image/png",
+        media_type: "image/jpeg",
         data: buf.toString("base64"),
       },
     }));
@@ -1310,6 +1316,8 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("error", "Generation error", {
       requestId: req.id,
       error: err.message,
+      errorBody: err.error ? JSON.stringify(err.error).substring(0, 500) : "no error body",
+      status: err.status,
       durationMs: Date.now() - startTime,
     });
 
@@ -1446,7 +1454,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v1",
-    version: "1.3.8",
+    version: "1.4.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
