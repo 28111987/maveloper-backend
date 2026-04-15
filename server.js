@@ -8,6 +8,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
 import path from "path";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -455,11 +456,17 @@ function extractOrderId(filename) {
 // Developer-specified values (width, font, ESP, dark mode) are injected at call time
 // to override Claude's visual guesses with known-correct values.
 // =====================================================================
-const STAGE1_PROMPT = `You are an email design analyst. Analyze the email design image and output a compact JSON specification. No HTML. No explanation. No markdown fences.
+const STAGE1_PROMPT = `You are an email design analyst. You will receive:
+1. One or more IMAGES showing an email design
+2. RAW TEXT extracted directly from the PDF file
 
-Respond with ONLY a JSON object. Start with { end with }.
+Your job: Combine the visual layout from the images with the exact text from the PDF extraction to produce a JSON design specification.
 
-SCHEMA — keep it FLAT and COMPACT. Omit empty/null fields:
+CRITICAL: The RAW TEXT section contains the EXACT text from the PDF. You MUST use this text verbatim in your JSON output. NEVER rewrite, paraphrase, or invent text. The images help you understand WHERE each piece of text goes (which section, what styling) — but the TEXT CONTENT itself comes from the RAW TEXT extraction, not from reading the blurry image.
+
+Respond with ONLY a JSON object. No markdown fences. No backticks. No explanation. Start with { end with }.
+
+SCHEMA — flat, compact, omit empty fields:
 {
   "width": 600,
   "bg_outer": "#hex",
@@ -469,14 +476,14 @@ SCHEMA — keep it FLAT and COMPACT. Omit empty/null fields:
   "sections": [
     {
       "n": 1,
-      "type": "preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image",
+      "type": "preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|stats",
       "bg": "#hex",
       "pad": "T R B L",
       "align": "left|center|right",
       "content": [
         {
           "el": "text|image|cta|divider|spacer|link|social_icons|columns",
-          "text": "VERBATIM text here",
+          "text": "EXACT TEXT FROM PDF EXTRACTION — copy verbatim",
           "size": 16,
           "weight": 400,
           "lh": 24,
@@ -519,14 +526,14 @@ SCHEMA — keep it FLAT and COMPACT. Omit empty/null fields:
 }
 
 RULES:
-1. TEXT IS KING — ZERO TOLERANCE FOR FABRICATION: Extract ALL visible text VERBATIM — every single word, line, punctuation mark, exactly as shown. NEVER paraphrase. NEVER rewrite. NEVER invent text that is not visible in the image. If you cannot read a word clearly, use "[unclear]" — do NOT guess or substitute. A fabricated sentence is WORSE than a missing one. Copy the text EXACTLY as it appears.
-2. SECTION ORDER: Analyze top-to-bottom. Every section in the design must appear in the JSON in the same order. Do NOT rearrange, merge, or skip sections.
-3. COLORS: Best hex estimate. #231F20 ≠ #000000. #F4F4F4 ≠ #F5F5F5. Dark charcoal is NOT pure black. Light gray is NOT white.
-4. SPACING: Estimate px. 33px ≠ 30px. Use "pad": "20 25 15 25" format (top right bottom left).
-5. IMAGES: Describe WHAT it shows (logo, headshot, banner, phone mockup, book cover) — not where it is.
+1. TEXT FROM PDF EXTRACTION ONLY: Every "text" field MUST contain text copied verbatim from the RAW TEXT section below the images. NEVER generate, paraphrase, or approximate text. If a piece of text from the PDF extraction maps to a section you see in the image, use it exactly. If you cannot match a text snippet to a visual section, include it in the nearest logical section.
+2. SECTION ORDER: Analyze the image top-to-bottom. Every visible section must appear in the JSON in visual order.
+3. COLORS: Study the image for hex colors. Be specific — #231F20 ≠ #000000. #F4F4F4 ≠ #F5F5F5. Dark charcoal is NOT pure black.
+4. SPACING: Estimate px from the image. 33px ≠ 30px. Use "pad": "20 25 15 25" format.
+5. IMAGES: Describe WHAT each image shows (logo, headshot, phone mockup, book cover, banner).
 6. VML: Set has_vml: true if text overlays a background image.
-7. COMPACT: Short keys. Omit null/default fields. No redundant data.
-8. METADATA: Do NOT include order IDs, filenames, or any text from the file metadata as email content. Only extract text that is VISIBLE in the actual email design.
+7. COMPACT: Short keys. Omit null/default fields.
+8. METADATA: Order IDs, filenames, "OID" lines are NOT email content. Do not include them.
 9. NO markdown fences. NO backticks. NO explanation. ONLY the JSON object.`;
 
 // =====================================================================
@@ -895,9 +902,11 @@ At the very end of the main table, add a 1-pixel spacer row to prevent Outlook c
 11. JavaScript of any kind
 12. Typos in meta tag names (always "supported-color-schemes" not "supproted")
 13. NEVER use <p> tags for text content — ALWAYS use <td> with inline styles. Mavlers developers NEVER use <p> tags in email HTML. All text goes directly in <td> cells.
-14. NEVER use #000000 as a dark background when the design shows a dark color that is NOT pure black — colors like #231F20, #1A1625, #042624, #00003D are intentionally different from pure black.
-15. NEVER use #EFEFEB as a generic gray background — read the EXACT gray from the design. #EFEFEF, #EAEAEA, #F4F4F4, #F9F7F8, #F9FAFB are all DIFFERENT grays.
-16. NEVER default font-family to 'Inter' — Inter is just one of many fonts. If you cannot identify the font, use 'Arial, sans-serif' and wait for the developer to specify via the input fields.
+14. NEVER use <h1>, <h2>, <h3>, <h4>, <h5>, <h6> tags — Mavlers developers style headings as <td> cells with inline font-size, font-weight, line-height. Heading tags break Outlook rendering.
+15. NEVER use <div> tags for layout or content — use <td> cells inside <table> structures. The only acceptable <div> is the hidden preheader div immediately after <body>.
+16. NEVER use #000000 as a dark background when the design shows a dark color that is NOT pure black — colors like #231F20, #1A1625, #042624, #00003D are intentionally different from pure black.
+17. NEVER use #EFEFEB as a generic gray background — read the EXACT gray from the design. #EFEFEF, #EAEAEA, #F4F4F4, #F9F7F8, #F9FAFB are all DIFFERENT grays.
+18. NEVER default font-family to 'Inter' — Inter is just one of many fonts. If you cannot identify the font, use 'Arial, sans-serif' and wait for the developer to specify via the input fields.
 
 ## ADDITIONAL CODING RULES (from 10-email analysis)
 
@@ -1084,7 +1093,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.2",
+    version: "3.0.0",
   });
 });
 
@@ -1266,20 +1275,16 @@ app.post("/generate", generateLimiter, async (req, res) => {
       });
 
       // Try progressively lower quality/size until under the limit.
-      // CRITICAL: Also cap height. Anthropic's Vision resizes images to fit within
-      // 1568px on the longest side. Sending a 600×8000px image wastes tokens on
-      // server-side downscaling that destroys text readability. Better to control
-      // the resize ourselves.
-      // For very tall single-page emails (height >> width), we limit max height
-      // to keep the image readable without exploding the payload.
-      const MAX_HEIGHT = 6400; // ~10 screens worth of email at 600px width
+      // With PDF text extraction, Claude's vision only needs to see LAYOUT
+      // (section structure, colors, image positions, spacing) — not read text.
+      // This means we can use lower quality than before without losing information.
+      const MAX_HEIGHT = 6400;
 
       const attempts = [
-        { width: 1000, quality: 65 },  // Best quality
-        { width: 900, quality: 55 },   // Good quality
-        { width: 800, quality: 50 },   // Moderate
-        { width: 700, quality: 45 },   // Reduced
-        { width: 600, quality: 40 },   // Last resort
+        { width: 800, quality: 55 },   // Good for layout detection
+        { width: 700, quality: 50 },   // Moderate
+        { width: 600, quality: 45 },   // Reduced — still fine for layout
+        { width: 500, quality: 40 },   // Last resort
       ];
 
       compressed = page.content; // fallback to original
@@ -1323,16 +1328,50 @@ app.post("/generate", generateLimiter, async (req, res) => {
       },
     }));
 
-    // Build Stage 1 user message: images + any developer overrides that affect analysis
+    // --- Extract raw text from PDF ---
+    // This is the KEY innovation: instead of relying on Claude's vision to read
+    // tiny compressed text, we extract it directly from the PDF file.
+    // Claude's vision only needs to understand LAYOUT (sections, colors, spacing,
+    // image positions) — the actual text content comes from this extraction.
+    let pdfRawText = "";
+    try {
+      const pdfData = await pdfParse(pdfBuffer);
+      pdfRawText = pdfData.text || "";
+      log("info", "PDF text extraction successful", {
+        requestId: req.id,
+        textLength: pdfRawText.length,
+        textPreview: pdfRawText.substring(0, 200),
+      });
+    } catch (extractErr) {
+      log("warn", "PDF text extraction failed — Stage 1 will rely on vision only", {
+        requestId: req.id,
+        error: extractErr.message,
+      });
+      // Non-fatal: Stage 1 will fall back to vision-only (worse quality but still works)
+    }
+
+    // Build Stage 1 user message: images + extracted text + developer overrides
     let stage1UserText = "Analyze this email design and output the JSON specification.";
+
+    // Inject the extracted PDF text
+    if (pdfRawText.length > 0) {
+      // Clean up the extracted text: remove excessive whitespace, normalize line breaks
+      const cleanedText = pdfRawText
+        .replace(/\r\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+
+      stage1UserText += `\n\n=== RAW TEXT EXTRACTED FROM PDF (use this VERBATIM — do NOT rewrite) ===\n${cleanedText}\n=== END RAW TEXT ===\n\nIMPORTANT: The text above was extracted directly from the PDF file. Use it EXACTLY as-is for all "text" fields in the JSON. Your job with the IMAGE is to understand the visual layout (which section each text belongs to, colors, spacing, alignment, image positions) — NOT to read the text from the image. The extracted text is the ground truth.`;
+    }
 
     // If developer specified width/font, tell Stage 1 so it doesn't guess wrong
     const width = emailWidth ? parseInt(emailWidth, 10) : null;
     if (width && [600, 640, 650, 680, 700].includes(width)) {
-      stage1UserText += `\n\nDEVELOPER OVERRIDE — Email width is CONFIRMED as ${width}px. Use this exact value in estimated_width. Do not guess.`;
+      stage1UserText += `\n\nDEVELOPER OVERRIDE — Email width is CONFIRMED as ${width}px. Use this exact value. Do not guess.`;
     }
     if (primaryFont) {
-      stage1UserText += `\n\nDEVELOPER OVERRIDE — Primary font is CONFIRMED as '${primaryFont}'. Use this in estimated_font_body and estimated_font_heading (unless heading is clearly a different font).`;
+      stage1UserText += `\n\nDEVELOPER OVERRIDE — Primary font is CONFIRMED as '${primaryFont}'. Use this in font_body and font_heading (unless heading is clearly a different font).`;
     }
 
     const stage1Content = [
@@ -1343,9 +1382,10 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Stage 1: Sending design to Claude for analysis", {
       requestId: req.id,
       pageCount: pngPages.length,
+      pdfTextExtracted: pdfRawText.length > 0,
+      pdfTextLength: pdfRawText.length,
       compressedPageSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
       totalCompressedKB: Math.round(compressedPdfPages.reduce((s, b) => s + b.length, 0) / 1024),
-      base64TotalKB: Math.round(compressedPdfPages.reduce((s, b) => s + Buffer.from(b).toString("base64").length, 0) / 1024),
       stage1PromptChars: STAGE1_PROMPT.length,
       userTextChars: stage1UserText.length,
       contentBlockCount: stage1Content.length,
@@ -1892,7 +1932,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.2",
+    version: "3.0.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
