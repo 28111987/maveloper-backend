@@ -1084,7 +1084,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.0",
+    version: "2.4.1",
   });
 });
 
@@ -1231,72 +1231,85 @@ app.post("/generate", generateLimiter, async (req, res) => {
     // =================================================================
 
     // Adaptive image compression for Stage 1.
-    // Text extraction requires readable text, but the Anthropic API has input size limits.
-    // Strategy: choose resolution/quality based on page count + total original size.
+    // Text extraction needs readable text, but the Anthropic API limits input size.
     //
-    // History of what failed:
-    //   600px Q50  → text was unreadable, Claude hallucinated body copy
-    //   1200px Q75 → 780KB single image, API rejected with 400 (payload too large)
-    //   1000px Q65 → untested, may still be too large for long single-page PDFs
+    // Key insight: Email PDFs are often VERY TALL single pages (5000-10000px at 1.6x).
+    // Width-only resize doesn't help — a 900px-wide, 8000px-tall JPEG is still huge.
+    // We must cap total pixel area AND check final file size.
     //
-    // Adaptive tiers (tested against Kenect email — 2537KB single-page PNG):
-    const totalOriginalSizeKB = pngPages.reduce((sum, p) => sum + p.content.length, 0) / 1024;
-    const pageCount = pngPages.length;
+    // Anthropic Vision supports images up to ~5MB base64. To be safe, we target
+    // compressed images under 1.5MB each (base64 inflates ~33%, so ~2MB encoded).
+    //
+    // History: 600px Q50 = text unreadable. 1200px Q75 = too large. 1000px Q65 = too large.
+    //          Root cause was always the HEIGHT of long single-page emails.
 
-    let targetWidth, targetQuality;
-    if (pageCount === 1 && totalOriginalSizeKB < 2000) {
-      // Short single-page email — maximize quality
-      targetWidth = 1000; targetQuality = 65;
-    } else if (pageCount === 1) {
-      // Long single-page email (like Kenect — 2500KB+ PNG)
-      targetWidth = 900; targetQuality = 55;
-    } else if (pageCount <= 3) {
-      // Multi-page (2-3 pages)
-      targetWidth = 800; targetQuality = 55;
-    } else {
-      // 4+ pages — aggressive compression to stay within limits
-      targetWidth = 700; targetQuality = 50;
-    }
+    const TARGET_MAX_BYTES = 1.5 * 1024 * 1024; // 1.5MB per compressed page
 
-    log("info", "Adaptive compression selected for Stage 1", {
-      requestId: req.id,
-      pageCount,
-      totalOriginalSizeKB: Math.round(totalOriginalSizeKB),
-      targetWidth,
-      targetQuality,
-    });
+    const compressedPdfPages = [];
+    for (let i = 0; i < pngPages.length; i++) {
+      const page = pngPages[i];
+      let compressed;
 
-    const compressedPdfPages = await Promise.all(
-      pngPages.map(async (page) => {
+      // Get original dimensions
+      let origWidth = 0, origHeight = 0;
+      try {
+        const meta = await sharp(page.content).metadata();
+        origWidth = meta.width || 0;
+        origHeight = meta.height || 0;
+      } catch { /* use defaults */ }
+
+      log("info", `Page ${i + 1} dimensions`, {
+        requestId: req.id,
+        origWidth,
+        origHeight,
+        origSizeKB: Math.round(page.content.length / 1024),
+      });
+
+      // Try progressively lower quality/size until under the limit.
+      // CRITICAL: Also cap height. Anthropic's Vision resizes images to fit within
+      // 1568px on the longest side. Sending a 600×8000px image wastes tokens on
+      // server-side downscaling that destroys text readability. Better to control
+      // the resize ourselves.
+      // For very tall single-page emails (height >> width), we limit max height
+      // to keep the image readable without exploding the payload.
+      const MAX_HEIGHT = 6400; // ~10 screens worth of email at 600px width
+
+      const attempts = [
+        { width: 1000, quality: 65 },  // Best quality
+        { width: 900, quality: 55 },   // Good quality
+        { width: 800, quality: 50 },   // Moderate
+        { width: 700, quality: 45 },   // Reduced
+        { width: 600, quality: 40 },   // Last resort
+      ];
+
+      compressed = page.content; // fallback to original
+
+      for (const attempt of attempts) {
         try {
-          return await sharp(page.content)
-            .resize(targetWidth, null, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: targetQuality })
+          const buf = await sharp(page.content)
+            .resize(attempt.width, MAX_HEIGHT, { fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: attempt.quality })
             .toBuffer();
-        } catch {
-          return page.content;
-        }
-      })
-    );
 
-    // Safety check: if any single compressed page > 4MB, re-compress at lower quality
-    const MAX_PAGE_BYTES = 4 * 1024 * 1024;
-    for (let i = 0; i < compressedPdfPages.length; i++) {
-      if (compressedPdfPages[i].length > MAX_PAGE_BYTES) {
-        log("warn", `Page ${i + 1} still too large (${Math.round(compressedPdfPages[i].length / 1024)}KB), re-compressing`, { requestId: req.id });
-        try {
-          compressedPdfPages[i] = await sharp(pngPages[i].content)
-            .resize(700, null, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: 45 })
-            .toBuffer();
+          if (buf.length <= TARGET_MAX_BYTES) {
+            compressed = buf;
+            log("info", `Page ${i + 1} compressed: ${attempt.width}px Q${attempt.quality} → ${Math.round(buf.length / 1024)}KB`, { requestId: req.id });
+            break;
+          } else {
+            log("info", `Page ${i + 1} attempt ${attempt.width}px Q${attempt.quality} → ${Math.round(buf.length / 1024)}KB (too large, trying smaller)`, { requestId: req.id });
+            compressed = buf; // keep the last attempt as fallback
+          }
         } catch {
-          // Keep the original compression if re-compress fails
+          continue;
         }
       }
+
+      compressedPdfPages.push(compressed);
     }
 
     log("info", "PDF pages compressed for Stage 1", {
       requestId: req.id,
+      pageCount: pngPages.length,
       originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
       compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
     });
@@ -1330,6 +1343,12 @@ app.post("/generate", generateLimiter, async (req, res) => {
     log("info", "Stage 1: Sending design to Claude for analysis", {
       requestId: req.id,
       pageCount: pngPages.length,
+      compressedPageSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
+      totalCompressedKB: Math.round(compressedPdfPages.reduce((s, b) => s + b.length, 0) / 1024),
+      base64TotalKB: Math.round(compressedPdfPages.reduce((s, b) => s + Buffer.from(b).toString("base64").length, 0) / 1024),
+      stage1PromptChars: STAGE1_PROMPT.length,
+      userTextChars: stage1UserText.length,
+      contentBlockCount: stage1Content.length,
     });
 
     const stage1StartTime = Date.now();
@@ -1682,7 +1701,7 @@ ${specs.join("\n\n")}
     log("error", "Generation error", {
       requestId: req.id,
       error: err.message,
-      errorBody: err.error ? JSON.stringify(err.error).substring(0, 500) : "no error body",
+      errorBody: err.error ? JSON.stringify(err.error).substring(0, 2000) : "no error body",
       status: err.status,
       durationMs: Date.now() - startTime,
     });
@@ -1820,7 +1839,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.0",
+    version: "2.4.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
