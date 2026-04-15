@@ -1,6 +1,6 @@
 {
   "name": "maveloper-backend",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Maveloper backend — PDF to HTML email code generator using Claude Vision",
   "type": "module",
   "main": "server.js",
@@ -16,6 +16,7 @@
     "sharp": "^0.33.5",
     "adm-zip": "^0.5.16",
     "dropbox": "^10.34.0",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.1.1"
   }
 }
