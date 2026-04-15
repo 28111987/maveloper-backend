@@ -1084,7 +1084,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.1",
+    version: "2.4.2",
   });
 });
 
@@ -1384,7 +1384,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
     try {
       let jsonText = stage1TextBlock.text.trim();
 
-      // Strip markdown fences
+      // Strip markdown fences (Claude adds these despite being told not to)
       jsonText = jsonText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
 
       // If Claude added preamble text before the JSON, find the first {
@@ -1392,6 +1392,22 @@ app.post("/generate", generateLimiter, async (req, res) => {
       if (firstBrace > 0) {
         jsonText = jsonText.substring(firstBrace);
       }
+
+      // Find the last } to strip any trailing text after JSON
+      const lastBrace = jsonText.lastIndexOf("}");
+      if (lastBrace > 0 && lastBrace < jsonText.length - 1) {
+        jsonText = jsonText.substring(0, lastBrace + 1);
+      }
+
+      // Sanitize common Claude JSON errors before parsing:
+      // 1. Trailing commas before } or ] (e.g., {"a":1,} )
+      jsonText = jsonText.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+      // 2. Single quotes instead of double quotes (e.g., {'key': 'value'})
+      // Only fix simple cases — avoid breaking strings that contain apostrophes
+      // 3. Unescaped newlines inside string values
+      jsonText = jsonText.replace(/(?<=:\s*"[^"]*)\n(?=[^"]*")/g, "\\n");
+      // 4. Control characters inside strings
+      jsonText = jsonText.replace(/[\x00-\x1f](?=(?:[^"]*"[^"]*")*[^"]*$)/g, "");
 
       // If truncated (no closing brace), attempt to repair
       if (stage1StopReason === "max_tokens" || !jsonText.endsWith("}")) {
@@ -1431,19 +1447,56 @@ app.post("/generate", generateLimiter, async (req, res) => {
 
       designSpec = JSON.parse(jsonText);
     } catch (parseErr) {
-      log("error", "Stage 1: Failed to parse JSON from Claude", {
+      // First parse failed — try to locate and fix the error
+      log("warn", "Stage 1: First JSON.parse failed, attempting aggressive repair", {
         requestId: req.id,
         error: parseErr.message,
-        stopReason: stage1StopReason,
-        rawResponseLength: stage1TextBlock.text.length,
-        rawResponseStart: stage1TextBlock.text.substring(0, 300),
-        rawResponseEnd: stage1TextBlock.text.substring(stage1TextBlock.text.length - 300),
       });
-      return res.status(502).json({
-        error: "Design analysis failed",
-        details: "Claude returned an invalid design specification. Please try again.",
-        requestId: req.id,
-      });
+
+      try {
+        let jsonText = stage1TextBlock.text.trim();
+        // Aggressive cleanup: strip everything outside the outermost { }
+        const firstBrace = jsonText.indexOf("{");
+        const lastBrace = jsonText.lastIndexOf("}");
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          jsonText = jsonText.substring(firstBrace, lastBrace + 1);
+        }
+
+        // Fix trailing commas
+        jsonText = jsonText.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+
+        // Remove any non-printable characters
+        jsonText = jsonText.replace(/[\x00-\x1f\x7f]/g, " ");
+
+        // Try to find the error position and remove the problematic line
+        const posMatch = parseErr.message.match(/at position (\d+)/);
+        if (posMatch) {
+          const errorPos = parseInt(posMatch[1], 10);
+          // Log the area around the error for debugging
+          log("warn", "Stage 1: JSON error near position " + errorPos, {
+            requestId: req.id,
+            context: jsonText.substring(Math.max(0, errorPos - 100), errorPos + 100),
+          });
+        }
+
+        designSpec = JSON.parse(jsonText);
+        log("info", "Stage 1: Aggressive repair succeeded", { requestId: req.id });
+      } catch (retryErr) {
+        log("error", "Stage 1: All JSON parse attempts failed", {
+          requestId: req.id,
+          originalError: parseErr.message,
+          retryError: retryErr.message,
+          stopReason: stage1StopReason,
+          rawResponseLength: stage1TextBlock.text.length,
+          rawResponseStart: stage1TextBlock.text.substring(0, 300),
+          rawResponseEnd: stage1TextBlock.text.substring(stage1TextBlock.text.length - 300),
+        });
+        return res.status(502).json({
+          error: "Design analysis failed",
+          details: "Claude returned an invalid design specification. Please try again.",
+          requestId: req.id,
+        });
+      }
     }
 
     log("info", "Stage 1 complete: design spec parsed", {
@@ -1839,7 +1892,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "2.4.1",
+    version: "2.4.2",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
