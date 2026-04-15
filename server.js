@@ -450,11 +450,148 @@ function extractOrderId(filename) {
 }
 
 // =====================================================================
-// MAVELOPER MASTER FRAMEWORK SYSTEM PROMPT
-// Distilled from 100 production Mavlers emails — 140 documented patterns.
+// STAGE 1 PROMPT — Design Analysis (Vision → JSON)
+// Short, focused: Claude analyzes the PDF image and outputs a structured spec.
+// Developer-specified values (width, font, ESP, dark mode) are injected at call time
+// to override Claude's visual guesses with known-correct values.
 // =====================================================================
-const SYSTEM_PROMPT = `## IDENTITY
-You are the senior email developer at Mavlers, a digital marketing agency renowned for pixel-perfect, production-grade HTML email code that renders identically across 40+ email clients including Outlook 2007-365, Gmail (Web, iOS, Android), Apple Mail (macOS, iOS), Yahoo, Outlook.com, Samsung Mail, and dark/light modes. You will receive one or more images showing pages of an email design PDF. Your job is to output production-ready Mavlers-grade HTML email code that visually matches the design EXACTLY and follows the Mavlers framework refined across 100+ enterprise client projects.
+const STAGE1_PROMPT = `You are a senior email design analyst at Mavlers. You will receive one or more images showing pages of an email design PDF. Your ONLY job is to analyze the design and output a JSON specification. Do NOT generate any HTML. Do NOT add any explanation.
+
+IMPORTANT: Analyze the design SECTION BY SECTION from top to bottom. For each section, capture:
+- Type (preheader, logo, navigation, hero_image, heading, body_text, cta, multi_column, divider, spacer, footer, social_icons, disclaimer, image_row, etc.)
+- All visual properties you can detect (colors, alignment, approximate spacing)
+- Text content VERBATIM — every word, every line, as it appears
+
+OUTPUT FORMAT: Respond with ONLY a valid JSON object. No markdown fences. No explanation. Start with { and end with }.
+
+JSON SCHEMA:
+{
+  "design_analysis": {
+    "overall": {
+      "estimated_width": <number — 600, 640, 650, 680, or 700>,
+      "outer_background_color": "<hex>",
+      "content_background_color": "<hex>",
+      "estimated_font_body": "<best guess or 'unknown-sans-serif' / 'unknown-serif'>",
+      "estimated_font_heading": "<best guess or same as body>"
+    },
+    "sections": [
+      {
+        "order": <1-based position from top>,
+        "type": "<section type>",
+        "background_color": "<hex or 'transparent'>",
+        "padding": {
+          "top": "<estimated px>",
+          "right": "<estimated px>",
+          "bottom": "<estimated px>",
+          "left": "<estimated px>"
+        },
+        "content": [
+          {
+            "element": "<text|image|cta|divider|spacer|icon_row|social_links|columns>",
+            "text": "<verbatim text if applicable>",
+            "font_size": "<estimated px>",
+            "font_weight": "<100-900>",
+            "line_height": "<estimated px>",
+            "color": "<hex>",
+            "alignment": "<left|center|right>",
+            "letter_spacing": "<estimated px or 'normal'>",
+            "text_transform": "<none|uppercase|lowercase|capitalize>",
+            "link_url": "<if element is a link or CTA>",
+            "image_description": "<what the image shows — for matching to uploaded assets>",
+            "image_estimated_width": "<px>",
+            "image_estimated_height": "<px>",
+            "cta_style": {
+              "background_color": "<hex>",
+              "text_color": "<hex>",
+              "border_radius": "<estimated px — 0 for square, 5-6 for slightly rounded, 20-30 for rounded, 9999 for pill>",
+              "height": "<estimated px>",
+              "font_size": "<px>",
+              "font_weight": "<100-900>",
+              "horizontal_padding": "<estimated px>",
+              "has_border": <true|false>,
+              "border_color": "<hex if has_border>",
+              "border_width": "<px if has_border>"
+            },
+            "columns": [
+              {
+                "width_percent": "<estimated %>",
+                "content": [ "<nested content elements>" ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "image_positions": [
+      {
+        "position_in_design": <1-based from top>,
+        "section_order": <which section this image belongs to>,
+        "description": "<what the image shows: logo, hero banner, headshot, product photo, icon, etc.>",
+        "estimated_width": "<px>",
+        "estimated_height": "<px>",
+        "alignment": "<left|center|right>",
+        "is_full_width": <true|false>,
+        "is_background_image": <true|false>
+      }
+    ],
+    "color_palette": {
+      "primary_brand": "<hex — dominant brand color>",
+      "secondary_brand": "<hex — secondary accent if visible>",
+      "background_outer": "<hex>",
+      "background_content": "<hex>",
+      "text_primary": "<hex — main body text color>",
+      "text_secondary": "<hex — lighter/secondary text>",
+      "text_heading": "<hex>",
+      "cta_primary_bg": "<hex>",
+      "cta_primary_text": "<hex>",
+      "footer_bg": "<hex>",
+      "footer_text": "<hex>",
+      "divider": "<hex if visible>",
+      "preheader_bg": "<hex if visible>",
+      "preheader_text": "<hex if visible>"
+    },
+    "typography": {
+      "body_size": "<px>",
+      "body_weight": "<100-900>",
+      "body_line_height": "<px>",
+      "heading_size": "<px>",
+      "heading_weight": "<100-900>",
+      "heading_line_height": "<px>",
+      "footer_size": "<px>"
+    },
+    "features_detected": {
+      "has_preheader_bar": <true|false>,
+      "has_navigation": <true|false>,
+      "has_hero_image": <true|false>,
+      "has_vml_background_needed": <true|false — true if text overlays a background image>,
+      "has_multi_column": <true|false>,
+      "column_count": <2|3|0>,
+      "has_social_icons": <true|false>,
+      "has_footer_links": <true|false>,
+      "has_compliance_disclaimer": <true|false>,
+      "total_cta_count": <number>,
+      "total_image_count": <number>,
+      "text_over_image_sections": <number — sections where text sits on top of an image background>
+    }
+  }
+}
+
+CRITICAL RULES:
+1. Extract ALL visible text VERBATIM. Every word, every line break, every piece of punctuation.
+2. For colors, give your best hex estimate. Be specific — #231F20 is different from #000000.
+3. For spacing, estimate in pixels. Be precise — 33px is different from 30px.
+4. Count sections from top to bottom. Miss nothing.
+5. For images, describe WHAT the image shows (not where it is) — this helps match uploaded assets.
+6. If you see text overlaid on a background image, mark has_vml_background_needed: true for that section.
+7. Output ONLY the JSON. No markdown. No explanation.`;
+
+// =====================================================================
+// STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
+// Receives structured JSON + image URLs + developer overrides.
+// Contains the full Master Framework rules for HTML output.
+// =====================================================================
+const STAGE2_PROMPT = `## IDENTITY
+You are the senior email developer at Mavlers, a digital marketing agency renowned for pixel-perfect, production-grade HTML email code that renders identically across 40+ email clients including Outlook 2007-365, Gmail (Web, iOS, Android), Apple Mail (macOS, iOS), Yahoo, Outlook.com, Samsung Mail, and dark/light modes. You will receive a STRUCTURED JSON DESIGN SPECIFICATION (not images) describing every section, color, spacing value, and text element of the email. Your job is to convert this specification into production-ready Mavlers-grade HTML email code that follows the Mavlers framework refined across 100+ enterprise client projects. Trust the JSON spec — it contains the analyzed design data. Generate HTML from the spec, not from guesswork.
 
 ## ABSOLUTE OUTPUT RULES (non-negotiable)
 1. Output ONLY the final HTML. Begin with <!DOCTYPE. End with </html>. Nothing before, nothing after.
@@ -465,11 +602,11 @@ You are the senior email developer at Mavlers, a digital marketing agency renown
 6. Use clean, indented, human-readable formatting. Two-space indent.
 
 ## ABSOLUTE VISUAL FIDELITY RULES
-1. Match the design EXACTLY. Do not approximate, simplify, modernize, or improve anything. The design is the law.
-2. Extract ALL visible text VERBATIM from the images. Every word, capitalization, punctuation, and line break. Never paraphrase, summarize, abbreviate, or invent copy.
-3. Match EXACT hex color codes from the design. NEVER approximate. If a green looks like #0BB68A, do NOT output #1BB292. If a dark looks like #042624, do NOT output #0A3832. Pay extreme attention to subtle color differences — two similar greens are likely two different hex values. When in doubt, favor the darker/more saturated reading.
-4. Match EXACT spacing in pixels as shown. Do NOT round to convenient multiples of 10 or 20. If the design shows 31px padding, use 31. If 42px, use 42. If 17px between items, use 17. Mavlers emails use precise, non-round pixel values — that precision is what makes them pixel-perfect.
-5. Match EXACT typography — font family (including Google Fonts), font size, font weight, line-height, letter-spacing, text-transform. NEVER inflate font sizes. If body copy in the design is 14px, use 14px — not 16px. If a CTA button text is font-weight:400, use 400 — not 700.
+1. The JSON spec IS the design. Use EVERY value from the spec exactly as specified. Do not approximate, simplify, modernize, or improve anything.
+2. Use ALL text from the spec VERBATIM. Every word, capitalization, punctuation, and line break. Never paraphrase, summarize, abbreviate, or invent copy.
+3. Use EXACT hex color codes from the spec's color_palette and per-section colors. NEVER substitute generic colors.
+4. Use EXACT spacing in pixels from the spec's padding values. Do NOT round to convenient multiples of 10 or 20.
+5. Use EXACT typography — font family, font size, font weight, line-height, letter-spacing, text-transform — all from the spec.
 6. Match exact column structures (1-col, 2-col, 3-col, asymmetric) with the correct mobile stacking behavior.
 7. Match all decorative elements: dividers (exact thickness, exact color), borders, background colors, background images, icons, illustrations.
 8. If text in the design appears in a non-standard font requiring loading, you MUST include the Google Font (see MANDATORY GOOGLE FONT LOADING section below).
@@ -933,7 +1070,7 @@ Before outputting, verify EVERY item. If ANY item fails, fix it before outputtin
 - ESP merge tags included if developer specified the platform
 - Output ends with </html>
 
-Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided design images.`;
+Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided JSON design specification and developer overrides.`;
 
 // =====================================================================
 // EXPRESS APP SETUP
@@ -1001,8 +1138,8 @@ app.get("/health", (req, res) => {
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     dropboxConfigured,
     model: CLAUDE_MODEL,
-    framework: "master-v1",
-    version: "2.1.0",
+    framework: "master-v2",
+    version: "2.2.0",
   });
 });
 
@@ -1142,8 +1279,13 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     }
 
-    // --- Step 4: Build prompt with image map + visual image blocks ---
-    // Compress PDF pages aggressively for Claude Vision (JPEG, max 600px width, quality 50)
+    // =================================================================
+    // STAGE 1 — Design Analysis (Vision → JSON)
+    // Send compressed PDF pages to Claude with STAGE1_PROMPT.
+    // Claude returns a structured JSON spec of the design.
+    // =================================================================
+
+    // Compress PDF pages for Claude Vision (JPEG, max 600px width, quality 50)
     const compressedPdfPages = await Promise.all(
       pngPages.map(async (page) => {
         try {
@@ -1157,8 +1299,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       })
     );
 
-    // Log compressed sizes for debugging
-    log("info", "PDF pages compressed for Claude", {
+    log("info", "PDF pages compressed for Stage 1", {
       requestId: req.id,
       originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
       compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
@@ -1173,131 +1314,108 @@ app.post("/generate", generateLimiter, async (req, res) => {
       },
     }));
 
-    // Build content array: PDF pages first, then extracted images with labels, then text prompt
-    const contentBlocks = [
-      ...pdfImageBlocks,
-      { type: "text", text: "--- The above images show the email design PDF pages. Below are the individual image assets extracted/uploaded for this email. Study each one carefully to understand what it depicts (logo, photo, icon, banner, etc.) before matching them to the design. ---" },
-    ];
+    // Build Stage 1 user message: images + any developer overrides that affect analysis
+    let stage1UserText = "Analyze this email design and output the JSON specification.";
 
-    // Add each extracted image as a visual block so Claude can SEE them and match accurately
-    // Compress to max 400px width for visual matching (full-res stays on Dropbox)
-    // For emails with 15+ images, skip visual blocks entirely — use text-only URL map
-    const MAX_VISUAL_BLOCKS = 5;
-    const MIN_VISUAL_SIZE = 3 * 1024; // Skip images under 3KB (spacers, tiny icons)
-    const SKIP_VISUAL_THRESHOLD = 15; // Too many images — text-only matching
-
-    if (images.length >= SKIP_VISUAL_THRESHOLD) {
-      log("info", "Skipping visual blocks — too many images, using text-only URL map", {
-        requestId: req.id,
-        imageCount: images.length,
-        threshold: SKIP_VISUAL_THRESHOLD,
-      });
-    } else if (images.length > 0 && Object.keys(imageUrlMap).length > 0) {
-      // Get dimensions for each image using Sharp
-      const imageMeta = await Promise.all(
-        images.map(async (img) => {
-          try {
-            const metadata = await sharp(img.buffer).metadata();
-            return { filename: img.filename, width: metadata.width, height: metadata.height, size: img.buffer.length };
-          } catch {
-            return { filename: img.filename, width: 0, height: 0, size: img.buffer.length };
-          }
-        })
-      );
-
-      // Sort images by file size descending — largest (most important) first
-      const sortedIndices = imageMeta
-        .map((meta, idx) => ({ idx, size: meta.size }))
-        .sort((a, b) => b.size - a.size)
-        .map((item) => item.idx);
-
-      let visualBlockCount = 0;
-
-      for (const i of sortedIndices) {
-        const img = images[i];
-        const meta = imageMeta[i];
-        const url = imageUrlMap[img.filename];
-
-        // Always list ALL images in the text map (for URL reference)
-        // But only send significant ones as visual blocks
-
-        if (img.buffer.length < MIN_VISUAL_SIZE) continue; // Skip tiny files
-        if (visualBlockCount >= MAX_VISUAL_BLOCKS) continue; // Cap visual blocks
-
-        // Determine media type from extension
-        const ext = path.extname(img.filename).toLowerCase();
-        const mediaTypeMap = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" };
-        const mediaType = mediaTypeMap[ext] || "image/jpeg";
-
-        // Compress image for Claude Vision (max 400px width — enough to identify content)
-        let visualBuffer = img.buffer;
-        try {
-          const imgMeta = await sharp(img.buffer).metadata();
-          if (imgMeta.width > 400) {
-            visualBuffer = await sharp(img.buffer)
-              .resize(400)
-              .jpeg({ quality: 70 })
-              .toBuffer();
-          }
-        } catch {
-          // Use original if compression fails
-        }
-
-        // Add a label before each image
-        contentBlocks.push({
-          type: "text",
-          text: `Image asset: "${img.filename}" (${meta.width}×${meta.height}px) → URL: ${url}`,
-        });
-
-        // Add the compressed image so Claude can see it
-        contentBlocks.push({
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: visualBuffer === img.buffer ? mediaType : "image/jpeg",
-            data: visualBuffer.toString("base64"),
-          },
-        });
-
-        visualBlockCount++;
-      }
-
-      log("info", "Visual blocks prepared for Claude", {
-        requestId: req.id,
-        totalImages: images.length,
-        visualBlocksSent: visualBlockCount,
-        skippedSmall: images.filter((img) => img.buffer.length < MIN_VISUAL_SIZE).length,
-      });
-    }
-
-    // Build the final text prompt
-    let userPrompt = "Generate production-ready Mavlers-grade HTML email code that visually matches the design shown in the PDF page images above EXACTLY. Extract all text verbatim. Output only the HTML starting with <!DOCTYPE.";
-
-    // --- Inject developer-specified values as HARD OVERRIDES ---
-    const specs = [];
-
-    // Width
+    // If developer specified width/font, tell Stage 1 so it doesn't guess wrong
     const width = emailWidth ? parseInt(emailWidth, 10) : null;
     if (width && [600, 640, 650, 680, 700].includes(width)) {
-      const breakpoint = width - 1;
-      specs.push(`EMAIL WIDTH: Use exactly ${width}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
+      stage1UserText += `\n\nDEVELOPER OVERRIDE — Email width is CONFIRMED as ${width}px. Use this exact value in estimated_width. Do not guess.`;
+    }
+    if (primaryFont) {
+      stage1UserText += `\n\nDEVELOPER OVERRIDE — Primary font is CONFIRMED as '${primaryFont}'. Use this in estimated_font_body and estimated_font_heading (unless heading is clearly a different font).`;
     }
 
-    // Fonts
-    if (primaryFont) {
-      const fontStack = secondaryFont 
-        ? `'${primaryFont}', '${secondaryFont}', Arial, sans-serif`
-        : `'${primaryFont}', Arial, sans-serif`;
-      
-      // Determine if Google Font loading is needed
-      const systemFonts = ["arial", "helvetica", "times new roman", "georgia", "verdana", "courier new", "tahoma", "trebuchet ms"];
-      const needsGoogleFont = !systemFonts.includes(primaryFont.toLowerCase());
-      
-      if (needsGoogleFont) {
-        specs.push(`FONT: Load '${primaryFont}' via Google Fonts inside <!--[if !mso]><!--><style>@import url('https://fonts.googleapis.com/css2?family=${encodeURIComponent(primaryFont)}:wght@100..900&display=swap');</style><!--<![endif]-->. Use font-family: ${fontStack} for ALL text elements throughout the email. NEVER fall back to just 'Arial, sans-serif' — the loaded font MUST be the primary in every font-family declaration.`);
-      } else {
-        specs.push(`FONT: Use font-family: ${fontStack} for all text elements. No Google Font loading needed.`);
-      }
+    const stage1Content = [
+      ...pdfImageBlocks,
+      { type: "text", text: stage1UserText },
+    ];
+
+    log("info", "Stage 1: Sending design to Claude for analysis", {
+      requestId: req.id,
+      pageCount: pngPages.length,
+    });
+
+    const stage1StartTime = Date.now();
+
+    const stage1Response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 16000,
+      system: STAGE1_PROMPT,
+      messages: [{ role: "user", content: stage1Content }],
+    });
+
+    const stage1TextBlock = stage1Response.content?.find((block) => block.type === "text");
+    if (!stage1TextBlock || !stage1TextBlock.text) {
+      log("error", "Stage 1: Claude returned no text", { requestId: req.id });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Claude could not analyze the design. Please try again.",
+        requestId: req.id,
+      });
+    }
+
+    // Parse the JSON spec from Stage 1
+    let designSpec;
+    try {
+      // Strip any markdown fences if Claude wrapped the JSON
+      let jsonText = stage1TextBlock.text.trim();
+      if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7);
+      if (jsonText.startsWith("```")) jsonText = jsonText.slice(3);
+      if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3);
+      jsonText = jsonText.trim();
+
+      designSpec = JSON.parse(jsonText);
+    } catch (parseErr) {
+      log("error", "Stage 1: Failed to parse JSON from Claude", {
+        requestId: req.id,
+        error: parseErr.message,
+        rawResponse: stage1TextBlock.text.substring(0, 500),
+      });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Claude returned an invalid design specification. Please try again.",
+        requestId: req.id,
+      });
+    }
+
+    log("info", "Stage 1 complete: design spec parsed", {
+      requestId: req.id,
+      stage1DurationMs: Date.now() - stage1StartTime,
+      sectionCount: designSpec?.design_analysis?.sections?.length || 0,
+      imagePositions: designSpec?.design_analysis?.image_positions?.length || 0,
+      specWidth: designSpec?.design_analysis?.overall?.estimated_width,
+      specFont: designSpec?.design_analysis?.overall?.estimated_font_body,
+    });
+
+    // =================================================================
+    // STAGE 2 — Code Generation (JSON spec + URLs → HTML)
+    // Send the design spec + image URL map + developer overrides
+    // to Claude with STAGE2_PROMPT. No PDF images sent.
+    // =================================================================
+
+    // --- Build developer specs (same logic as before, but now for Stage 2) ---
+    const specs = [];
+
+    // Width — developer override wins, then fall back to Stage 1 detection
+    const finalWidth = width || designSpec?.design_analysis?.overall?.estimated_width || 600;
+    const breakpoint = finalWidth - 1;
+    specs.push(`EMAIL WIDTH: Use exactly ${finalWidth}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
+
+    // Fonts — developer override wins, then fall back to Stage 1 detection
+    const finalFont = primaryFont || designSpec?.design_analysis?.overall?.estimated_font_body || "Arial";
+    const finalSecondaryFont = secondaryFont || designSpec?.design_analysis?.overall?.estimated_font_heading;
+    const fontStack = (finalSecondaryFont && finalSecondaryFont !== finalFont)
+      ? `'${finalFont}', '${finalSecondaryFont}', Arial, sans-serif`
+      : `'${finalFont}', Arial, sans-serif`;
+
+    const systemFonts = ["arial", "helvetica", "times new roman", "georgia", "verdana", "courier new", "tahoma", "trebuchet ms", "calibri"];
+    const needsGoogleFont = !systemFonts.includes(finalFont.toLowerCase());
+
+    if (needsGoogleFont) {
+      specs.push(`FONT: Load '${finalFont}' via Google Fonts inside <!--[if !mso]><!--><style>@import url('https://fonts.googleapis.com/css2?family=${encodeURIComponent(finalFont)}:wght@100..900&display=swap');</style><!--<![endif]-->. Use font-family: ${fontStack} for ALL text elements throughout the email. NEVER fall back to just 'Arial, sans-serif' — the loaded font MUST be the primary in every font-family declaration.`);
+    } else {
+      specs.push(`FONT: Use font-family: ${fontStack} for all text elements. No Google Font loading needed.`);
     }
 
     // ESP Platform
@@ -1329,87 +1447,105 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     }
 
-    // Dark Mode
+    // Dark Mode — developer override wins, then fall back to Stage 1 detection
     if (darkMode === true || darkMode === "true") {
       specs.push(`DARK MODE: Include dark mode support. Add @media (prefers-color-scheme: dark) rules with design-specific dark colors. Use em_dark, em_dark1, em_dark2, em_dark3 classes on sections that need dark background overrides. Use em_dm_txt_white / em_color1 on text that should be white in dark mode. Invert CTA colors in dark mode using .em_cta class.`);
     } else if (darkMode === false || darkMode === "false") {
       specs.push(`DARK MODE: Do NOT include any dark mode CSS. No prefers-color-scheme media query. No em_dark classes. The email does not need dark mode support.`);
     }
 
-    // Auto-detection reinforcement — tell Claude to be extra precise about colors and CTAs
-    specs.push(`COLOR EXTRACTION: Extract EXACT hex color codes from the design PDF for every element — backgrounds, text, CTAs, dividers, accents. Do NOT approximate. If a purple looks like #4F007D, use #4F007D — not #6b1b9a. If a dark color looks like #231F20, use that — not #000000. Every distinct shade in the design is intentional.`);
-
-    specs.push(`CTA BUTTON DETECTION: Study each CTA button in the design carefully and match EVERY property exactly:
-- BORDER-RADIUS: If corners look sharp/square: 0px. Slightly rounded: 5-6px. Moderately rounded: 10-20px. Full pill/capsule: 9999px. NEVER default to 30px.
-- HEIGHT: Most email CTA buttons are 40-46px tall. Use 40px, 42px, or 45px — NOT 48px or 50px unless the button is clearly taller than normal.
-- FONT-WEIGHT: Many CTAs use font-weight: 400 or 600, NOT 700. If the CTA text doesn't look bold in the design, use 400. If semi-bold, use 600. Only use 700 if clearly bold.
-- FONT-SIZE: CTA text is typically 14-18px. Match exactly from the design. Common sizes: 14px, 16px, 18px.
-- PADDING: Typical CTA horizontal padding is 28-34px. Use 30px as default unless the design clearly shows wider or narrower.
-- BACKGROUND COLOR: Extract the EXACT color from the design. #FA1914 is NOT #FF1E1E.
-- If the button has NO visible border-radius (sharp square corners), use border-radius: 0px — do not add rounding.`);
-
-    specs.push(`BODY TEXT STRUCTURE: When the design shows a long body text section (multiple paragraphs), keep ALL paragraphs inside a SINGLE <td> cell separated by <br/><br/> tags. Do NOT split paragraphs into separate <tr> rows — this changes the visual spacing. The developer pattern is one <td> with inline <br/> breaks.`);
-
-    // Inject all specs into the prompt
-    if (specs.length > 0) {
-      userPrompt += "\n\n=== DEVELOPER-SPECIFIED DESIGN VALUES (MANDATORY — these override any visual interpretation) ===\n" + specs.join("\n\n") + "\n=== END DEVELOPER SPECIFICATIONS ===";
-    }
-
+    // --- Build image URL mapping for Stage 2 ---
+    let imageSection = "";
     if (Object.keys(imageUrlMap).length > 0) {
+      // Get image dimensions from Sharp for each uploaded image
+      const imageDimensions = {};
+      for (const img of images) {
+        try {
+          const meta = await sharp(img.buffer).metadata();
+          imageDimensions[img.filename] = { width: meta.width, height: meta.height };
+        } catch {
+          imageDimensions[img.filename] = { width: 0, height: 0 };
+        }
+      }
+
       const imageListStr = Object.entries(imageUrlMap)
-        .map(([filename, url]) => `${filename} → ${url}`)
+        .map(([filename, url]) => {
+          const dims = imageDimensions[filename];
+          return `${filename} (${dims?.width || "?"}×${dims?.height || "?"}px) → ${url}`;
+        })
         .join("\n");
 
-      if (images.length >= SKIP_VISUAL_THRESHOLD) {
-        // Text-only matching — no visual blocks sent
-        userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have NOT been shown individual image assets (too many images for visual matching). Match each image to the correct position in the email design using the FILENAME as a hint.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by FILENAME — "logo" goes in the logo position, "hero" or "banner" goes in the hero section, "founder" goes with the founder bio, "product" images go in product sections.\n2. Use the full Dropbox URL for every img src — NEVER use relative paths.\n3. If a filename cannot be matched to any design element, skip it.\n4. Preserve the original image dimensions from the design.`;
-      } else {
-        userPrompt += `\n\nIMAGE MATCHING INSTRUCTIONS:\nYou have been shown the PDF design AND each individual image asset above. You can SEE what each image looks like. Match each image to the correct position in the email design by comparing what the image shows (photo of a person, logo, icon, banner, etc.) to where that visual appears in the PDF design.\n\nAvailable image URLs (USE THESE EXACT URLs for img src):\n${imageListStr}\n\nCRITICAL RULES:\n1. Match images by their VISUAL CONTENT — look at what each image depicts and place it where that visual appears in the PDF design.\n2. A small image with a logo should go in the logo position, not the hero banner.\n3. A photo of a person should go in the section where that person's photo appears in the design.\n4. A wide banner/hero image should go at the top hero section.\n5. Use the full Dropbox URL for every img src — NEVER use relative paths.\n6. If an image cannot be matched to any design element, do not use it.`;
-      }
+      imageSection = `\n\n=== IMAGE ASSETS (USE THESE EXACT URLs for img src) ===
+Match each image to its correct position in the design using the image_positions array from the JSON spec above. The spec describes what each image shows (logo, hero, photo, icon, etc.) — match by description.
+
+Available images:
+${imageListStr}
+
+RULES:
+1. Use the full Dropbox URL for every img src — NEVER use relative paths like "images/hero.jpg".
+2. Match images by their description in the spec's image_positions array.
+3. Use the actual image dimensions from the list above for width/height attributes.
+4. If an image in the spec has no matching uploaded asset, use a descriptive alt text and a transparent placeholder.
+5. NEVER fabricate image URLs.
+=== END IMAGE ASSETS ===`;
     }
 
-    contentBlocks.push({ type: "text", text: userPrompt });
+    // --- Assemble the Stage 2 user message ---
+    const stage2UserPrompt = `Generate production-ready Mavlers-grade HTML email code from the following design specification. Output ONLY the HTML starting with <!DOCTYPE. No markdown. No explanation.
 
-    // --- Step 5: Send to Claude ---
-    log("info", "Sending to Claude", {
+=== DESIGN SPECIFICATION (from Stage 1 analysis) ===
+${JSON.stringify(designSpec, null, 2)}
+=== END DESIGN SPECIFICATION ===
+
+=== DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
+${specs.join("\n\n")}
+=== END DEVELOPER SPECIFICATIONS ===${imageSection}`;
+
+    // Stage 2: text-only content (no images sent)
+    const stage2Content = [{ type: "text", text: stage2UserPrompt }];
+
+    log("info", "Stage 2: Sending spec to Claude for HTML generation", {
       requestId: req.id,
-      pageCount: pngPages.length,
-      extractedImageCount: images.length,
-      imageUrlCount: Object.keys(imageUrlMap).length,
+      specSections: designSpec?.design_analysis?.sections?.length || 0,
+      imageUrls: Object.keys(imageUrlMap).length,
       devSpecs: specs.length,
-      emailWidth: width || "auto",
-      primaryFont: primaryFont || "auto",
+      finalWidth,
+      finalFont,
       espPlatform: espPlatform || "none",
-      darkMode: darkMode || "auto",
-      rasterizeMs: Date.now() - startTime,
+      darkMode: darkMode ?? "auto",
+      stage1DurationMs: Date.now() - stage1StartTime,
     });
 
-    const message = await anthropic.messages.create({
+    const stage2StartTime = Date.now();
+
+    const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 32000,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: contentBlocks,
-        },
-      ],
+      system: STAGE2_PROMPT,
+      messages: [{ role: "user", content: stage2Content }],
     });
 
-    const textBlock = message.content?.find((block) => block.type === "text");
-    if (!textBlock || !textBlock.text) {
-      log("error", "Claude returned no text block", {
+    const stage2TextBlock = stage2Response.content?.find((block) => block.type === "text");
+    if (!stage2TextBlock || !stage2TextBlock.text) {
+      log("error", "Stage 2: Claude returned no text", {
         requestId: req.id,
-        contentBlocks: message.content?.length || 0,
+        contentBlocks: stage2Response.content?.length || 0,
       });
       return res.status(502).json({
-        error: "Generation failed",
-        details: "Claude returned an empty or unexpected response. Please try again.",
+        error: "HTML generation failed",
+        details: "Claude could not generate HTML from the design spec. Please try again.",
         requestId: req.id,
       });
     }
 
-    const html = textBlock.text;
+    const html = stage2TextBlock.text;
+
+    log("info", "Stage 2 complete: HTML generated", {
+      requestId: req.id,
+      stage2DurationMs: Date.now() - stage2StartTime,
+      totalPipelineDurationMs: Date.now() - startTime,
+      htmlLength: html.length,
+    });
 
     // --- Step 6: Generate preview images ---
     const previewImages = await Promise.all(
@@ -1421,15 +1557,16 @@ app.post("/generate", generateLimiter, async (req, res) => {
       })
     );
 
-    log("info", "Generation complete", {
+    log("info", "Generation complete (two-stage pipeline)", {
       requestId: req.id,
       orderId,
       pageCount: pngPages.length,
       imageSource,
       imageCount: images.length,
       dropboxUrls: Object.keys(imageUrlMap).length,
-      durationMs: Date.now() - startTime,
+      totalDurationMs: Date.now() - startTime,
       htmlLength: html.length,
+      specSections: designSpec?.design_analysis?.sections?.length || 0,
     });
 
     // --- Step 7: Ensure imageUrlMap is populated ---
@@ -1489,6 +1626,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       imageUrlMap,
       imageSource,
       imageCount: images.length,
+      designSpec,
       requestId: req.id,
     });
 
@@ -1633,8 +1771,8 @@ app.post("/approve", generateLimiter, async (req, res) => {
 const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
-    framework: "master-v1",
-    version: "2.1.0",
+    framework: "master-v2",
+    version: "2.2.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
