@@ -458,31 +458,73 @@ function extractOrderId(filename) {
 // =====================================================================
 const STAGE1_PROMPT = `You are an email design analyst. You will receive:
 1. One or more IMAGES showing an email design
-2. RAW TEXT extracted directly from the PDF file
+2. RAW TEXT extracted directly from the PDF file (OCR output)
 
 Your job: Combine the visual layout from the images with the exact text from the PDF extraction to produce a JSON design specification.
 
-CRITICAL: The RAW TEXT section contains the EXACT text from the PDF. You MUST use this text verbatim in your JSON output. NEVER rewrite, paraphrase, or invent text. The images help you understand WHERE each piece of text goes (which section, what styling) — but the TEXT CONTENT itself comes from the RAW TEXT extraction, not from reading the blurry image.
+CRITICAL: The RAW TEXT section contains the EXACT text from the PDF. You MUST use this text verbatim in your JSON output. NEVER rewrite, paraphrase, or invent text. The images help you understand WHERE each piece of text goes and the visual layout — but the TEXT CONTENT itself comes from the RAW TEXT extraction.
 
 Respond with ONLY a JSON object. No markdown fences. No backticks. No explanation. Start with { end with }.
 
-SCHEMA — flat, compact, omit empty fields:
+========================================
+MANDATORY PRE-ANALYSIS PROCESS (do this BEFORE building JSON)
+========================================
+
+STEP 1 — HORIZONTAL BAND COUNT (required)
+Scan the image top-to-bottom. Count EVERY distinct horizontal band of content, no matter how thin or how similar to another band. Examples of bands that MUST be counted:
+- A 2-5px colored stripe at the top or bottom of the design
+- A narrow preheader bar with text like "View in Browser"
+- A logo band (even if only 30-50px tall)
+- An alert/notification bar in a bright color (orange, red, yellow)
+- A hero image
+- A heading band
+- A body text band
+- A CTA band
+- A divider/spacer band
+- A column row (2-col, 3-col)
+- A repeated variant of an earlier band (count it AGAIN even if it looks similar)
+- A footer band
+- A copyright band
+
+Put this band count in "band_count" at the top level of your JSON. Your "sections" array MUST have AT LEAST this many entries. If band_count is 28, sections array must have 28+ entries.
+
+STEP 2 — ABSOLUTELY NO DEDUPLICATION
+Many email designs intentionally show the SAME content in MULTIPLE layout variants (e.g., a testimonial shown in one style, then shown again in a different style below). The designer put it there twice on purpose. You MUST include BOTH occurrences as separate entries in the sections array. NEVER skip a section because "it looks similar to an earlier one". If you see two testimonials with the same quote text, output TWO testimonial sections.
+
+STEP 3 — THIN/SMALL ELEMENTS ARE SECTIONS
+Do NOT skip these just because they are small:
+- Colored divider stripes (even 2-5px tall)
+- Preheader/utility bars (10-20px tall) 
+- Alert message bars
+- Dark-mode and light-mode duplicate versions of the same section (many designs show the dark version followed by the light version as a preview)
+- Separator bars between major sections
+- Phone number or contact info bars above the footer
+Each of these is a separate entry in the sections array.
+
+STEP 4 — REPEATED LAYOUT VARIANTS
+If you see the same short piece of text (e.g., a name + timestamp) appear twice within a single row (two columns side-by-side), that is ONE section with columns. But if you see the ENTIRE block (heading + body + CTA) twice at different vertical positions, those are TWO separate sections.
+
+========================================
+SCHEMA
+========================================
 {
   "width": 600,
   "bg_outer": "#hex",
   "bg_content": "#hex",
   "font_body": "font name or unknown-sans",
   "font_heading": "font name or same as body",
+  "band_count": 28,
   "sections": [
     {
       "n": 1,
-      "type": "preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|stats",
+      "type": "thin_colored_band|preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|stats|alert_bar|phone_bar|bullet_list|job_listings|closing_cta",
       "bg": "#hex",
       "pad": "T R B L",
       "align": "left|center|right",
+      "height_hint": "2px|thin|normal|tall",
       "content": [
         {
-          "el": "text|image|cta|divider|spacer|link|social_icons|columns",
+          "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list",
           "text": "EXACT TEXT FROM PDF EXTRACTION — copy verbatim",
           "size": 16,
           "weight": 400,
@@ -501,6 +543,7 @@ SCHEMA — flat, compact, omit empty fields:
           "cta_weight": 600,
           "cta_pad": 30,
           "cta_border": "1px solid #hex",
+          "bullets": ["item 1", "item 2"],
           "cols": [
             { "w": "50%", "content": [] }
           ]
@@ -525,16 +568,39 @@ SCHEMA — flat, compact, omit empty fields:
   "img_count": 8
 }
 
-RULES:
-1. TEXT FROM PDF EXTRACTION ONLY: Every "text" field MUST contain text copied verbatim from the RAW TEXT section below the images. NEVER generate, paraphrase, or approximate text. If a piece of text from the PDF extraction maps to a section you see in the image, use it exactly. If you cannot match a text snippet to a visual section, include it in the nearest logical section.
-2. SECTION ORDER: Analyze the image top-to-bottom. Every visible section must appear in the JSON in visual order.
-3. COLORS: Study the image for hex colors. Be specific — #231F20 ≠ #000000. #F4F4F4 ≠ #F5F5F5. Dark charcoal is NOT pure black.
-4. SPACING: Estimate px from the image. 33px ≠ 30px. Use "pad": "20 25 15 25" format.
-5. IMAGES: Describe WHAT each image shows (logo, headshot, phone mockup, book cover, banner).
-6. VML: Set has_vml: true if text overlays a background image.
-7. COMPACT: Short keys. Omit null/default fields.
-8. METADATA: Order IDs, filenames, "OID" lines are NOT email content. Do not include them.
-9. NO markdown fences. NO backticks. NO explanation. ONLY the JSON object.`;
+========================================
+RULES
+========================================
+1. TEXT FROM PDF EXTRACTION ONLY: Every "text" field MUST contain text copied verbatim from the RAW TEXT section. NEVER generate, paraphrase, or approximate. If you cannot match a text snippet to a visual section, include it in the nearest logical section.
+2. TEXT ALIGNMENT — STUDY EVERY BLOCK INDIVIDUALLY: For every text element, look at the image and determine whether the text is left-aligned, centered, or right-aligned within its container. Set the "align" field explicitly for each element. NEVER default to "left" just because it's the common default — if the visual shows centered text, set align="center". Headings, body copy, testimonial quotes, CTAs, and footer text often use center alignment; sidebar content and list items often use left alignment. A section can contain text elements with different alignments. Get this right for every element.
+3. SECTION ORDER: Top-to-bottom in visual order. Every section visible in the image must appear in the JSON.
+4. NO DEDUPLICATION: If the same content/layout appears multiple times in the design, output it multiple times. This is intentional design — preserve it.
+5. CATALOG EVERY BAND: Even 2-5px colored stripes, narrow alert bars, dark/light duplicate sections — each gets its own entry.
+6. COLORS: Be specific. Match the exact hex visible in the design. Dark charcoal is NOT pure #000000. Neon/saturated colors are NOT the same as brand colors (a brand green is NOT pure #00FF00; a brand red is NOT pure #FF0000; a brand blue is NOT pure #0000FF). Light neutrals (cream, off-white, warm beige, cool gray) are NOT #FFFFFF. When in doubt, pick a hex that matches the actual pixel color, not a common default. Report the exact hex you see — do not round to convenient values.
+7. SPACING: Estimate px from the image. 33px ≠ 30px.
+8. IMAGES: Describe WHAT each image shows (logo, headshot, phone mockup, banner).
+9. VML: Set has_vml: true if text overlays a background image.
+10. COMPACT: Short keys. Omit null/default fields.
+11. METADATA: Order IDs, filenames, "OID" lines from file metadata are NOT email content. Do not include them as text in sections.
+12. BULLET LISTS: If the design shows a bulleted list (4+ short items stacked with bullet markers), use el: "bullet_list" with a "bullets" array.
+13. BAND_COUNT CHECK: Before outputting, count your sections array length. If it's less than band_count, GO BACK and find the missing bands. Common missed bands: thin colored stripes at edges of the design, dark/light duplicate versions of preheader or logo, narrow alert/notification bars, standalone contact info rows, prominent closing CTA blocks, separate copyright/legal footer strips.
+14. NO markdown fences. NO backticks. NO explanation. ONLY the JSON object.
+
+========================================
+SELF-CHECK CHECKLIST (verify before outputting)
+========================================
+- Did you count every horizontal band top-to-bottom?
+- Did you include any thin accent-colored stripes at the top or bottom (if present)?
+- Did you include BOTH dark and light versions of preheader/logo (if the design shows both)?
+- Did you include any narrow alert/notification bars (if present — any bright accent color)?
+- Did you include every repeated layout variant as a separate section?
+- Did you include standalone contact info bands like phone number rows (if separate from footer)?
+- Did you include the closing CTA block (if the design has a prominent final call-to-action section before the footer)?
+- Did you include the copyright/legal footer band?
+- Does sections.length >= band_count?
+- Are colors specific hex values matching the actual design (not generic defaults)?
+- Is every "text" field from the RAW TEXT extraction, verbatim?
+- Is the "align" field set correctly for EVERY text element based on the visual alignment in the design?`;
 
 // =====================================================================
 // STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
@@ -552,10 +618,11 @@ You are the senior email developer at Mavlers. You receive a JSON design specifi
 
 ## ABSOLUTE FIDELITY RULES
 1. Use ALL text from the spec VERBATIM. Copy every word exactly. NEVER rewrite or paraphrase.
-2. Use EXACT hex colors from the spec. #231F20 ≠ #000000. NEVER use pure black when spec shows dark charcoal.
+2. Use EXACT hex colors from the spec. Match every hex value as-is. Do not substitute pure black for a dark charcoal, do not substitute a neon color for a brand color, do not substitute #FFFFFF for a light neutral.
 3. Use EXACT spacing from the spec. 33px ≠ 30px. NEVER round.
 4. Output sections in the EXACT order from the spec. Do NOT rearrange, merge, or skip sections.
-5. Every element goes in a <td> with inline styles. NEVER use <p>, <h1>-<h6>, or <div> (except the hidden preheader div).
+5. Every element goes in a <td> with inline styles. NEVER use <p>, <h1>-<h6>, or <div> (except the hidden preheader div and <ul>/<li> inside bullet_list sections).
+6. TEXT ALIGNMENT — RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. If spec says align="left", use align="left". NEVER default to "left" when the spec says otherwise. This applies to headings, body text, testimonial quotes, footer text, and every other text block. Also apply the correct alignment to the parent <td> that wraps the content table (align="center" parent td vs align="left" parent td).
 
 ## GOLD STANDARD: SECTION WRAPPER PATTERN
 Every section MUST follow this exact wrapper pattern — each section is an independent table block:
@@ -579,46 +646,48 @@ Every section MUST follow this exact wrapper pattern — each section is an inde
 RULES: Each section gets its OWN em_wrapper table. Sections are NOT nested inside one shared wrapper. Use HTML comments to label each section. Adjust padding, bgcolor, and dark-mode class per section.
 
 ## GOLD STANDARD: CTA BUTTON
-Every CTA button MUST follow this exact pattern:
+Every CTA button MUST follow this exact pattern (substitute values from spec):
 
-<table align="left" bgcolor="#231F20" border="0" cellspacing="0" cellpadding="0" style="background-color:#231F20; border-radius: 6px;" class="em_border">
+<table align="left" bgcolor="#CTA_BG_HEX" border="0" cellspacing="0" cellpadding="0" style="background-color:#CTA_BG_HEX; border-radius: [SPEC_RADIUS]px;" class="em_border">
   <tr>
-    <td class="em_defaultlink" align="center" valign="middle" height="50" style="font-size: 18px; font-family: 'FONT_STACK'; font-weight:600; color: #ffffff; height:50px; padding:0px 18px;" ><a href="#" target="_blank" style="text-decoration:none; color:#ffffff; line-height:50px; display:block;">CTA TEXT</a></td>
+    <td class="em_defaultlink" align="center" valign="middle" height="[SPEC_HEIGHT]" style="font-size: [SPEC_SIZE]px; font-family: 'FONT_STACK'; font-weight:[SPEC_WEIGHT]; color: #CTA_TEXT_HEX; height:[SPEC_HEIGHT]px; padding:0px [SPEC_PAD]px;" ><a href="#" target="_blank" style="text-decoration:none; color:#CTA_TEXT_HEX; line-height:[SPEC_HEIGHT]px; display:block;">CTA TEXT</a></td>
   </tr>
 </table>
 
-MANDATORY CTA PROPERTIES (override with spec values if different):
-- bgcolor + background-color: Use EXACT color from spec (usually #231F20, NOT #000000)
-- border-radius: 6px (unless spec shows different)
-- height: 50px + line-height: 50px on the <a>
-- font-size: 18px
-- font-weight: 600
+MANDATORY CTA PROPERTIES — ALL values come from the spec, never from defaults:
+- bgcolor + background-color: EXACT value from spec.cta_bg — NEVER substitute #000000 or a guess
+- color (text): EXACT value from spec.cta_color — usually #FFFFFF but not always
+- border-radius: spec value — commonly 4px, 6px, 8px, 25px, 30px (pill-shape). NEVER assume one default.
+- height: spec value — commonly 38px, 40px, 44px, 45px, 50px
+- font-size: spec value — commonly 13px, 14px, 15px, 16px, 18px
+- font-weight: spec value — commonly 400, 600, or 700
+- padding: spec value — horizontal padding varies widely
 - class="em_border" on the table (for dark mode border)
 - class="em_defaultlink" on the td
 - align="left" on the table for left-aligned CTAs, align="center" for centered
 - For centered CTA: wrap in a <td align="center"> parent
 
 ## GOLD STANDARD: SECTION HEADING
-Section headings use <td>, NOT <h1>-<h6>:
+Section headings use <td>, NOT <h1>-<h6>. ALL values from spec:
 
-<td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: 26px; line-height:30px; color: #231F20; font-weight: 600; ">Section Title Here</td>
+<td align="[SPEC_ALIGN]" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: [SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_HEX; font-weight: [SPEC_WEIGHT]; ">[HEADING TEXT FROM SPEC]</td>
 
 ## GOLD STANDARD: BODY TEXT
-Body copy uses <td>, NOT <p>:
+Body copy uses <td>, NOT <p>. ALL values from spec:
 
-<td align="center" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:18px; line-height:30px; color: #231F20; font-weight: 400; padding-bottom: 28px;">Body text here with &nbsp; for non-breaking spaces.</td>
+<td align="[SPEC_ALIGN]" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_HEX; font-weight: [SPEC_WEIGHT]; padding-bottom: [SPEC_PB]px;">[BODY TEXT FROM SPEC]</td>
 
-## GOLD STANDARD: TWO-COLUMN CARD (Product Highlight pattern)
-Wrapped in a card with border + rounded corners + light gray bg:
+## GOLD STANDARD: TWO-COLUMN CARD (content + image side-by-side)
+Wrapped in a card with border + rounded corners + bg color from spec:
 
-<td align="center" valign="top" style="border: 1px solid #E7E7E7; padding: 20px 29px 0px 26px; border-radius: 6px;" class="em_pad3 em_black" bgcolor="#F9F7F8"><table width="100%" align="center" border="0" cellspacing="0" cellpadding="0">
+<td align="center" valign="top" style="border: 1px solid #BORDER_HEX; padding: [SPEC_PAD]; border-radius: [SPEC_RADIUS]px;" class="em_pad3 em_black" bgcolor="#CARD_BG_HEX"><table width="100%" align="center" border="0" cellspacing="0" cellpadding="0">
     <tbody>
       <tr>
-        <th align="center" valign="top" class="em_clear"><table align="center" style="width: 233px;" class="em_wrapper" width="233" border="0" cellspacing="0" cellpadding="0">
+        <th align="center" valign="top" class="em_clear"><table align="center" style="width: [COL1_W]px;" class="em_wrapper" width="[COL1_W]" border="0" cellspacing="0" cellpadding="0">
             <!-- Text column: heading, body, CTA -->
           </table>
         </th>
-        <th align="center" valign="top" class="em_clear"><table style="width: 210px;" class="em_wrapper" width="210" border="0" cellspacing="0" cellpadding="0">
+        <th align="center" valign="top" class="em_clear"><table style="width: [COL2_W]px;" class="em_wrapper" width="[COL2_W]" border="0" cellspacing="0" cellpadding="0">
             <!-- Image column -->
           </table>
         </th>
@@ -629,35 +698,35 @@ Wrapped in a card with border + rounded corners + light gray bg:
 ## GOLD STANDARD: DIVIDER
 Dividers use spacer.gif on a colored bgcolor, NOT CSS border-top:
 
-<td height="1" style="height: 1px; line-height: 0px; font-size: 0px;" class="em_white" bgcolor="#231F20"><img src="images/spacer.gif" width="1" height="1" alt="" border="0" style/></td>
+<td height="1" style="height: 1px; line-height: 0px; font-size: 0px;" class="em_white" bgcolor="#DIVIDER_HEX"><img src="images/spacer.gif" width="1" height="1" alt="" border="0" style/></td>
 
 ## GOLD STANDARD: TESTIMONIAL CARD
-Two-column testimonial cards with rounded corners and gray bg:
+Testimonial cards with rounded corners and bg color from spec:
 
-<td align="center" valign="top" bgcolor="#E7E7E7" style="padding: 28px 18px 17px; border-radius: 15px;"><table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+<td align="center" valign="top" bgcolor="#CARD_BG_HEX" style="padding: [SPEC_PAD]; border-radius: [SPEC_RADIUS]px;"><table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
     <tbody>
       <tr>
-        <td align="left" valign="top" style="padding-bottom: 17px; padding-left: 5px;"><img src="images/quote_icon.png" width="32" alt="" border="0" style="display: block; max-width: 32px;"/></td>
+        <td align="left" valign="top" style="padding-bottom: [SPEC_PB]px; padding-left: 5px;"><img src="images/quote_icon.png" width="32" alt="" border="0" style="display: block; max-width: 32px;"/></td>
       </tr>
       <tr>
-        <td align="left" valign="top" class="em_defaultlink" style="font-family: 'FONT_STACK'; font-size:16px; line-height:24px; color: #231F20; font-weight: 400; padding-bottom: 16px;">"Quote text here"</td>
+        <td align="left" valign="top" class="em_defaultlink" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_HEX; font-weight: 400; padding-bottom: [SPEC_PB]px;">[QUOTE TEXT FROM SPEC]</td>
       </tr>
       <tr>
-        <td align="left" valign="top" class="em_defaultlink" style="font-family: 'FONT_STACK'; font-size:16px; line-height:24px; color: #231F20; font-weight: 400;"><span style="font-weight: 600;">-Source Name</span><br /><span style="font-size: 14px;">Title</span></td>
+        <td align="left" valign="top" class="em_defaultlink" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_HEX; font-weight: 400;"><span style="font-weight: 600;">[ATTRIBUTION FROM SPEC]</span><br /><span style="font-size: [SPEC_SMALL]px;">[ROLE/SUBTITLE FROM SPEC]</span></td>
       </tr>
     </tbody>
   </table></td>
 
-## GOLD STANDARD: CASE STUDY (navy bg card)
-Navy background cards with white text and rounded corners:
+## GOLD STANDARD: COLORED CARD (e.g., case study, feature callout)
+Cards with a solid bg color and contrasting text. Use spec values for bg + text color:
 
-<td align="center" valign="top" bgcolor="#022C87" style="padding: 23px 18px 15px; border-radius: 6px;"><table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+<td align="center" valign="top" bgcolor="#CARD_BG_HEX" style="padding: [SPEC_PAD]; border-radius: [SPEC_RADIUS]px;"><table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
     <tbody>
       <tr>
-        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:16px; line-height:24px; color: #FFFFFF; font-weight: 400; padding-bottom: 16px;"><span style="font-weight: 600;">-Company Name</span> <br />Headline</td>
+        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_ON_CARD_HEX; font-weight: 400; padding-bottom: [SPEC_PB]px;"><span style="font-weight: 600;">[ATTRIBUTION]</span> <br />[HEADLINE FROM SPEC]</td>
       </tr>
       <tr>
-        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:16px; line-height:24px; color: #ffffff; font-weight: 400;">Body text</td>
+        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_ON_CARD_HEX; font-weight: 400;">[BODY TEXT FROM SPEC]</td>
       </tr>
     </tbody>
   </table></td>
@@ -688,14 +757,14 @@ Footer has logo-left + social-icons-right in ONE row, then links row, then copyr
   </tr>
 </table>
 
-<!-- Footer row 2: Links -->
-<td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'Mulish',Arial,sans-serif; font-size: 14px; line-height: 16px; color: #231F20; font-weight: 400;"><a href="#" style="text-decoration: underline; color: #231F20;">greenvalley.cc</a></td>
+<!-- Footer row 2: Links (URL left + unsubscribe/legal right) -->
+<td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 16px; color: #TEXT_HEX; font-weight: 400;"><a href="#" style="text-decoration: underline; color: #TEXT_HEX;">[BRAND URL FROM SPEC]</a></td>
 <td width="273" style="width: 273px;" class="em_side15"></td>
-<td align="left" valign="top"><a href="{{ unsubscribe_link }}" style="text-decoration: underline; color: #231F20;">Unsubscribe</a></td>
+<td align="left" valign="top"><a href="{{ unsubscribe_link }}" style="text-decoration: underline; color: #TEXT_HEX;">Unsubscribe</a></td>
 
-<!-- Footer row 3: Copyright bar on light gray -->
-<td align="center" valign="top" style="padding: 10px;" bgcolor="#F9F7F8" class="em_black">
-  <td align="center" valign="top" style="font-family: 'FONT_STACK'; font-size:12px; line-height:14px; color: #231F20; font-weight: 400;">© 2026 Brand. All rights reserved. | Terms | Privacy | Manage Preferences</td>
+<!-- Footer row 3: Copyright bar on separate bg -->
+<td align="center" valign="top" style="padding: 10px;" bgcolor="#COPYRIGHT_BG_HEX" class="em_black">
+  <td align="center" valign="top" style="font-family: 'FONT_STACK'; font-size:12px; line-height:14px; color: #TEXT_HEX; font-weight: 400;">[COPYRIGHT TEXT FROM SPEC]</td>
 </td>
 
 ## MANDATORY DOCTYPE + HEAD
@@ -795,6 +864,64 @@ NOTE: The em_main_table directly contains section <tr> blocks. There is NO third
 ## IMAGE URL HANDLING
 When image URLs are provided, use the EXACT Dropbox URLs for ALL img src attributes. NEVER use relative paths like "images/hero.jpg" when URLs are provided.
 
+## SPECIAL SECTION TYPES (new in v3.3.0)
+
+### thin_colored_band (thin horizontal band in any accent color)
+A narrow horizontal bar, typically 2-10px tall, in any brand/accent color. Appears at the top, bottom, or between major sections. Render as a spacer-based divider using the bg color from the spec:
+<td height="5" style="height: 5px; line-height: 0px; font-size: 0px;" bgcolor="#SPEC_BG_HEX"><img src="images/spacer.gif" width="1" height="1" alt="" border="0" style="display: block; max-width: 1px;"/></td>
+
+Use whatever bg color the spec provides — could be any accent color (green, orange, red, blue, brand color, etc.). Height can be 2px, 5px, 8px, or 10px based on the spec's height_hint.
+
+### alert_bar (orange/red/yellow notification strip)
+A narrow bar with a bright background color and uppercase text:
+<td align="center" valign="top" style="font-size: 10px; line-height: 14px; color: #000000; font-family:'FONT_STACK'; text-transform: uppercase; padding: 13px 15px;">ALERT TEXT HERE</td>
+Use the bgcolor from the spec — alert bars use any bright accent color (orange, red, yellow, amber, teal, etc. — whatever the design shows).
+
+### phone_bar (phone number in its own band, usually above footer)
+<td align="center" valign="top" style="padding: 20px 40px;" bgcolor="#000000">
+  <td align="center" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 16px; color: #FFFFFF; font-weight: 400;">(+61) 1300 818 777</td>
+</td>
+
+### closing_cta (prominent final call-to-action block before footer)
+A high-emphasis closing section with large heading + CTA, often with a full-width colored background. Use the heading text, colors, and styling from the spec — do NOT hard-code any specific wording:
+<td align="center" valign="top" style="padding: 50px 40px;" bgcolor="#SPEC_BG_HEX">
+  <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td align="center" valign="top" class="em_defaultlink" style="font-family: 'FONT_STACK'; font-size: 36px; line-height: 42px; color: #SPEC_TEXT_HEX; font-weight: 700; padding-bottom: 24px;">[HEADING TEXT FROM SPEC]</td>
+    </tr>
+    <tr>
+      <td align="center" valign="top">
+        <!-- CTA button pattern here, using spec CTA values -->
+      </td>
+    </tr>
+  </table>
+</td>
+
+### bullet_list (4+ stacked short items with bullet markers)
+<td align="left" valign="top" style="padding: 0 40px 20px;">
+  <ul style="margin: 0; padding: 0 0 0 20px; list-style-type: disc;">
+    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #231F20; padding-bottom: 8px;">Bullet item 1</li>
+    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #231F20; padding-bottom: 8px;">Bullet item 2</li>
+  </ul>
+</td>
+Note: <ul>/<li> ARE acceptable for bullet lists (exception to the no-non-table-elements rule).
+
+### job_listings (name + timestamp + action pattern)
+Used for activity feeds, booking lists, etc. Each entry has name (bold), timestamp (light), action (gray):
+<table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%">
+  <tr>
+    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 600; color: #231F20; padding-bottom: 4px;">Name Wed DD Mon H.MMpm</td>
+  </tr>
+  <tr>
+    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 400; color: #666666; padding-bottom: 12px;">Action description</td>
+  </tr>
+</table>
+
+### DARK/LIGHT DUPLICATE SECTIONS
+Some designs show the SAME section twice — once styled for dark mode preview, once for light mode. When the spec shows two adjacent sections with similar content but different bg colors (e.g., black bg then white bg for the same logo/preheader), output BOTH sections. Tag them with classes:
+- Dark version: bgcolor="#000000" with class="em_dark"
+- Light version: bgcolor="#ffffff" with class="em_white1" or "em_white2"
+
 ## ANTI-PATTERNS — NEVER OUTPUT
 1. <p> tags — use <td>
 2. <h1>-<h6> tags — use <td> with inline font-size/weight
@@ -802,25 +929,31 @@ When image URLs are provided, use the EXACT Dropbox URLs for ALL img src attribu
 4. <button> elements
 5. CSS border-top/border-bottom for dividers — use spacer.gif + bgcolor
 6. role="presentation" on layout tables (developer doesn't use it in this codebase)
-7. #000000 when spec shows #231F20
-8. border-radius: 4px on CTAs (should be 6px)
-9. height: 40px or 44px on CTAs (should be 50px)
-10. font-size: 13-15px on CTAs (should be 18px)
-11. @import for fonts (use <link> tag)
-12. One giant em_wrapper nesting all sections (each section gets its own)
+7. Substituting common defaults (#000000, #FFFFFF, #00FF00, etc.) when the spec provides specific brand hex values — always use the exact hex from the spec
+8. Neon/pure/saturated colors (like #00FF00, #FF0000, #0000FF) when spec shows a brand variant (like #00DA00, #E41525, #022C87). Match the exact hex from spec.
+9. border-radius: 4px on CTAs (should be 6px or 30px based on spec)
+10. @import for fonts (use <link> tag)
+11. One giant em_wrapper nesting all sections (each section gets its own)
+12. SKIPPING any section from the spec — if spec has 28 sections, output 28 sections
+13. DEDUPLICATING sections — if spec shows the same content twice (dark+light, two variants), output both
+14. Collapsing similar adjacent sections into one — preserve every section from the spec
 
 ## FINAL CHECKLIST
 Before outputting, verify:
 - Output begins with <!DOCTYPE
+- sections.length in HTML === sections.length in spec (count both)
+- Every section from spec has a corresponding <tr> block in HTML
 - Each section is its own em_wrapper table inside a <tr>
-- All CTAs use height:50px, border-radius:6px, font-size:18px, bgcolor:#231F20
-- All text colors use #231F20 (not #000000) unless spec says otherwise
+- CTAs match spec values for bgcolor, height, border-radius, font-size
+- Text colors match the exact spec hex (no generic defaults substituted)
+- EVERY text element's align attribute and text-align style matches the spec's "align" value (never default to left)
 - Font loaded via <link> tag, not @import
 - All text from spec used verbatim
-- Section order matches spec exactly
-- Dark mode classes present if requested
-- Footer has logo-left + icons-right layout
-- Copyright bar on separate bgcolor row
+- Section order matches spec exactly (top-to-bottom)
+- Thin elements (colored stripes, alert bars, standalone contact rows) are preserved
+- Dark/light variant pairs both present when spec shows both
+- Bullet lists rendered as <ul>/<li>
+- Footer + copyright bar on separate rows
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided JSON design specification and developer overrides.`;
 
@@ -892,7 +1025,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.2.0",
+    version: "3.3.0",
   });
 });
 
@@ -1406,6 +1539,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
       requestId: req.id,
       stage1DurationMs: Date.now() - stage1StartTime,
       sectionCount: designSpec?.sections?.length || 0,
+      bandCount: designSpec?.band_count || 0,
       imagePositions: designSpec?.images?.length || 0,
       specWidth: designSpec?.width,
       specFont: designSpec?.font_body,
@@ -1563,12 +1697,38 @@ ${specs.join("\n\n")}
 
     const html = stage2TextBlock.text;
 
+    // Post-generation validation: count sections in HTML output vs spec
+    // Gold-standard HTML uses <!-- Section_Name --> comments for each section
+    const htmlSectionMatches = html.match(/<!-- [A-Za-z_0-9]+ -->/g) || [];
+    // Filter out closing comments (<!-- // Section_Name -->)
+    const htmlOpeningSections = htmlSectionMatches.filter(m => !m.includes("//"));
+    const specSectionCount = designSpec?.sections?.length || 0;
+    const bandCount = designSpec?.band_count || specSectionCount;
+
+    const sectionCountMatch = htmlOpeningSections.length >= specSectionCount;
+    const bandCountMatch = htmlOpeningSections.length >= bandCount;
+
     log("info", "Stage 2 complete: HTML generated", {
       requestId: req.id,
       stage2DurationMs: Date.now() - stage2StartTime,
       totalPipelineDurationMs: Date.now() - startTime,
       htmlLength: html.length,
+      htmlSectionCount: htmlOpeningSections.length,
+      specSectionCount,
+      bandCount,
+      sectionCountMatch,
+      bandCountMatch,
     });
+
+    if (!sectionCountMatch || !bandCountMatch) {
+      log("warn", "SECTION COUNT MISMATCH — HTML has fewer sections than spec", {
+        requestId: req.id,
+        htmlSections: htmlOpeningSections.length,
+        specSections: specSectionCount,
+        bandCount,
+        missingCount: Math.max(specSectionCount, bandCount) - htmlOpeningSections.length,
+      });
+    }
 
     // --- Step 6: Generate preview images ---
     const previewImages = await Promise.all(
@@ -1795,7 +1955,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.2.0",
+    version: "3.3.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
