@@ -9,7 +9,7 @@ import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
 import path from "path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
-import { detectBands, cropBand, extractAccentColors, postProcessOcr } from "./band-detector.js";
+import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -451,230 +451,120 @@ function extractOrderId(filename) {
   return name;
 }
 
-// =====================================================================
-// BAND ANALYSIS PROMPT (v4.0.0) — Per-band content classification
-// Receives a single cropped horizontal band image + its exact bg color
-// + accent colors sampled from pixels + nearby OCR text.
-// Returns classification of WHAT the band contains.
-//
-// This replaces Stage 1's old approach of asking Claude to discover ALL
-// sections in a full compressed PDF (which missed thin bands and guessed
-// colors). Now band discovery is done by pixel analysis in Node.js, and
-// Claude only classifies what's inside each already-detected band.
-// =====================================================================
-const BAND_PROMPT = `You are analyzing ONE horizontal band (one section) of an email design.
-
-You will receive:
-- A cropped image showing just this band
-- The EXACT bg color (hex) sampled from pixels — use this, don't guess
-- Accent colors (hex) detected in this band's pixels — use these for any non-bg elements
-- OCR text that falls within this band's vertical range
-- Band dimensions (width × height in px)
-
-Respond with ONLY a compact JSON object. No markdown fences. No commentary. Start with { end with }.
-
-SCHEMA:
-{
-  "type": "thin_colored_band|preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|alert_bar|phone_bar|bullet_list|job_listings|closing_cta|empty",
-  "dark_variant": false,
-  "pad": "T R B L",
-  "align": "left|center|right",
-  "content": [
-    {
-      "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list",
-      "text": "EXACT TEXT from OCR in this band",
-      "size": 16,
-      "weight": 400,
-      "lh": 24,
-      "color": "#hex (pick from accent_colors or band bg)",
-      "align": "center",
-      "transform": "uppercase",
-      "img_desc": "what the image shows (for image elements)",
-      "img_w": 600,
-      "cta_bg": "#hex (pick from accent_colors)",
-      "cta_color": "#hex",
-      "cta_radius": 6,
-      "cta_h": 45,
-      "cta_text": "CTA button text from OCR",
-      "bullets": ["item 1", "item 2"],
-      "cols": [
-        { "w": "50%", "content": [] }
-      ]
-    }
-  ]
-}
-
-RULES:
-1. USE ACCENT COLORS VERBATIM: the accent_colors array contains exact hex values sampled from this band's pixels. Pick from this list for all color fields. DO NOT invent or round colors.
-2. USE BG VERBATIM: the band's bg color is provided as an exact hex. DO NOT change it.
-3. TEXT FROM OCR: every "text" field MUST be verbatim from the provided OCR text for this band. Never paraphrase or invent.
-4. CLASSIFY CORRECTLY:
-   - Band height ≤10px with single solid color → "thin_colored_band"
-   - Narrow band (10-50px) with a notification/uppercase text on bright bg → "alert_bar"
-   - Phone number as the only content → "phone_bar"
-   - A prominent closing section with large heading + CTA on a branded bg color → "closing_cta"
-   - 4+ short stacked lines each starting a sentence → "bullet_list"
-   - List of name + timestamp + action repeated → "job_listings"
-   - Only a logo image → "logo"
-   - Uppercase tagline + browser link combo → "preheader"
-   - Background is primarily dark (bg matches dark_variant=true means bg is near-black) → set dark_variant: true
-5. COLUMNS: if the image shows 2 or 3 visually distinct vertical columns, use el:"columns" with cols array. Each column's content is its own array of elements.
-6. EMPTY / DIVIDER: if the band is purely decorative (a spacer, or a thin line), use type "divider" or "spacer" and empty content array.
-7. ALIGN: read the visual alignment of text in the image. "center" when text is horizontally centered; "left" when left-aligned; "right" when right-aligned. Never guess — look at the image.
-8. COMPACT: omit null/default fields.
-9. NO markdown. NO backticks. NO explanation.`;
 
 // =====================================================================
-// STAGE 1 PROMPT — Design Analysis (Vision → JSON)
-// NOTE: As of v4.0.0, this full-PDF analysis is used as a FALLBACK only,
-// when per-band analysis produces an incomplete spec. The primary Stage 1
-// uses band detection + per-band BAND_PROMPT classification.
+// STAGE 1 PROMPT (v5.0.0) — Full-design analysis with pixel palette
+// Replaces v4.0.1's per-band classification. Claude now sees the full design
+// once, with pixel-exact colors and OCR text provided as authoritative data.
 // =====================================================================
-const STAGE1_PROMPT = `You are an email design analyst. You will receive:
-1. One or more IMAGES showing an email design
-2. RAW TEXT extracted directly from the PDF file (OCR output)
+const STAGE1_PROMPT = `You are analyzing an email design PDF to produce a structured JSON specification. You will receive:
 
-Your job: Combine the visual layout from the images with the exact text from the PDF extraction to produce a JSON design specification.
+1. A HIGH-QUALITY IMAGE of the complete email design
+2. A pixel-sampled COLOR PALETTE — these are the exact hex values that appear in the design's pixels. Use these VERBATIM for any color field in your JSON output. Do NOT round, approximate, or substitute colors. A dark-charcoal hex like #2A2623 is different from pure black #000000. A specific brand green like #1FC23D is different from neon green #00FF00. A cream off-white like #F7F3E4 is different from generic #F5F5F5. Match the exact palette hex, never a common default.
+3. OCR-EXTRACTED TEXT — every piece of text visible in the design. Use this text VERBATIM for every "text" field. NEVER paraphrase, rewrite, or invent text. If you cannot match a piece of OCR text to a visible section, include it where it logically belongs.
+4. A BAND MAP — pixel-exact positions (y_start, y_end, height, bg_hex) of every horizontal band detected in the design. This is a structural reference showing where color transitions occur. Use it to verify you don't miss thin elements (colored stripes, narrow alert bars, divider lines).
+5. An IMAGE ASSETS LIST — uploaded image files with filenames, dimensions, and Dropbox URLs. Match each visible image in the design to one of these files by content matching, and include the exact Dropbox URL in your output.
+6. Developer-specified values (email width, fonts, ESP merge-tag style) — these are authoritative overrides.
 
-CRITICAL: The RAW TEXT section contains the EXACT text from the PDF. You MUST use this text verbatim in your JSON output. NEVER rewrite, paraphrase, or invent text. The images help you understand WHERE each piece of text goes and the visual layout — but the TEXT CONTENT itself comes from the RAW TEXT extraction.
-
-Respond with ONLY a JSON object. No markdown fences. No backticks. No explanation. Start with { end with }.
+Output ONLY a JSON object. No markdown fences. No explanation. Start with { end with }.
 
 ========================================
-MANDATORY PRE-ANALYSIS PROCESS (do this BEFORE building JSON)
+CORE RULES
 ========================================
 
-STEP 1 — HORIZONTAL BAND COUNT (required)
-Scan the image top-to-bottom. Count EVERY distinct horizontal band of content, no matter how thin or how similar to another band. Examples of bands that MUST be counted:
-- A 2-5px colored stripe at the top or bottom of the design
-- A narrow preheader bar with text like "View in Browser"
-- A logo band (even if only 30-50px tall)
-- An alert/notification bar in a bright color (orange, red, yellow)
-- A hero image
-- A heading band
-- A body text band
-- A CTA band
-- A divider/spacer band
-- A column row (2-col, 3-col)
-- A repeated variant of an earlier band (count it AGAIN even if it looks similar)
-- A footer band
-- A copyright band
+A. LOGICAL SECTIONS (not raw bands)
+   Group the design into LOGICAL content sections as a human email developer would. A "section" is a semantic unit: a heading + body + CTA block is ONE section. A two-column layout with its content is ONE section. A thin colored stripe on its own is ONE section.
+   Do NOT produce one section per pixel-band. Do NOT fragment logical groups.
+   Do NOT produce fake sections that aren't visible in the design (no hallucinated thin gray bars from JPEG compression).
 
-Put this band count in "band_count" at the top level of your JSON. Your "sections" array MUST have AT LEAST this many entries. If band_count is 28, sections array must have 28+ entries.
+B. BAND COVERAGE
+   Every band in the BAND MAP must be accounted for in your sections array. Your sections array can have FEWER entries than the band map (because you merge related bands), but the visible y-range from band 1 to the last band must be fully covered by your sections in order.
+   If a band with height >= 10px and a distinctive color (not white/gray near-white) exists but you don't have a section for it, you've missed something.
 
-STEP 2 — ABSOLUTELY NO DEDUPLICATION
-Many email designs intentionally show the SAME content in MULTIPLE layout variants (e.g., a testimonial shown in one style, then shown again in a different style below). The designer put it there twice on purpose. You MUST include BOTH occurrences as separate entries in the sections array. NEVER skip a section because "it looks similar to an earlier one". If you see two testimonials with the same quote text, output TWO testimonial sections.
+C. COLORS FROM PALETTE
+   For every "bg", "color", "cta_bg", "cta_color" field: use an exact hex value from the supplied PALETTE. Do not invent new hex values. If you need a color not in the palette, pick the closest palette color.
 
-STEP 3 — THIN/SMALL ELEMENTS ARE SECTIONS
-Do NOT skip these just because they are small:
-- Colored divider stripes (even 2-5px tall)
-- Preheader/utility bars (10-20px tall) 
-- Alert message bars
-- Dark-mode and light-mode duplicate versions of the same section (many designs show the dark version followed by the light version as a preview)
-- Separator bars between major sections
-- Phone number or contact info bars above the footer
-Each of these is a separate entry in the sections array.
+D. TEXT FROM OCR
+   For every "text" field: copy verbatim from the OCR output. Preserve case, punctuation, special characters.
 
-STEP 4 — REPEATED LAYOUT VARIANTS
-If you see the same short piece of text (e.g., a name + timestamp) appear twice within a single row (two columns side-by-side), that is ONE section with columns. But if you see the ENTIRE block (heading + body + CTA) twice at different vertical positions, those are TWO separate sections.
+E. MULTI-COLOR HEADINGS WITH SPANS
+   When a single visible heading line has TWO OR MORE colors inline (e.g., the first part of a heading in one accent color + the second part in another color, all on one visual line/paragraph with no line break between them), represent this as ONE text element with a "spans" array:
+   {
+     "el": "text",
+     "spans": [
+       { "text": "[FIRST PART OF HEADING]", "color": "#<exact hex>" },
+       { "text": " [SECOND PART OF HEADING]", "color": "#<exact hex>" }
+     ],
+     "size": 28, "weight": 700, "lh": 34, "align": "center", "transform": "uppercase"
+   }
+   Do NOT duplicate the text across two text elements with different colors.
+
+F. IMAGES
+   For every visible image in the design, inspect the IMAGE ASSETS LIST and pick the filename whose content description matches. Populate:
+   {
+     "el": "image",
+     "src": "<exact Dropbox URL from the list>",
+     "alt": "descriptive alt text based on what the image shows",
+     "width": <dimension from list>
+   }
+   If no match exists, use { "el": "image", "src": "", "alt": "<description>", "width": <estimated> } and Claude in Stage 2 will use a placeholder.
+
+G. ALIGNMENT
+   For every text element, observe the actual visual alignment in the design (left, center, right). Never default to left if the design shows center.
+
+H. REPEATED VARIANTS
+   If the design shows the same content twice (e.g., dark-variant preheader + light-variant preheader, intentional), output both as separate sections.
 
 ========================================
 SCHEMA
 ========================================
 {
-  "width": 600,
-  "bg_outer": "#hex",
-  "bg_content": "#hex",
-  "font_body": "font name or unknown-sans",
-  "font_heading": "font name or same as body",
-  "band_count": 28,
+  "width": <developer-specified width>,
+  "font_body": "<developer-specified primary font>",
+  "font_heading": "<developer-specified secondary font, if any, else same as body>",
+  "band_count": <total bands from BAND MAP>,
   "sections": [
     {
       "n": 1,
-      "type": "thin_colored_band|preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|stats|alert_bar|phone_bar|bullet_list|job_listings|closing_cta",
-      "bg": "#hex",
+      "type": "thin_colored_band|preheader|nav|logo|hero_image|alert_bar|heading|body_text|cta|columns|divider|spacer|testimonial|image|phone_bar|closing_cta|bullet_list|footer|disclaimer|social",
+      "bg": "#<exact hex from palette>",
       "pad": "T R B L",
       "align": "left|center|right",
-      "height_hint": "2px|thin|normal|tall",
+      "dark_variant": false,
+      "y_start": <pixel y from band map — approximate if merging bands>,
+      "y_end": <pixel y>,
       "content": [
         {
           "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list",
-          "text": "EXACT TEXT FROM PDF EXTRACTION — copy verbatim",
-          "size": 16,
-          "weight": 400,
-          "lh": 24,
-          "color": "#hex",
-          "align": "center",
-          "transform": "uppercase",
-          "img_desc": "what the image shows",
-          "img_w": 600,
-          "img_h": 400,
-          "cta_bg": "#hex",
-          "cta_color": "#hex",
-          "cta_radius": 6,
-          "cta_h": 45,
-          "cta_size": 16,
-          "cta_weight": 600,
-          "cta_pad": 30,
-          "cta_border": "1px solid #hex",
+          "text": "<verbatim from OCR>",
+          "spans": [{ "text": "...", "color": "#hex" }],
+          "size": 16, "weight": 400, "lh": 24,
+          "color": "#hex", "align": "left|center|right", "transform": "uppercase",
+          "src": "<Dropbox URL>", "alt": "<description>", "width": <number>, "height": <number>,
+          "cta_bg": "#hex", "cta_color": "#hex", "cta_radius": 30,
+          "cta_h": 50, "cta_size": 16, "cta_weight": 700, "cta_pad": 30,
+          "cta_text": "<button label>",
           "bullets": ["item 1", "item 2"],
-          "cols": [
-            { "w": "50%", "content": [] }
-          ]
+          "cols": [ { "w": "50%", "content": [] } ]
         }
       ]
     }
   ],
-  "images": [
-    { "n": 1, "section": 3, "desc": "company logo top center", "w": 184, "h": 60, "full_width": false, "is_bg": false }
-  ],
-  "colors": {
-    "brand1": "#hex",
-    "brand2": "#hex",
-    "text": "#hex",
-    "heading": "#hex",
-    "cta_bg": "#hex",
-    "cta_text": "#hex"
-  },
-  "has_vml": false,
-  "has_multicol": false,
-  "cta_count": 2,
-  "img_count": 8
+  "palette_used": ["#hex1", "#hex2", "..."]
 }
 
 ========================================
-RULES
+FINAL CHECKLIST (run before outputting)
 ========================================
-1. TEXT FROM PDF EXTRACTION ONLY: Every "text" field MUST contain text copied verbatim from the RAW TEXT section. NEVER generate, paraphrase, or approximate. If you cannot match a text snippet to a visual section, include it in the nearest logical section.
-2. TEXT ALIGNMENT — STUDY EVERY BLOCK INDIVIDUALLY: For every text element, look at the image and determine whether the text is left-aligned, centered, or right-aligned within its container. Set the "align" field explicitly for each element. NEVER default to "left" just because it's the common default — if the visual shows centered text, set align="center". Headings, body copy, testimonial quotes, CTAs, and footer text often use center alignment; sidebar content and list items often use left alignment. A section can contain text elements with different alignments. Get this right for every element.
-3. SECTION ORDER: Top-to-bottom in visual order. Every section visible in the image must appear in the JSON.
-4. NO DEDUPLICATION: If the same content/layout appears multiple times in the design, output it multiple times. This is intentional design — preserve it.
-5. CATALOG EVERY BAND: Even 2-5px colored stripes, narrow alert bars, dark/light duplicate sections — each gets its own entry.
-6. COLORS: Be specific. Match the exact hex visible in the design. Dark charcoal is NOT pure #000000. Neon/saturated colors are NOT the same as brand colors (a brand green is NOT pure #00FF00; a brand red is NOT pure #FF0000; a brand blue is NOT pure #0000FF). Light neutrals (cream, off-white, warm beige, cool gray) are NOT #FFFFFF. When in doubt, pick a hex that matches the actual pixel color, not a common default. Report the exact hex you see — do not round to convenient values.
-7. SPACING: Estimate px from the image. 33px ≠ 30px.
-8. IMAGES: Describe WHAT each image shows (logo, headshot, phone mockup, banner).
-9. VML: Set has_vml: true if text overlays a background image.
-10. COMPACT: Short keys. Omit null/default fields.
-11. METADATA: Order IDs, filenames, "OID" lines from file metadata are NOT email content. Do not include them as text in sections.
-12. BULLET LISTS: If the design shows a bulleted list (4+ short items stacked with bullet markers), use el: "bullet_list" with a "bullets" array.
-13. BAND_COUNT CHECK: Before outputting, count your sections array length. If it's less than band_count, GO BACK and find the missing bands. Common missed bands: thin colored stripes at edges of the design, dark/light duplicate versions of preheader or logo, narrow alert/notification bars, standalone contact info rows, prominent closing CTA blocks, separate copyright/legal footer strips.
-14. NO markdown fences. NO backticks. NO explanation. ONLY the JSON object.
-
-========================================
-SELF-CHECK CHECKLIST (verify before outputting)
-========================================
-- Did you count every horizontal band top-to-bottom?
-- Did you include any thin accent-colored stripes at the top or bottom (if present)?
-- Did you include BOTH dark and light versions of preheader/logo (if the design shows both)?
-- Did you include any narrow alert/notification bars (if present — any bright accent color)?
-- Did you include every repeated layout variant as a separate section?
-- Did you include standalone contact info bands like phone number rows (if separate from footer)?
-- Did you include the closing CTA block (if the design has a prominent final call-to-action section before the footer)?
-- Did you include the copyright/legal footer band?
-- Does sections.length >= band_count?
-- Are colors specific hex values matching the actual design (not generic defaults)?
-- Is every "text" field from the RAW TEXT extraction, verbatim?
-- Is the "align" field set correctly for EVERY text element based on the visual alignment in the design?`;
+- Do your sections cover the full vertical range from y=0 to the last band's y_end?
+- Every "bg" and "color" is from the supplied palette?
+- Every "text" is verbatim from OCR?
+- Every image has a src that is a Dropbox URL from the assets list (or empty if no match)?
+- Every text element has an "align" field matching the visible alignment?
+- Multi-color inline headings use "spans" (not duplicated rows)?
+- Colored stripes >= 2px in the band map have a thin_colored_band section?
+- No fake hallucinated sections not visible in the design image?
+`;
 
 // =====================================================================
 // STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
@@ -684,10 +574,31 @@ SELF-CHECK CHECKLIST (verify before outputting)
 const STAGE2_PROMPT = `## IDENTITY
 You are the senior email developer at Mavlers. You receive a JSON design specification and produce production-ready HTML email code. The JSON spec contains analyzed design data — section structure, verbatim text, colors, spacing, image descriptions. Your job: convert this spec into Mavlers-grade HTML. Trust the spec. Generate HTML from it, not from guesswork.
 
-## IMPORTANT — PIXEL-EXACT COLORS IN SPEC (v4.0.0)
-The spec's section "bg" fields, and any hex values in "colors.unique_bg_colors" and "colors.accent_colors" arrays, are sampled DIRECTLY from the design image's pixels — NOT guessed from a compressed preview. Use these hex values VERBATIM. Do NOT round #231F20 to #000000, do NOT substitute #F5F5F5 for #F5F5E8, do NOT change #00DA00 to #00FF00. Whatever hex the spec contains IS the correct color.
+## IMPORTANT — PIXEL-EXACT COLORS IN SPEC (v5.0.0)
+The spec's section "bg" fields and all hex values in element "color", "cta_bg", "cta_color", and "spans[].color" fields are sampled DIRECTLY from the design image's pixels — NOT guessed from a compressed preview. Use these hex values VERBATIM. Do NOT round, substitute, or approximate. Do NOT change one brand color to another similar-looking color. Whatever hex the spec contains IS the correct color. The spec also includes a "_palette" array — only use colors from that palette for any color field.
 
-Each section also carries a "_band" field with y_start, y_end, height, row_coverage, and page — this is structural metadata. You can ignore _band but must honor the section order it implies.
+## IMPORTANT — IMAGE URLs ARE EMBEDDED IN THE SPEC (v5.0.0)
+Every image content element carries an "src" field with a full Dropbox URL. Use that URL VERBATIM as the img src attribute. NEVER substitute relative paths like "images/hero.jpg" when the spec has a URL. NEVER fabricate image URLs. If spec's src is empty string, use a descriptive alt and omit the src (do not invent a filename).
+
+## IMPORTANT — MULTI-COLOR HEADINGS USE SPANS (v5.0.0)
+When a text content element has a "spans" array, it means the visible heading in the design has multiple colors INLINE on the same line. Render as a SINGLE <td> containing multiple <span> elements:
+
+Example spec content:
+{
+  "el": "text",
+  "spans": [
+    { "text": "[FIRST PART]", "color": "#COLOR_A" },
+    { "text": " [SECOND PART].", "color": "#COLOR_B" }
+  ],
+  "size": 28, "weight": 700, "lh": 34, "align": "center"
+}
+
+Correct HTML output — ONE td, TWO spans:
+<td align="center" valign="top" style="font-family: 'FONT_STACK'; font-size: 28px; line-height: 34px; font-weight: 700; text-align: center;">
+  <span style="color: #COLOR_A;">[FIRST PART]</span><span style="color: #COLOR_B;"> [SECOND PART].</span>
+</td>
+
+NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the heading text as two entirely-colored rows. This is the #1 failure of prior versions — the developer's reference code always uses inline spans, never stacked rows.
 
 ## ABSOLUTE OUTPUT RULES
 1. Output ONLY the final HTML. Begin with <!DOCTYPE. End with </html>. Nothing else.
@@ -697,11 +608,11 @@ Each section also carries a "_band" field with y_start, y_end, height, row_cover
 
 ## ABSOLUTE FIDELITY RULES
 1. Use ALL text from the spec VERBATIM. Copy every word exactly. NEVER rewrite or paraphrase.
-2. Use EXACT hex colors from the spec. Match every hex value as-is. Do not substitute pure black for a dark charcoal, do not substitute a neon color for a brand color, do not substitute #FFFFFF for a light neutral.
+2. Use EXACT hex colors from the spec. Match every hex value as-is.
 3. Use EXACT spacing from the spec. 33px ≠ 30px. NEVER round.
 4. Output sections in the EXACT order from the spec. Do NOT rearrange, merge, or skip sections.
 5. Every element goes in a <td> with inline styles. NEVER use <p>, <h1>-<h6>, or <div> (except the hidden preheader div and <ul>/<li> inside bullet_list sections).
-6. TEXT ALIGNMENT — RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. If spec says align="left", use align="left". NEVER default to "left" when the spec says otherwise. This applies to headings, body text, testimonial quotes, footer text, and every other text block. Also apply the correct alignment to the parent <td> that wraps the content table (align="center" parent td vs align="left" parent td).
+6. TEXT ALIGNMENT — RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. NEVER default to "left" when the spec says otherwise.
 
 ## GOLD STANDARD: SECTION WRAPPER PATTERN
 Every section MUST follow this exact wrapper pattern — each section is an independent table block:
@@ -940,8 +851,14 @@ NOTE: The em_main_table directly contains section <tr> blocks. There is NO third
 - Full-width images: class="em_full_img" on parent td
 - Banner images: NO height attribute (responsive)
 
-## IMAGE URL HANDLING
-When image URLs are provided, use the EXACT Dropbox URLs for ALL img src attributes. NEVER use relative paths like "images/hero.jpg" when URLs are provided.
+## IMAGE URL HANDLING (v5.0.0)
+Every image element in the spec's content arrays has an "src" field populated with the exact Dropbox URL to use. You must:
+1. Use spec.content[].src VERBATIM as the img src attribute — never modify, never substitute with relative paths, never shorten.
+2. Never invent image filenames like "images/hero.jpg" or "images/logo_img1.png".
+3. If spec's src field is an empty string "", it means no matching uploaded asset exists — render the img tag with src="" and the descriptive alt from the spec. Do NOT fabricate a filename.
+4. Width and height attributes come from spec.content[].width and spec.content[].height — use those values as numbers without "px" suffix.
+5. Always include alt text from spec.content[].alt.
+6. NEVER output img src values like "images/anything.png" — those are relative paths which break in every email client.
 
 ## SPECIAL SECTION TYPES (new in v3.3.0)
 
@@ -957,8 +874,8 @@ A narrow bar with a bright background color and uppercase text:
 Use the bgcolor from the spec — alert bars use any bright accent color (orange, red, yellow, amber, teal, etc. — whatever the design shows).
 
 ### phone_bar (phone number in its own band, usually above footer)
-<td align="center" valign="top" style="padding: 20px 40px;" bgcolor="#000000">
-  <td align="center" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 16px; color: #FFFFFF; font-weight: 400;">(+61) 1300 818 777</td>
+<td align="center" valign="top" style="padding: 20px 40px;" bgcolor="#SPEC_BG_HEX">
+  <td align="center" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 16px; color: #SPEC_TEXT_HEX; font-weight: 400;">[PHONE NUMBER FROM SPEC VERBATIM]</td>
 </td>
 
 ### closing_cta (prominent final call-to-action block before footer)
@@ -979,8 +896,8 @@ A high-emphasis closing section with large heading + CTA, often with a full-widt
 ### bullet_list (4+ stacked short items with bullet markers)
 <td align="left" valign="top" style="padding: 0 40px 20px;">
   <ul style="margin: 0; padding: 0 0 0 20px; list-style-type: disc;">
-    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #231F20; padding-bottom: 8px;">Bullet item 1</li>
-    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #231F20; padding-bottom: 8px;">Bullet item 2</li>
+    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #SPEC_TEXT_HEX; padding-bottom: 8px;">[BULLET TEXT FROM SPEC]</li>
+    <li style="font-family: 'FONT_STACK'; font-size: 14px; line-height: 22px; color: #SPEC_TEXT_HEX; padding-bottom: 8px;">[BULLET TEXT FROM SPEC]</li>
   </ul>
 </td>
 Note: <ul>/<li> ARE acceptable for bullet lists (exception to the no-non-table-elements rule).
@@ -989,10 +906,10 @@ Note: <ul>/<li> ARE acceptable for bullet lists (exception to the no-non-table-e
 Used for activity feeds, booking lists, etc. Each entry has name (bold), timestamp (light), action (gray):
 <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%">
   <tr>
-    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 600; color: #231F20; padding-bottom: 4px;">Name Wed DD Mon H.MMpm</td>
+    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 600; color: #SPEC_PRIMARY_HEX; padding-bottom: 4px;">[NAME] [DAY] [DATE] [TIME]</td>
   </tr>
   <tr>
-    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 400; color: #666666; padding-bottom: 12px;">Action description</td>
+    <td align="left" style="font-family: 'FONT_STACK'; font-size: 12px; font-weight: 400; color: #SPEC_SECONDARY_HEX; padding-bottom: 12px;">[ACTION DESCRIPTION]</td>
   </tr>
 </table>
 
@@ -1009,13 +926,16 @@ Some designs show the SAME section twice — once styled for dark mode preview, 
 5. CSS border-top/border-bottom for dividers — use spacer.gif + bgcolor
 6. role="presentation" on layout tables (developer doesn't use it in this codebase)
 7. Substituting common defaults (#000000, #FFFFFF, #00FF00, etc.) when the spec provides specific brand hex values — always use the exact hex from the spec
-8. Neon/pure/saturated colors (like #00FF00, #FF0000, #0000FF) when spec shows a brand variant (like #00DA00, #E41525, #022C87). Match the exact hex from spec.
+8. Neon/pure/saturated colors (like #00FF00, #FF0000, #0000FF) when spec shows a brand variant. Match the exact hex from spec — brand colors are almost always slightly off-pure (#1FC23D not #00FF00, #E41525 not #FF0000, #0A36A8 not #0000FF).
 9. border-radius: 4px on CTAs (should be 6px or 30px based on spec)
 10. @import for fonts (use <link> tag)
 11. One giant em_wrapper nesting all sections (each section gets its own)
-12. SKIPPING any section from the spec — if spec has 28 sections, output 28 sections
+12. SKIPPING any section from the spec — if spec has N sections, output N sections
 13. DEDUPLICATING sections — if spec shows the same content twice (dark+light, two variants), output both
 14. Collapsing similar adjacent sections into one — preserve every section from the spec
+15. **Splitting a "spans" element into two <td> rows** — the developer's reference code always renders multi-color headings as ONE <td> with multiple inline <span> elements. If spec content has a "spans" array, output ONE td with multiple spans. NEVER duplicate the heading text across multiple colored rows.
+16. **Relative image paths** — img src="images/anything.png" is always wrong in v5. If spec has a URL, use it; if spec has empty src, use empty src. NEVER make up a filename.
+17. **Inventing sections not in the spec** — if the spec has 23 sections, output exactly 23 sections. Do not add a "dark logo" or "decorative banner" that isn't in the spec.
 
 ## FINAL CHECKLIST
 Before outputting, verify:
@@ -1025,7 +945,11 @@ Before outputting, verify:
 - Each section is its own em_wrapper table inside a <tr>
 - CTAs match spec values for bgcolor, height, border-radius, font-size
 - Text colors match the exact spec hex (no generic defaults substituted)
+- All colors used are from the spec's _palette array (no invented hex values)
 - EVERY text element's align attribute and text-align style matches the spec's "align" value (never default to left)
+- Every img src is the exact Dropbox URL from spec.content[].src (or "" if spec had empty src)
+- NO img tag has a relative path like "images/filename.png" — this is always wrong
+- Every "spans" array renders as ONE td with multiple inline <span> elements (never two stacked rows)
 - Font loaded via <link> tag, not @import
 - All text from spec used verbatim
 - Section order matches spec exactly (top-to-bottom)
@@ -1033,6 +957,7 @@ Before outputting, verify:
 - Dark/light variant pairs both present when spec shows both
 - Bullet lists rendered as <ul>/<li>
 - Footer + copyright bar on separate rows
+- No sections invented that aren't in the spec
 
 Generate the most accurate, production-ready, Mavlers-grade HTML email code possible from the provided JSON design specification and developer overrides.`;
 
@@ -1104,7 +1029,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "4.0.1",
+    version: "5.0.0",
   });
 });
 
@@ -1245,24 +1170,21 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     // =================================================================
-    // STAGE 1 — Design Analysis (Band Detection → Per-band Claude → Spec)
-    // v4.0.0 — Deterministic band discovery + pixel-sampled colors.
+    // STAGE 1 — Design Analysis (v5.0.0)
+    // Full-design Claude call with pixel-sampled palette + OCR text.
     //
-    // OLD (v3.x): Send compressed PDF to Claude, ask "find all sections".
-    //              Missed thin bands, guessed colors from compressed JPEG.
-    // NEW (v4.0.0): Detect bands in Node.js by scanning pixel rows.
-    //                Sample exact hex colors from pixels.
-    //                Crop each band and send to Claude individually for
-    //                content classification. Claude's job shrinks from
-    //                "analyze entire design" to "describe this one strip".
+    // v4.x was per-band Claude calls. That fragmented sections and lost
+    // visual context. v5 reverts to a single full-design pass, but hands
+    // Claude authoritative pixel-sampled colors + OCR text + a band map,
+    // so Claude never has to GUESS colors or miss thin elements.
     // =================================================================
     const stage1StartTime = Date.now();
-    log("info", "Stage 1 starting: band detection (v4.0.0)", {
+    log("info", "Stage 1 starting (v5.0.0)", {
       requestId: req.id,
       pageCount: pngPages.length,
     });
 
-    // --- Extract raw text from PDF (unchanged from v3.x) ---
+    // --- Step 1a: Text extraction (pdf-parse, fallback to Tesseract OCR) ---
     const MIN_USEFUL_TEXT_LENGTH = 200;
     let extractedText = "";
     let textExtractionMethod = "none";
@@ -1281,7 +1203,6 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     if (!extractedText || extractedText.trim().length < MIN_USEFUL_TEXT_LENGTH) {
-      // Fall back to Tesseract OCR on the full-res rasterized PNG
       try {
         const { createWorker } = await import("tesseract.js");
         const worker = await createWorker("eng");
@@ -1301,11 +1222,10 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     }
 
-    // Post-process OCR output to fix letter-spacing, doubled spaces, etc.
-    // This is Fix #2 from the v4.0.0 plan.
-    if (textExtractionMethod === "tesseract-ocr") {
-      extractedText = postProcessOcr(extractedText);
-    }
+    // Always run post-processing regardless of extraction method.
+    // The universal fixes (letter-spacing collapse, doubled spaces, etc.)
+    // don't break clean pdf-parse output but do repair OCR artifacts.
+    extractedText = postProcessOcr(extractedText);
 
     log("info", "Text extraction complete", {
       requestId: req.id,
@@ -1313,17 +1233,16 @@ app.post("/generate", generateLimiter, async (req, res) => {
       textLength: extractedText.length,
     });
 
-    // --- Detect bands in each page ---
-    // For multi-page PDFs, we process each page independently and concatenate
-    // band lists with y-offsets to preserve global section ordering.
+    // --- Step 1b: Band detection + palette building ---
     const allBands = [];
-    const pageBandOffsets = []; // { pageIdx, yOffset, bandCount }
+    const pageInfos = [];
     let cumulativeBandCount = 0;
 
     for (let pageIdx = 0; pageIdx < pngPages.length; pageIdx++) {
       const pageBuffer = pngPages[pageIdx].content;
       const detectStart = Date.now();
-      const { width: pageW, height: pageH, bands: pageBands } = await detectBands(pageBuffer);
+      const { width: pageW, height: pageH, bands: pageBands } =
+        await detectBands(pageBuffer);
 
       log("info", `Page ${pageIdx + 1} band detection`, {
         requestId: req.id,
@@ -1333,12 +1252,11 @@ app.post("/generate", generateLimiter, async (req, res) => {
         detectMs: Date.now() - detectStart,
       });
 
-      pageBandOffsets.push({
+      pageInfos.push({
         pageIdx,
-        yOffset: cumulativeBandCount,
-        bandCount: pageBands.length,
         pageWidth: pageW,
         pageHeight: pageH,
+        bandCount: pageBands.length,
       });
 
       for (const band of pageBands) {
@@ -1350,247 +1268,329 @@ app.post("/generate", generateLimiter, async (req, res) => {
       }
     }
 
-    log("info", "Band detection complete", {
+    // Build a palette of authoritative colors
+    const palette = buildColorPalette(allBands);
+
+    log("info", "Band detection + palette complete", {
       requestId: req.id,
       totalBands: allBands.length,
+      paletteSize: palette.length,
+      paletteColors: palette.slice(0, 10).map((p) => p.hex),
     });
 
-    // --- For each band: crop, extract accent colors, classify with Claude ---
-    //
-    // Rate-limit strategy (v4.0.0.1):
-    // - Anthropic free tier / low-tier accounts cap requests/minute
-    // - Each Claude call takes 2-4 seconds, so firing 5 at once can burst >50
-    //   calls/min when the minute-boundary lines up
-    // - Strategy: concurrency=2, retry on 429 with exponential backoff,
-    //   small inter-batch delay to average out requests/minute
-    // - Pre-filter thin/trivial bands (spacers, 1-2px stripes) — classify them
-    //   locally without a Claude call at all. This typically halves the API calls.
-    const BAND_ANALYSIS_CONCURRENCY = 2;
-    const INTER_BATCH_DELAY_MS = 700;   // ~85 bands/min ceiling regardless of batch size
-    const MAX_RATE_LIMIT_RETRIES = 4;
-    const bandAnalyses = new Array(allBands.length);
+    // --- Step 1c: Prepare Stage 1 Claude inputs ---
+    // Compress each page for Claude vision. Use higher quality than v4 (2x
+    // larger file budget) because this is a single full-design call, not 30
+    // per-band calls, so we can afford better resolution.
+    const TARGET_MAX_BYTES = 3 * 1024 * 1024; // 3MB — single call allows larger images
 
-    // For each band, we provide the FULL OCR text and let Claude match relevant lines.
-    const totalOcrText = extractedText;
+    const compressedPdfPages = [];
+    for (let i = 0; i < pngPages.length; i++) {
+      const page = pngPages[i];
+      const pageInfo = pageInfos[i];
 
-    /**
-     * Decide whether we can classify a band locally without calling Claude.
-     * Applies only to trivially simple bands where pixel data alone tells
-     * us everything Stage 2 needs. Saves API calls and avoids 429 errors.
-     */
-    const classifyLocally = (band) => {
-      // Pure-white short gap → spacer
-      if (band.height < 3 && band.bg_hex === "#FFFFFF") {
-        return { type: "spacer", pad: "0 0 0 0", align: "center", content: [], _meta: { local: true, reason: "empty_spacer" } };
-      }
-      // Thin colored stripe (≤10px) → dedicated type, no Claude needed
-      if (band.is_thin && !band.is_content) {
-        return {
-          type: "thin_colored_band",
-          pad: "0 0 0 0",
-          align: "center",
-          content: [{ el: "divider", color: band.bg_hex }],
-          _meta: { local: true, reason: "thin_stripe" },
-        };
-      }
-      // Tall pure-white region that is NOT content-heavy → blank spacer
-      if (!band.is_content && band.bg_hex === "#FFFFFF" && band.height < 40) {
-        return { type: "spacer", pad: "0 0 0 0", align: "center", content: [], _meta: { local: true, reason: "whitespace" } };
-      }
-      return null; // Needs a Claude call
-    };
+      log("info", `Page ${i + 1} original`, {
+        requestId: req.id,
+        origWidth: pageInfo.pageWidth,
+        origHeight: pageInfo.pageHeight,
+        origSizeKB: Math.round(page.content.length / 1024),
+      });
 
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-    const analyzeBand = async (band, idx) => {
-      const local = classifyLocally(band);
-      if (local) return local;
-
-      const pageBuffer = pngPages[band.pageIdx].content;
-      // Crop the band from its source page PNG
-      const cropped = await cropBand(pageBuffer, band.y_start, band.y_end);
-      // Compress the crop for Claude API (small JPEG keeps latency low)
-      const croppedJpeg = await sharp(cropped)
-        .jpeg({ quality: 75 })
-        .toBuffer();
-
-      // Sample accent colors from the band's pixel region
-      const accentColors = await extractAccentColors(pageBuffer, band, 6);
-
-      // Build the per-band user prompt
-      const bandInfoText = [
-        `BAND DIMENSIONS: ${band.height}px tall`,
-        `BAND BG COLOR (exact from pixels): ${band.bg_hex}`,
-        `ACCENT COLORS (exact from pixels): ${accentColors.length > 0 ? accentColors.join(", ") : "none detected"}`,
-        `IS THIN BAND: ${band.is_thin}`,
-        `IS CONTENT-HEAVY (text/image): ${band.is_content}`,
-        "",
-        "FULL OCR TEXT FROM THE EMAIL (use only lines visually within this band):",
-        totalOcrText.substring(0, 8000),
-      ].join("\n");
-
-      const userContent = [
-        {
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: "image/jpeg",
-            data: croppedJpeg.toString("base64"),
-          },
-        },
-        { type: "text", text: bandInfoText },
+      // Step-down quality until we fit under the byte cap.
+      // Higher resolution than v4 for better section recognition.
+      const attempts = [
+        { width: 1400, quality: 80 },
+        { width: 1200, quality: 75 },
+        { width: 1000, quality: 70 },
+        { width: 850, quality: 65 },
+        { width: 700, quality: 55 },
       ];
 
-      // Retry loop with exponential backoff for 429 rate-limit errors
-      let lastErr = null;
-      for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
+      let compressed = page.content;
+      const MAX_HEIGHT = 12000;
+
+      for (const attempt of attempts) {
         try {
-          const message = await anthropic.messages.create({
-            model: CLAUDE_MODEL,
-            max_tokens: 4000,
-            system: BAND_PROMPT,
-            messages: [{ role: "user", content: userContent }],
-          });
+          const buf = await sharp(page.content)
+            .resize(attempt.width, MAX_HEIGHT, {
+              fit: "inside",
+              withoutEnlargement: true,
+            })
+            .jpeg({ quality: attempt.quality })
+            .toBuffer();
 
-          const textBlock = message.content.find((b) => b.type === "text");
-          if (!textBlock) {
-            throw new Error("No text block in response");
-          }
-
-          let raw = textBlock.text.trim();
-          raw = raw.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
-
-          const firstBrace = raw.indexOf("{");
-          const lastBrace = raw.lastIndexOf("}");
-          if (firstBrace === -1 || lastBrace === -1) {
-            throw new Error("No JSON object in response");
-          }
-          const jsonStr = raw.substring(firstBrace, lastBrace + 1);
-          return JSON.parse(jsonStr);
-        } catch (err) {
-          lastErr = err;
-          // Detect 429 rate-limit: Anthropic SDK returns status 429 on err.status
-          const is429 = err?.status === 429 || (err?.message && err.message.includes("429"));
-          if (is429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-            // Exponential backoff: 2s, 4s, 8s, 16s
-            const backoffMs = 2000 * Math.pow(2, attempt);
-            log("info", `Band ${idx + 1} hit rate limit, retrying after ${backoffMs}ms`, {
+          if (buf.length <= TARGET_MAX_BYTES) {
+            compressed = buf;
+            log("info", `Page ${i + 1} compressed`, {
               requestId: req.id,
-              attempt: attempt + 1,
+              width: attempt.width,
+              quality: attempt.quality,
+              sizeKB: Math.round(buf.length / 1024),
             });
-            await sleep(backoffMs);
-            continue;
+            break;
+          } else {
+            compressed = buf;
           }
-          // Non-429 error or out of retries → fall through to fallback
-          break;
+        } catch {
+          continue;
         }
       }
 
-      log("warn", `Band ${idx + 1} analysis failed, using fallback`, {
-        requestId: req.id,
-        error: lastErr?.message || "unknown",
-        bandHex: band.bg_hex,
-        bandHeight: band.height,
-      });
-      return {
-        type: band.is_thin ? "thin_colored_band" : band.is_content ? "body_text" : "spacer",
-        pad: "0 0 0 0",
-        align: "center",
-        content: [],
-        _meta: { fallback: true },
-      };
-    };
+      compressedPdfPages.push(compressed);
+    }
 
-    // Run band analyses in parallel batches with inter-batch throttling
-    for (let i = 0; i < allBands.length; i += BAND_ANALYSIS_CONCURRENCY) {
-      const batch = allBands.slice(i, i + BAND_ANALYSIS_CONCURRENCY);
-      const results = await Promise.all(
-        batch.map((band, j) => analyzeBand(band, i + j))
-      );
-      for (let j = 0; j < results.length; j++) {
-        bandAnalyses[i + j] = results[j];
-      }
-      // Small gap between batches so we don't saturate the per-minute rate limit
-      if (i + BAND_ANALYSIS_CONCURRENCY < allBands.length) {
-        await sleep(INTER_BATCH_DELAY_MS);
+    // --- Step 1d: Build the Stage 1 user message ---
+    // This is the SINGLE call that does all design analysis. Claude sees:
+    // - Full high-quality design image
+    // - Pixel-sampled color palette (authoritative)
+    // - OCR text (authoritative)
+    // - Band map (reference for thin elements)
+    // - Image asset list (with Dropbox URLs pre-matched)
+    // - Developer overrides (width, fonts, ESP, dark mode)
+
+    const paletteTable = palette
+      .map((p) => {
+        const tags = [];
+        if (p.is_saturated) tags.push("brand/accent");
+        if (p.is_grayscale) tags.push("grayscale");
+        return `  ${p.hex}  (${p.total_height_px}px total, ${p.band_count} bands${tags.length ? ", " + tags.join(", ") : ""})`;
+      })
+      .join("\n");
+
+    const bandMapTable = allBands
+      .map(
+        (b) =>
+          `  #${b.globalIndex.toString().padStart(2, " ")} y=${b.y_start}-${b.y_end} h=${b.height}px bg=${b.bg_hex}${b.is_thin ? " THIN" : ""}${b.is_content ? " CONTENT" : ""}`
+      )
+      .join("\n");
+
+    // Gather image asset list from the uploaded ZIP (already extracted and
+    // uploaded to Dropbox in earlier steps).
+    const imageDimensions = {};
+    if (Object.keys(imageUrlMap).length > 0) {
+      for (const img of images) {
+        try {
+          const meta = await sharp(img.buffer).metadata();
+          imageDimensions[img.filename] = {
+            width: meta.width,
+            height: meta.height,
+          };
+        } catch {
+          imageDimensions[img.filename] = { width: 0, height: 0 };
+        }
       }
     }
 
-    log("info", "Per-band Claude analysis complete", {
-      requestId: req.id,
-      bandsAnalyzed: bandAnalyses.length,
-      localCount: bandAnalyses.filter((b) => b._meta?.local).length,
-      fallbackCount: bandAnalyses.filter((b) => b._meta?.fallback).length,
-      claudeAnalyzedCount: bandAnalyses.filter((b) => !b._meta?.local && !b._meta?.fallback).length,
-    });
+    const imageAssetList = Object.entries(imageUrlMap)
+      .map(([filename, url]) => {
+        const dims = imageDimensions[filename] || {};
+        return `  ${filename}  (${dims.width || "?"}x${dims.height || "?"}px)  →  ${url}`;
+      })
+      .join("\n");
 
-    // --- Assemble the final design spec ---
-    // Each band becomes one section with its pixel-exact bg_hex and the
-    // Claude-classified content.
-    const sections = allBands.map((band, idx) => {
-      const analysis = bandAnalyses[idx] || {};
-      return {
-        n: idx + 1,
-        type: analysis.type || "unknown",
-        bg: band.bg_hex,              // PIXEL-EXACT, never guessed
-        pad: analysis.pad || "0 0 0 0",
-        align: analysis.align || "center",
-        height_hint: band.is_thin ? "thin" : band.height < 100 ? "normal" : "tall",
-        dark_variant: analysis.dark_variant || false,
-        content: analysis.content || [],
-        _band: {
-          y_start: band.y_start,
-          y_end: band.y_end,
-          height: band.height,
-          row_coverage: band.row_coverage_ratio,
-          page: band.pageIdx,
-        },
-      };
-    });
+    // Developer override block
+    const devOverrides = [];
+    if (emailWidth) devOverrides.push(`EMAIL WIDTH: ${emailWidth}px`);
+    if (primaryFont) devOverrides.push(`PRIMARY FONT: ${primaryFont}`);
+    if (secondaryFont) devOverrides.push(`SECONDARY FONT: ${secondaryFont}`);
+    if (espPlatform && espPlatform !== "none") devOverrides.push(`ESP PLATFORM: ${espPlatform}`);
+    if (typeof darkMode === "boolean")
+      devOverrides.push(`DARK MODE SUPPORT: ${darkMode ? "required" : "not required"}`);
+    const devOverridesText = devOverrides.length
+      ? devOverrides.join("\n")
+      : "(none — use your best judgment)";
 
-    // Build the aggregate color palette from all pixel-sampled bg colors.
-    const uniqueBgColors = [...new Set(allBands.map((b) => b.bg_hex))];
-    const allAccentColors = new Set();
-    for (let i = 0; i < Math.min(allBands.length, 20); i++) {
-      const band = allBands[i];
-      const pageBuffer = pngPages[band.pageIdx].content;
-      try {
-        const accents = await extractAccentColors(pageBuffer, band, 3);
-        accents.forEach((c) => allAccentColors.add(c));
-      } catch {
-        // non-fatal
-      }
-    }
+    const stage1UserPrompt = `
+=== DEVELOPER-SPECIFIED VALUES (authoritative overrides) ===
+${devOverridesText}
+=== END DEVELOPER VALUES ===
 
-    // Width is taken from developer input or from page width / RASTERIZE_SCALE
-    const detectedWidth = Math.round((pageBandOffsets[0]?.pageWidth || 960) / RASTERIZE_SCALE);
+=== COLOR PALETTE (pixel-sampled from the design image) ===
+These are the exact colors that appear in the design. Use these verbatim for every bg/color/cta_bg/cta_color field in your output. Do NOT invent or round.
+${paletteTable}
+=== END PALETTE ===
 
-    const designSpec = {
-      width: detectedWidth,
-      bg_outer: uniqueBgColors[0] || "#FFFFFF",
-      bg_content: uniqueBgColors.find((c) => c === "#FFFFFF") || uniqueBgColors[0] || "#FFFFFF",
-      font_body: "unknown-sans", // Developer input overrides this in Stage 2
-      font_heading: "unknown-sans",
-      band_count: allBands.length,
-      sections,
-      colors: {
-        unique_bg_colors: uniqueBgColors,
-        accent_colors: [...allAccentColors],
+=== BAND MAP (pixel-exact horizontal regions) ===
+This is a reference map of every color transition in the design, by vertical position. Use this to verify you don't miss thin stripes or narrow bars. Your sections should cover the full y-range from 0 to the last band's y_end. Merge adjacent bands into logical sections, but don't skip visible thin colored stripes.
+${bandMapTable}
+=== END BAND MAP ===
+
+=== OCR TEXT (verbatim, authoritative) ===
+Every "text" field in your JSON output must come from this text, copied verbatim. Never paraphrase.
+
+${extractedText.slice(0, 12000)}
+=== END OCR TEXT ===
+
+=== IMAGE ASSETS (uploaded to Dropbox, use these EXACT URLs) ===
+For every visible image in the design, match to one of these files by content inspection and use the exact Dropbox URL in your output's img src field.
+${imageAssetList || "(no images uploaded)"}
+=== END IMAGE ASSETS ===
+
+Now analyze the attached design image and produce the JSON specification per the schema rules. Output ONLY the JSON object, no markdown fences, no explanation.`;
+
+    const stage1ImageBlocks = compressedPdfPages.map((buf) => ({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/jpeg",
+        data: buf.toString("base64"),
       },
-      cta_count: sections.filter((s) => s.type === "cta" || s.type === "closing_cta").length,
-      img_count: sections.filter((s) => s.type === "image" || s.type === "hero_image" || s.type === "logo").length,
-    };
+    }));
 
-    log("info", "Stage 1 complete: design spec parsed (v4.0.0)", {
+    const stage1UserContent = [
+      ...stage1ImageBlocks,
+      { type: "text", text: stage1UserPrompt },
+    ];
+
+    // --- Step 1e: Call Claude with retry on 429 ---
+    const MAX_STAGE1_RETRIES = 3;
+    let stage1Message = null;
+    let stage1LastErr = null;
+    const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    for (let attempt = 0; attempt <= MAX_STAGE1_RETRIES; attempt++) {
+      try {
+        stage1Message = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 16000,
+          system: STAGE1_PROMPT,
+          messages: [{ role: "user", content: stage1UserContent }],
+        });
+        break; // success
+      } catch (err) {
+        stage1LastErr = err;
+        const is429 =
+          err?.status === 429 || (err?.message && err.message.includes("429"));
+        if (is429 && attempt < MAX_STAGE1_RETRIES) {
+          const backoffMs = 3000 * Math.pow(2, attempt);
+          log("info", `Stage 1 hit rate limit, retrying after ${backoffMs}ms`, {
+            requestId: req.id,
+            attempt: attempt + 1,
+          });
+          await sleepMs(backoffMs);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!stage1Message) {
+      log("error", "Stage 1 API call failed after retries", {
+        requestId: req.id,
+        error: stage1LastErr?.message || "unknown",
+      });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Could not reach Claude for design analysis. Please try again in a moment.",
+        requestId: req.id,
+      });
+    }
+
+    // --- Step 1f: Parse JSON response ---
+    const stage1TextBlock = stage1Message.content.find((b) => b.type === "text");
+    if (!stage1TextBlock) {
+      log("error", "Stage 1 returned no text block", { requestId: req.id });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Claude returned an empty response. Please try again.",
+        requestId: req.id,
+      });
+    }
+
+    let rawJson = stage1TextBlock.text.trim();
+    rawJson = rawJson
+      .replace(/^```(?:json)?\s*\n?/, "")
+      .replace(/\n?```\s*$/, "")
+      .trim();
+    const firstBrace = rawJson.indexOf("{");
+    const lastBrace = rawJson.lastIndexOf("}");
+    if (firstBrace === -1 || lastBrace === -1) {
+      log("error", "Stage 1 returned non-JSON output", {
+        requestId: req.id,
+        preview: rawJson.slice(0, 300),
+      });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Claude's response was not valid JSON.",
+        requestId: req.id,
+      });
+    }
+
+    let designSpec;
+    try {
+      designSpec = JSON.parse(rawJson.substring(firstBrace, lastBrace + 1));
+    } catch (jsonErr) {
+      log("error", "Stage 1 JSON parse error", {
+        requestId: req.id,
+        error: jsonErr.message,
+        preview: rawJson.slice(0, 500),
+      });
+      return res.status(502).json({
+        error: "Design analysis failed",
+        details: "Claude's JSON output was malformed. Please try again.",
+        requestId: req.id,
+      });
+    }
+
+    // --- Step 1g: Post-analysis validation ---
+    // Check that every meaningful band is accounted for in the sections.
+    // A "meaningful band" is either saturated (brand color) OR >= 40px tall.
+    // For each meaningful band, check that some section's y-range overlaps it.
+    const meaningfulBands = allBands.filter((b) => {
+      const [r, g, b2] = [
+        parseInt(b.bg_hex.substring(1, 3), 16),
+        parseInt(b.bg_hex.substring(3, 5), 16),
+        parseInt(b.bg_hex.substring(5, 7), 16),
+      ];
+      const sat = Math.max(r, g, b2) - Math.min(r, g, b2);
+      return sat > 40 || b.height >= 40;
+    });
+
+    const sections = Array.isArray(designSpec.sections) ? designSpec.sections : [];
+    const coveredBands = meaningfulBands.filter((band) => {
+      return sections.some((s) => {
+        const ys = s.y_start ?? 0;
+        const ye = s.y_end ?? ys;
+        // Overlap check
+        return ye > band.y_start && ys < band.y_end;
+      });
+    });
+
+    const uncoveredBands = meaningfulBands.filter((b) => !coveredBands.includes(b));
+    if (uncoveredBands.length > 0) {
+      log("warn", "Some meaningful bands not covered by Stage 1 sections", {
+        requestId: req.id,
+        uncoveredCount: uncoveredBands.length,
+        examples: uncoveredBands.slice(0, 5).map((b) => ({
+          y: `${b.y_start}-${b.y_end}`,
+          hex: b.bg_hex,
+          height: b.height,
+        })),
+      });
+    }
+
+    // Expose band data + palette to Stage 2 (read-only reference)
+    designSpec._band_map = allBands.map((b) => ({
+      idx: b.globalIndex,
+      y: [b.y_start, b.y_end],
+      h: b.height,
+      bg: b.bg_hex,
+    }));
+    designSpec._palette = palette.map((p) => p.hex);
+    designSpec._uncovered_band_count = uncoveredBands.length;
+
+    log("info", "Stage 1 complete (v5.0.0)", {
       requestId: req.id,
       stage1DurationMs: Date.now() - stage1StartTime,
       sectionCount: sections.length,
       bandCount: allBands.length,
-      uniqueBgColors: uniqueBgColors.length,
-      accentColorCount: allAccentColors.size,
-      detectedWidth,
+      paletteSize: palette.length,
+      meaningfulBands: meaningfulBands.length,
+      coveredBands: coveredBands.length,
+      uncoveredBands: uncoveredBands.length,
       textExtractionMethod,
     });
+
 
     // =================================================================
     // STAGE 2 — Code Generation (JSON spec + URLs → HTML)
@@ -1658,10 +1658,11 @@ app.post("/generate", generateLimiter, async (req, res) => {
       specs.push(`DARK MODE: Do NOT include any dark mode CSS. No prefers-color-scheme media query. No em_dark classes. The email does not need dark mode support.`);
     }
 
-    // --- Build image URL mapping for Stage 2 ---
+    // --- Build image URL reference for Stage 2 (v5.0.0) ---
+    // In v5, image URLs are embedded in each section's content[].src by Stage 1.
+    // This block is a BACKUP reference in case Stage 1 left any src empty.
     let imageSection = "";
     if (Object.keys(imageUrlMap).length > 0) {
-      // Get image dimensions from Sharp for each uploaded image
       const imageDimensions = {};
       for (const img of images) {
         try {
@@ -1675,23 +1676,15 @@ app.post("/generate", generateLimiter, async (req, res) => {
       const imageListStr = Object.entries(imageUrlMap)
         .map(([filename, url]) => {
           const dims = imageDimensions[filename];
-          return `${filename} (${dims?.width || "?"}×${dims?.height || "?"}px) → ${url}`;
+          return `${filename} (${dims?.width || "?"}x${dims?.height || "?"}px) -> ${url}`;
         })
         .join("\n");
 
-      imageSection = `\n\n=== IMAGE ASSETS (USE THESE EXACT URLs for img src) ===
-Match each image to its correct position in the design using the image_positions array from the JSON spec above. The spec describes what each image shows (logo, hero, photo, icon, etc.) — match by description.
-
-Available images:
+      imageSection = `\n\n=== IMAGE ASSETS REFERENCE (backup — primary URLs are embedded in spec.content[].src) ===
 ${imageListStr}
 
-RULES:
-1. Use the full Dropbox URL for every img src — NEVER use relative paths like "images/hero.jpg".
-2. Match images by their description in the spec's image_positions array.
-3. Use the actual image dimensions from the list above for width/height attributes.
-4. If an image in the spec has no matching uploaded asset, use a descriptive alt text and a transparent placeholder.
-5. NEVER fabricate image URLs.
-=== END IMAGE ASSETS ===`;
+NOTE: In v5.0.0 the Stage 1 analysis has already matched images and embedded the correct Dropbox URL in each section's content.src field. Use those embedded URLs directly. This list is only a reference — do NOT use it to substitute URLs that Stage 1 already matched.
+=== END IMAGE ASSETS REFERENCE ===`;
     }
 
     // --- Assemble the Stage 2 user message ---
@@ -2002,7 +1995,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "4.0.1",
+    version: "5.0.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
