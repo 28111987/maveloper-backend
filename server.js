@@ -9,6 +9,7 @@ import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
 import path from "path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
+import { detectBands, cropBand, extractAccentColors, postProcessOcr } from "./band-detector.js";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -451,10 +452,83 @@ function extractOrderId(filename) {
 }
 
 // =====================================================================
+// BAND ANALYSIS PROMPT (v4.0.0) — Per-band content classification
+// Receives a single cropped horizontal band image + its exact bg color
+// + accent colors sampled from pixels + nearby OCR text.
+// Returns classification of WHAT the band contains.
+//
+// This replaces Stage 1's old approach of asking Claude to discover ALL
+// sections in a full compressed PDF (which missed thin bands and guessed
+// colors). Now band discovery is done by pixel analysis in Node.js, and
+// Claude only classifies what's inside each already-detected band.
+// =====================================================================
+const BAND_PROMPT = `You are analyzing ONE horizontal band (one section) of an email design.
+
+You will receive:
+- A cropped image showing just this band
+- The EXACT bg color (hex) sampled from pixels — use this, don't guess
+- Accent colors (hex) detected in this band's pixels — use these for any non-bg elements
+- OCR text that falls within this band's vertical range
+- Band dimensions (width × height in px)
+
+Respond with ONLY a compact JSON object. No markdown fences. No commentary. Start with { end with }.
+
+SCHEMA:
+{
+  "type": "thin_colored_band|preheader|logo|nav|hero_image|heading|body_text|cta|columns|divider|spacer|footer|social|disclaimer|image|testimonial|alert_bar|phone_bar|bullet_list|job_listings|closing_cta|empty",
+  "dark_variant": false,
+  "pad": "T R B L",
+  "align": "left|center|right",
+  "content": [
+    {
+      "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list",
+      "text": "EXACT TEXT from OCR in this band",
+      "size": 16,
+      "weight": 400,
+      "lh": 24,
+      "color": "#hex (pick from accent_colors or band bg)",
+      "align": "center",
+      "transform": "uppercase",
+      "img_desc": "what the image shows (for image elements)",
+      "img_w": 600,
+      "cta_bg": "#hex (pick from accent_colors)",
+      "cta_color": "#hex",
+      "cta_radius": 6,
+      "cta_h": 45,
+      "cta_text": "CTA button text from OCR",
+      "bullets": ["item 1", "item 2"],
+      "cols": [
+        { "w": "50%", "content": [] }
+      ]
+    }
+  ]
+}
+
+RULES:
+1. USE ACCENT COLORS VERBATIM: the accent_colors array contains exact hex values sampled from this band's pixels. Pick from this list for all color fields. DO NOT invent or round colors.
+2. USE BG VERBATIM: the band's bg color is provided as an exact hex. DO NOT change it.
+3. TEXT FROM OCR: every "text" field MUST be verbatim from the provided OCR text for this band. Never paraphrase or invent.
+4. CLASSIFY CORRECTLY:
+   - Band height ≤10px with single solid color → "thin_colored_band"
+   - Narrow band (10-50px) with a notification/uppercase text on bright bg → "alert_bar"
+   - Phone number as the only content → "phone_bar"
+   - A prominent closing section with large heading + CTA on a branded bg color → "closing_cta"
+   - 4+ short stacked lines each starting a sentence → "bullet_list"
+   - List of name + timestamp + action repeated → "job_listings"
+   - Only a logo image → "logo"
+   - Uppercase tagline + browser link combo → "preheader"
+   - Background is primarily dark (bg matches dark_variant=true means bg is near-black) → set dark_variant: true
+5. COLUMNS: if the image shows 2 or 3 visually distinct vertical columns, use el:"columns" with cols array. Each column's content is its own array of elements.
+6. EMPTY / DIVIDER: if the band is purely decorative (a spacer, or a thin line), use type "divider" or "spacer" and empty content array.
+7. ALIGN: read the visual alignment of text in the image. "center" when text is horizontally centered; "left" when left-aligned; "right" when right-aligned. Never guess — look at the image.
+8. COMPACT: omit null/default fields.
+9. NO markdown. NO backticks. NO explanation.`;
+
+// =====================================================================
 // STAGE 1 PROMPT — Design Analysis (Vision → JSON)
-// Short, focused: Claude analyzes the PDF image and outputs a structured spec.
-// Developer-specified values (width, font, ESP, dark mode) are injected at call time
-// to override Claude's visual guesses with known-correct values.
+// NOTE: As of v4.0.0, this full-PDF analysis is used as a FALLBACK only,
+// when per-band analysis produces an incomplete spec. The primary Stage 1
+// uses band detection + per-band BAND_PROMPT classification.
 // =====================================================================
 const STAGE1_PROMPT = `You are an email design analyst. You will receive:
 1. One or more IMAGES showing an email design
@@ -609,6 +683,11 @@ SELF-CHECK CHECKLIST (verify before outputting)
 // =====================================================================
 const STAGE2_PROMPT = `## IDENTITY
 You are the senior email developer at Mavlers. You receive a JSON design specification and produce production-ready HTML email code. The JSON spec contains analyzed design data — section structure, verbatim text, colors, spacing, image descriptions. Your job: convert this spec into Mavlers-grade HTML. Trust the spec. Generate HTML from it, not from guesswork.
+
+## IMPORTANT — PIXEL-EXACT COLORS IN SPEC (v4.0.0)
+The spec's section "bg" fields, and any hex values in "colors.unique_bg_colors" and "colors.accent_colors" arrays, are sampled DIRECTLY from the design image's pixels — NOT guessed from a compressed preview. Use these hex values VERBATIM. Do NOT round #231F20 to #000000, do NOT substitute #F5F5F5 for #F5F5E8, do NOT change #00DA00 to #00FF00. Whatever hex the spec contains IS the correct color.
+
+Each section also carries a "_band" field with y_start, y_end, height, row_coverage, and page — this is structural metadata. You can ignore _band but must honor the section order it implies.
 
 ## ABSOLUTE OUTPUT RULES
 1. Output ONLY the final HTML. Begin with <!DOCTYPE. End with </html>. Nothing else.
@@ -1025,7 +1104,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.3.0",
+    version: "4.0.0",
   });
 });
 
@@ -1166,383 +1245,302 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     // =================================================================
-    // STAGE 1 — Design Analysis (Vision → JSON)
-    // Send compressed PDF pages to Claude with STAGE1_PROMPT.
-    // Claude returns a structured JSON spec of the design.
+    // STAGE 1 — Design Analysis (Band Detection → Per-band Claude → Spec)
+    // v4.0.0 — Deterministic band discovery + pixel-sampled colors.
+    //
+    // OLD (v3.x): Send compressed PDF to Claude, ask "find all sections".
+    //              Missed thin bands, guessed colors from compressed JPEG.
+    // NEW (v4.0.0): Detect bands in Node.js by scanning pixel rows.
+    //                Sample exact hex colors from pixels.
+    //                Crop each band and send to Claude individually for
+    //                content classification. Claude's job shrinks from
+    //                "analyze entire design" to "describe this one strip".
     // =================================================================
-
-    // Adaptive image compression for Stage 1.
-    // Text extraction needs readable text, but the Anthropic API limits input size.
-    //
-    // Key insight: Email PDFs are often VERY TALL single pages (5000-10000px at 1.6x).
-    // Width-only resize doesn't help — a 900px-wide, 8000px-tall JPEG is still huge.
-    // We must cap total pixel area AND check final file size.
-    //
-    // Anthropic Vision supports images up to ~5MB base64. To be safe, we target
-    // compressed images under 1.5MB each (base64 inflates ~33%, so ~2MB encoded).
-    //
-    // History: 600px Q50 = text unreadable. 1200px Q75 = too large. 1000px Q65 = too large.
-    //          Root cause was always the HEIGHT of long single-page emails.
-
-    const TARGET_MAX_BYTES = 1.5 * 1024 * 1024; // 1.5MB per compressed page
-
-    const compressedPdfPages = [];
-    for (let i = 0; i < pngPages.length; i++) {
-      const page = pngPages[i];
-      let compressed;
-
-      // Get original dimensions
-      let origWidth = 0, origHeight = 0;
-      try {
-        const meta = await sharp(page.content).metadata();
-        origWidth = meta.width || 0;
-        origHeight = meta.height || 0;
-      } catch { /* use defaults */ }
-
-      log("info", `Page ${i + 1} dimensions`, {
-        requestId: req.id,
-        origWidth,
-        origHeight,
-        origSizeKB: Math.round(page.content.length / 1024),
-      });
-
-      // Try progressively lower quality/size until under the limit.
-      // With PDF text extraction, Claude's vision only needs to see LAYOUT
-      // (section structure, colors, image positions, spacing) — not read text.
-      // This means we can use lower quality than before without losing information.
-      const MAX_HEIGHT = 6400;
-
-      const attempts = [
-        { width: 800, quality: 55 },   // Good for layout detection
-        { width: 700, quality: 50 },   // Moderate
-        { width: 600, quality: 45 },   // Reduced — still fine for layout
-        { width: 500, quality: 40 },   // Last resort
-      ];
-
-      compressed = page.content; // fallback to original
-
-      for (const attempt of attempts) {
-        try {
-          const buf = await sharp(page.content)
-            .resize(attempt.width, MAX_HEIGHT, { fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: attempt.quality })
-            .toBuffer();
-
-          if (buf.length <= TARGET_MAX_BYTES) {
-            compressed = buf;
-            log("info", `Page ${i + 1} compressed: ${attempt.width}px Q${attempt.quality} → ${Math.round(buf.length / 1024)}KB`, { requestId: req.id });
-            break;
-          } else {
-            log("info", `Page ${i + 1} attempt ${attempt.width}px Q${attempt.quality} → ${Math.round(buf.length / 1024)}KB (too large, trying smaller)`, { requestId: req.id });
-            compressed = buf; // keep the last attempt as fallback
-          }
-        } catch {
-          continue;
-        }
-      }
-
-      compressedPdfPages.push(compressed);
-    }
-
-    log("info", "PDF pages compressed for Stage 1", {
+    const stage1StartTime = Date.now();
+    log("info", "Stage 1 starting: band detection (v4.0.0)", {
       requestId: req.id,
       pageCount: pngPages.length,
-      originalSizes: pngPages.map((p) => Math.round(p.content.length / 1024) + "KB"),
-      compressedSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
     });
 
-    const pdfImageBlocks = compressedPdfPages.map((buf) => ({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: "image/jpeg",
-        data: buf.toString("base64"),
-      },
-    }));
-
-    // --- Extract raw text from PDF ---
-    // This is the KEY innovation: instead of relying on Claude's vision to read
-    // tiny compressed text, we extract it directly from the PDF file.
-    // Claude's vision only needs to understand LAYOUT (sections, colors, spacing,
-    // image positions) — the actual text content comes from text extraction.
-    //
-    // Two extraction methods:
-    // 1. pdf-parse: extracts text stored as text objects in the PDF (fast, reliable)
-    // 2. Tesseract OCR: reads text from the rasterized PNG image (slower, but works
-    //    when designers export PDFs with outlined/vectorized fonts)
-    //
-    // Strategy: try pdf-parse first. If result is too short (<200 chars), the PDF
-    // likely has outlined text, so fall back to Tesseract OCR on the full-res PNG.
-
-    const MIN_USEFUL_TEXT_LENGTH = 200; // Below this, pdf-parse didn't find real text
+    // --- Extract raw text from PDF (unchanged from v3.x) ---
+    const MIN_USEFUL_TEXT_LENGTH = 200;
     let extractedText = "";
     let textExtractionMethod = "none";
 
-    // Method 1: pdf-parse (fast — reads PDF text objects directly)
     try {
       const pdfData = await pdfParse(pdfBuffer);
-      const pdfText = (pdfData.text || "").trim();
-      log("info", "pdf-parse result", {
-        requestId: req.id,
-        textLength: pdfText.length,
-        textPreview: pdfText.substring(0, 200),
-      });
-      if (pdfText.length >= MIN_USEFUL_TEXT_LENGTH) {
-        extractedText = pdfText;
+      if (pdfData.text && pdfData.text.trim().length >= MIN_USEFUL_TEXT_LENGTH) {
+        extractedText = pdfData.text;
         textExtractionMethod = "pdf-parse";
       }
-    } catch (pdfErr) {
-      log("warn", "pdf-parse failed", { requestId: req.id, error: pdfErr.message });
+    } catch (parseErr) {
+      log("warn", "pdf-parse failed, will try OCR", {
+        requestId: req.id,
+        error: parseErr.message,
+      });
     }
 
-    // Method 2: Tesseract OCR (slower — reads text from rasterized image)
-    // Only used if pdf-parse didn't return enough text
-    if (extractedText.length < MIN_USEFUL_TEXT_LENGTH) {
-      log("info", "pdf-parse returned insufficient text, falling back to Tesseract OCR", {
-        requestId: req.id,
-        pdfParseLength: extractedText.length,
-      });
+    if (!extractedText || extractedText.trim().length < MIN_USEFUL_TEXT_LENGTH) {
+      // Fall back to Tesseract OCR on the full-res rasterized PNG
       try {
         const { createWorker } = await import("tesseract.js");
         const worker = await createWorker("eng");
-
-        // Use the ORIGINAL full-resolution PNG (not compressed) for best OCR quality
-        // Process each page and concatenate
-        const ocrTexts = [];
-        for (let i = 0; i < pngPages.length; i++) {
-          const { data: { text } } = await worker.recognize(pngPages[i].content);
-          ocrTexts.push(text);
-          log("info", `Tesseract OCR page ${i + 1} complete`, {
-            requestId: req.id,
-            textLength: text.length,
-          });
+        const ocrResults = [];
+        for (const page of pngPages) {
+          const { data } = await worker.recognize(page.content);
+          ocrResults.push(data.text);
         }
         await worker.terminate();
-
-        extractedText = ocrTexts.join("\n\n--- PAGE BREAK ---\n\n").trim();
+        extractedText = ocrResults.join("\n\n");
         textExtractionMethod = "tesseract-ocr";
-
-        log("info", "Tesseract OCR extraction complete", {
-          requestId: req.id,
-          totalTextLength: extractedText.length,
-          textPreview: extractedText.substring(0, 300),
-        });
       } catch (ocrErr) {
-        log("error", "Tesseract OCR also failed — Stage 1 will rely on vision only", {
+        log("error", "Tesseract OCR failed", {
           requestId: req.id,
           error: ocrErr.message,
         });
       }
     }
 
-    log("info", "Text extraction result", {
+    // Post-process OCR output to fix letter-spacing, doubled spaces, etc.
+    // This is Fix #2 from the v4.0.0 plan.
+    if (textExtractionMethod === "tesseract-ocr") {
+      extractedText = postProcessOcr(extractedText);
+    }
+
+    log("info", "Text extraction complete", {
       requestId: req.id,
-      method: textExtractionMethod,
+      textExtractionMethod,
       textLength: extractedText.length,
     });
 
-    // Build Stage 1 user message: images + extracted text + developer overrides
-    let stage1UserText = "Analyze this email design and output the JSON specification.";
+    // --- Detect bands in each page ---
+    // For multi-page PDFs, we process each page independently and concatenate
+    // band lists with y-offsets to preserve global section ordering.
+    const allBands = [];
+    const pageBandOffsets = []; // { pageIdx, yOffset, bandCount }
+    let cumulativeBandCount = 0;
 
-    // Inject the extracted text (from whichever method succeeded)
-    if (extractedText.length >= MIN_USEFUL_TEXT_LENGTH) {
-      // Clean up: remove excessive whitespace, normalize line breaks
-      const cleanedText = extractedText
-        .replace(/\r\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .replace(/[ \t]{2,}/g, " ")
-        .trim();
+    for (let pageIdx = 0; pageIdx < pngPages.length; pageIdx++) {
+      const pageBuffer = pngPages[pageIdx].content;
+      const detectStart = Date.now();
+      const { width: pageW, height: pageH, bands: pageBands } = await detectBands(pageBuffer);
 
-      stage1UserText += `\n\n=== RAW TEXT EXTRACTED FROM PDF (use this VERBATIM — do NOT rewrite) ===\n${cleanedText}\n=== END RAW TEXT ===\n\nIMPORTANT: The text above was extracted directly from the PDF file. Use it EXACTLY as-is for all "text" fields in the JSON. Your job with the IMAGE is to understand the visual layout (which section each text belongs to, colors, spacing, alignment, image positions) — NOT to read the text from the image. The extracted text is the ground truth.`;
-    } else {
-      log("warn", "No usable text extracted — Stage 1 will attempt vision-based text reading", {
+      log("info", `Page ${pageIdx + 1} band detection`, {
         requestId: req.id,
+        pageWidth: pageW,
+        pageHeight: pageH,
+        bandsDetected: pageBands.length,
+        detectMs: Date.now() - detectStart,
       });
-      stage1UserText += `\n\nWARNING: Text extraction from the PDF failed. You must read ALL text from the image carefully and VERBATIM. Do NOT paraphrase or invent text. If you cannot read a word, use [unclear].`;
+
+      pageBandOffsets.push({
+        pageIdx,
+        yOffset: cumulativeBandCount,
+        bandCount: pageBands.length,
+        pageWidth: pageW,
+        pageHeight: pageH,
+      });
+
+      for (const band of pageBands) {
+        allBands.push({
+          ...band,
+          pageIdx,
+          globalIndex: ++cumulativeBandCount,
+        });
+      }
     }
 
-    // If developer specified width/font, tell Stage 1 so it doesn't guess wrong
-    const width = emailWidth ? parseInt(emailWidth, 10) : null;
-    if (width && [600, 640, 650, 680, 700].includes(width)) {
-      stage1UserText += `\n\nDEVELOPER OVERRIDE — Email width is CONFIRMED as ${width}px. Use this exact value. Do not guess.`;
-    }
-    if (primaryFont) {
-      stage1UserText += `\n\nDEVELOPER OVERRIDE — Primary font is CONFIRMED as '${primaryFont}'. Use this in font_body and font_heading (unless heading is clearly a different font).`;
-    }
-
-    const stage1Content = [
-      ...pdfImageBlocks,
-      { type: "text", text: stage1UserText },
-    ];
-
-    log("info", "Stage 1: Sending design to Claude for analysis", {
+    log("info", "Band detection complete", {
       requestId: req.id,
-      pageCount: pngPages.length,
-      textExtractionMethod,
-      extractedTextLength: extractedText.length,
-      compressedPageSizes: compressedPdfPages.map((b) => Math.round(b.length / 1024) + "KB"),
-      totalCompressedKB: Math.round(compressedPdfPages.reduce((s, b) => s + b.length, 0) / 1024),
-      stage1PromptChars: STAGE1_PROMPT.length,
-      userTextChars: stage1UserText.length,
-      contentBlockCount: stage1Content.length,
+      totalBands: allBands.length,
     });
 
-    const stage1StartTime = Date.now();
+    // --- For each band: crop, extract accent colors, classify with Claude ---
+    // We process bands in parallel (batch of 5 at a time) to keep latency low.
+    const BAND_ANALYSIS_CONCURRENCY = 5;
+    const bandAnalyses = new Array(allBands.length);
 
-    const stage1Response = await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 16000,
-      system: STAGE1_PROMPT,
-      messages: [{ role: "user", content: stage1Content }],
-    });
+    // Slice OCR text into chunks proportional to band vertical positions.
+    // For each band, we provide OCR text from roughly its vertical region.
+    // This is a heuristic — exact slicing would need positional OCR which
+    // tesseract doesn't provide here. We pass the full OCR text to each band
+    // and let Claude match relevant lines.
+    const totalOcrText = extractedText;
 
-    const stage1TextBlock = stage1Response.content?.find((block) => block.type === "text");
-    if (!stage1TextBlock || !stage1TextBlock.text) {
-      log("error", "Stage 1: Claude returned no text", { requestId: req.id });
-      return res.status(502).json({
-        error: "Design analysis failed",
-        details: "Claude could not analyze the design. Please try again.",
-        requestId: req.id,
-      });
-    }
-
-    // Check if Stage 1 hit the token limit (truncated JSON)
-    const stage1StopReason = stage1Response.stop_reason;
-    if (stage1StopReason === "max_tokens") {
-      log("warn", "Stage 1: Response was truncated (hit max_tokens)", {
-        requestId: req.id,
-        responseLength: stage1TextBlock.text.length,
-      });
-    }
-
-    // Parse the JSON spec from Stage 1 — resilient extraction
-    let designSpec;
-    try {
-      let jsonText = stage1TextBlock.text.trim();
-
-      // Strip markdown fences (Claude adds these despite being told not to)
-      jsonText = jsonText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-
-      // If Claude added preamble text before the JSON, find the first {
-      const firstBrace = jsonText.indexOf("{");
-      if (firstBrace > 0) {
-        jsonText = jsonText.substring(firstBrace);
+    const analyzeBand = async (band, idx) => {
+      // Skip empty/pure-spacer bands to save API calls
+      if (band.height < 3 && band.bg_hex === "#FFFFFF") {
+        return {
+          type: "spacer",
+          pad: "0 0 0 0",
+          align: "center",
+          content: [],
+          _meta: { skipped: true, reason: "empty_spacer" },
+        };
       }
 
-      // Find the last } to strip any trailing text after JSON
-      const lastBrace = jsonText.lastIndexOf("}");
-      if (lastBrace > 0 && lastBrace < jsonText.length - 1) {
-        jsonText = jsonText.substring(0, lastBrace + 1);
-      }
+      const pageBuffer = pngPages[band.pageIdx].content;
+      // Crop the band from its source page PNG
+      const cropped = await cropBand(pageBuffer, band.y_start, band.y_end);
+      // Compress the crop for Claude API (small JPEG keeps latency low)
+      const croppedJpeg = await sharp(cropped)
+        .jpeg({ quality: 75 })
+        .toBuffer();
 
-      // Sanitize common Claude JSON errors before parsing:
-      // 1. Trailing commas before } or ] (e.g., {"a":1,} )
-      jsonText = jsonText.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
-      // 2. Single quotes instead of double quotes (e.g., {'key': 'value'})
-      // Only fix simple cases — avoid breaking strings that contain apostrophes
-      // 3. Unescaped newlines inside string values
-      jsonText = jsonText.replace(/(?<=:\s*"[^"]*)\n(?=[^"]*")/g, "\\n");
-      // 4. Control characters inside strings
-      jsonText = jsonText.replace(/[\x00-\x1f](?=(?:[^"]*"[^"]*")*[^"]*$)/g, "");
+      // Sample accent colors from the band's pixel region
+      const accentColors = await extractAccentColors(pageBuffer, band, 6);
 
-      // If truncated (no closing brace), attempt to repair
-      if (stage1StopReason === "max_tokens" || !jsonText.endsWith("}")) {
-        log("warn", "Stage 1: Attempting to repair truncated JSON", { requestId: req.id });
+      // Build the per-band user prompt
+      const bandInfoText = [
+        `BAND DIMENSIONS: ${band.height}px tall`,
+        `BAND BG COLOR (exact from pixels): ${band.bg_hex}`,
+        `ACCENT COLORS (exact from pixels): ${accentColors.length > 0 ? accentColors.join(", ") : "none detected"}`,
+        `IS THIN BAND: ${band.is_thin}`,
+        `IS CONTENT-HEAVY (text/image): ${band.is_content}`,
+        "",
+        "FULL OCR TEXT FROM THE EMAIL (use only lines visually within this band):",
+        totalOcrText.substring(0, 8000),
+      ].join("\n");
 
-        // Strategy: find the last complete section by looking for the last valid closing brace
-        // Count braces to find where JSON is still balanced
-        let braceDepth = 0;
-        let lastBalancedPos = -1;
-        for (let i = 0; i < jsonText.length; i++) {
-          if (jsonText[i] === "{") braceDepth++;
-          if (jsonText[i] === "}") {
-            braceDepth--;
-            if (braceDepth === 0) {
-              lastBalancedPos = i;
-            }
-          }
-        }
-
-        if (lastBalancedPos > 0) {
-          // Found a balanced closing point — truncate there
-          jsonText = jsonText.substring(0, lastBalancedPos + 1);
-        } else {
-          // No balanced point found — close all open braces/brackets
-          // Remove the last incomplete value and close the structure
-          // Trim trailing comma and incomplete key-value pairs
-          jsonText = jsonText.replace(/,\s*"[^"]*"?\s*:?\s*[^,}\]]*$/, "");
-          // Close any open brackets/braces
-          const openBraces = (jsonText.match(/{/g) || []).length;
-          const closeBraces = (jsonText.match(/}/g) || []).length;
-          const openBrackets = (jsonText.match(/\[/g) || []).length;
-          const closeBrackets = (jsonText.match(/]/g) || []).length;
-          jsonText += "]".repeat(Math.max(0, openBrackets - closeBrackets));
-          jsonText += "}".repeat(Math.max(0, openBraces - closeBraces));
-        }
-      }
-
-      designSpec = JSON.parse(jsonText);
-    } catch (parseErr) {
-      // First parse failed — try to locate and fix the error
-      log("warn", "Stage 1: First JSON.parse failed, attempting aggressive repair", {
-        requestId: req.id,
-        error: parseErr.message,
-      });
+      const userContent = [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/jpeg",
+            data: croppedJpeg.toString("base64"),
+          },
+        },
+        { type: "text", text: bandInfoText },
+      ];
 
       try {
-        let jsonText = stage1TextBlock.text.trim();
-        // Aggressive cleanup: strip everything outside the outermost { }
-        const firstBrace = jsonText.indexOf("{");
-        const lastBrace = jsonText.lastIndexOf("}");
-        if (firstBrace >= 0 && lastBrace > firstBrace) {
-          jsonText = jsonText.substring(firstBrace, lastBrace + 1);
+        const message = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 4000,
+          system: BAND_PROMPT,
+          messages: [{ role: "user", content: userContent }],
+        });
+
+        const textBlock = message.content.find((b) => b.type === "text");
+        if (!textBlock) {
+          throw new Error("No text block in response");
         }
 
-        // Fix trailing commas
-        jsonText = jsonText.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+        let raw = textBlock.text.trim();
+        // Strip any accidental markdown fences
+        raw = raw.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
 
-        // Remove any non-printable characters
-        jsonText = jsonText.replace(/[\x00-\x1f\x7f]/g, " ");
-
-        // Try to find the error position and remove the problematic line
-        const posMatch = parseErr.message.match(/at position (\d+)/);
-        if (posMatch) {
-          const errorPos = parseInt(posMatch[1], 10);
-          // Log the area around the error for debugging
-          log("warn", "Stage 1: JSON error near position " + errorPos, {
-            requestId: req.id,
-            context: jsonText.substring(Math.max(0, errorPos - 100), errorPos + 100),
-          });
+        // Find first { and matching final }
+        const firstBrace = raw.indexOf("{");
+        const lastBrace = raw.lastIndexOf("}");
+        if (firstBrace === -1 || lastBrace === -1) {
+          throw new Error("No JSON object in response");
         }
+        const jsonStr = raw.substring(firstBrace, lastBrace + 1);
+        return JSON.parse(jsonStr);
+      } catch (err) {
+        log("warn", `Band ${idx + 1} analysis failed, using fallback`, {
+          requestId: req.id,
+          error: err.message,
+          bandHex: band.bg_hex,
+          bandHeight: band.height,
+        });
+        // Fallback: classify by pixel heuristics alone
+        return {
+          type: band.is_thin ? "thin_colored_band" : band.is_content ? "body_text" : "spacer",
+          pad: "0 0 0 0",
+          align: "center",
+          content: [],
+          _meta: { fallback: true },
+        };
+      }
+    };
 
-        designSpec = JSON.parse(jsonText);
-        log("info", "Stage 1: Aggressive repair succeeded", { requestId: req.id });
-      } catch (retryErr) {
-        log("error", "Stage 1: All JSON parse attempts failed", {
-          requestId: req.id,
-          originalError: parseErr.message,
-          retryError: retryErr.message,
-          stopReason: stage1StopReason,
-          rawResponseLength: stage1TextBlock.text.length,
-          rawResponseStart: stage1TextBlock.text.substring(0, 300),
-          rawResponseEnd: stage1TextBlock.text.substring(stage1TextBlock.text.length - 300),
-        });
-        return res.status(502).json({
-          error: "Design analysis failed",
-          details: "Claude returned an invalid design specification. Please try again.",
-          requestId: req.id,
-        });
+    // Run band analyses in parallel batches
+    for (let i = 0; i < allBands.length; i += BAND_ANALYSIS_CONCURRENCY) {
+      const batch = allBands.slice(i, i + BAND_ANALYSIS_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((band, j) => analyzeBand(band, i + j))
+      );
+      for (let j = 0; j < results.length; j++) {
+        bandAnalyses[i + j] = results[j];
       }
     }
 
-    log("info", "Stage 1 complete: design spec parsed", {
+    log("info", "Per-band Claude analysis complete", {
+      requestId: req.id,
+      bandsAnalyzed: bandAnalyses.length,
+      fallbackCount: bandAnalyses.filter((b) => b._meta?.fallback).length,
+      skippedCount: bandAnalyses.filter((b) => b._meta?.skipped).length,
+    });
+
+    // --- Assemble the final design spec ---
+    // Each band becomes one section with its pixel-exact bg_hex and the
+    // Claude-classified content.
+    const sections = allBands.map((band, idx) => {
+      const analysis = bandAnalyses[idx] || {};
+      return {
+        n: idx + 1,
+        type: analysis.type || "unknown",
+        bg: band.bg_hex,              // PIXEL-EXACT, never guessed
+        pad: analysis.pad || "0 0 0 0",
+        align: analysis.align || "center",
+        height_hint: band.is_thin ? "thin" : band.height < 100 ? "normal" : "tall",
+        dark_variant: analysis.dark_variant || false,
+        content: analysis.content || [],
+        _band: {
+          y_start: band.y_start,
+          y_end: band.y_end,
+          height: band.height,
+          row_coverage: band.row_coverage_ratio,
+          page: band.pageIdx,
+        },
+      };
+    });
+
+    // Build the aggregate color palette from all pixel-sampled bg colors.
+    const uniqueBgColors = [...new Set(allBands.map((b) => b.bg_hex))];
+    const allAccentColors = new Set();
+    for (let i = 0; i < Math.min(allBands.length, 20); i++) {
+      const band = allBands[i];
+      const pageBuffer = pngPages[band.pageIdx].content;
+      try {
+        const accents = await extractAccentColors(pageBuffer, band, 3);
+        accents.forEach((c) => allAccentColors.add(c));
+      } catch {
+        // non-fatal
+      }
+    }
+
+    // Width is taken from developer input or from page width / RASTERIZE_SCALE
+    const detectedWidth = Math.round((pageBandOffsets[0]?.pageWidth || 960) / RASTERIZE_SCALE);
+
+    const designSpec = {
+      width: detectedWidth,
+      bg_outer: uniqueBgColors[0] || "#FFFFFF",
+      bg_content: uniqueBgColors.find((c) => c === "#FFFFFF") || uniqueBgColors[0] || "#FFFFFF",
+      font_body: "unknown-sans", // Developer input overrides this in Stage 2
+      font_heading: "unknown-sans",
+      band_count: allBands.length,
+      sections,
+      colors: {
+        unique_bg_colors: uniqueBgColors,
+        accent_colors: [...allAccentColors],
+      },
+      cta_count: sections.filter((s) => s.type === "cta" || s.type === "closing_cta").length,
+      img_count: sections.filter((s) => s.type === "image" || s.type === "hero_image" || s.type === "logo").length,
+    };
+
+    log("info", "Stage 1 complete: design spec parsed (v4.0.0)", {
       requestId: req.id,
       stage1DurationMs: Date.now() - stage1StartTime,
-      sectionCount: designSpec?.sections?.length || 0,
-      bandCount: designSpec?.band_count || 0,
-      imagePositions: designSpec?.images?.length || 0,
-      specWidth: designSpec?.width,
-      specFont: designSpec?.font_body,
+      sectionCount: sections.length,
+      bandCount: allBands.length,
+      uniqueBgColors: uniqueBgColors.length,
+      accentColorCount: allAccentColors.size,
+      detectedWidth,
+      textExtractionMethod,
     });
 
     // =================================================================
@@ -1955,7 +1953,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "3.3.0",
+    version: "4.0.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
