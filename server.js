@@ -459,10 +459,10 @@ function extractOrderId(filename) {
 // =====================================================================
 const STAGE1_PROMPT = `You are analyzing an email design PDF to produce a structured JSON specification. You will receive:
 
-1. A HIGH-QUALITY IMAGE of the complete email design
+1. ONE OR MORE TILE IMAGES showing the email design. Email designs are tall so they are split into overlapping horizontal tiles. Each tile is preceded by a text label like "--- TILE N of M — y_range=<y_start>-<y_end> ---" that tells you the tile's vertical position in the full design. Tiles overlap by ~300px so you can see continuity across boundaries. Treat the tiles as ONE continuous design.
 2. A pixel-sampled COLOR PALETTE — these are the exact hex values that appear in the design's pixels. Use these VERBATIM for any color field in your JSON output. Do NOT round, approximate, or substitute colors. A dark-charcoal hex like #2A2623 is different from pure black #000000. A specific brand green like #1FC23D is different from neon green #00FF00. A cream off-white like #F7F3E4 is different from generic #F5F5F5. Match the exact palette hex, never a common default.
 3. OCR-EXTRACTED TEXT — every piece of text visible in the design. Use this text VERBATIM for every "text" field. NEVER paraphrase, rewrite, or invent text. If you cannot match a piece of OCR text to a visible section, include it where it logically belongs.
-4. A BAND MAP — pixel-exact positions (y_start, y_end, height, bg_hex) of every horizontal band detected in the design. This is a structural reference showing where color transitions occur. Use it to verify you don't miss thin elements (colored stripes, narrow alert bars, divider lines).
+4. A BAND MAP — pixel-exact positions (y_start, y_end, height, bg_hex) of every horizontal band detected in the design. Coordinates are in the FULL design's pixel space, not per-tile. Use this to verify you don't miss thin elements (colored stripes, narrow alert bars, divider lines).
 5. An IMAGE ASSETS LIST — uploaded image files with filenames, dimensions, and Dropbox URLs. Match each visible image in the design to one of these files by content matching, and include the exact Dropbox URL in your output.
 6. Developer-specified values (email width, fonts, ESP merge-tag style) — these are authoritative overrides.
 
@@ -1279,65 +1279,158 @@ app.post("/generate", generateLimiter, async (req, res) => {
     });
 
     // --- Step 1c: Prepare Stage 1 Claude inputs ---
-    // Compress each page for Claude vision. Use higher quality than v4 (2x
-    // larger file budget) because this is a single full-design call, not 30
-    // per-band calls, so we can afford better resolution.
-    const TARGET_MAX_BYTES = 3 * 1024 * 1024; // 3MB — single call allows larger images
+    // Anthropic Vision API has a HARD LIMIT of 8000px on any image dimension.
+    // Email design rasters at 150dpi often exceed 12000px tall. A single
+    // resized image either breaks the limit (crash) or compresses so much
+    // that section layout becomes unreadable.
+    //
+    // Solution: tile the design into overlapping horizontal slices, each
+    // under 6000px tall (safe margin under 8000 cap). Overlap helps Claude
+    // see section continuity across tile boundaries.
+    // Each tile is a full-width slice of the original raster.
+    const TILE_MAX_HEIGHT = 6000;
+    const TILE_OVERLAP = 300;
+    const TILE_TARGET_MAX_BYTES = 2 * 1024 * 1024; // 2MB per tile
 
-    const compressedPdfPages = [];
+    const tiles = []; // Array of { buffer, pageIdx, y_offset, y_end, width, height }
+
     for (let i = 0; i < pngPages.length; i++) {
       const page = pngPages[i];
       const pageInfo = pageInfos[i];
+      const pageH = pageInfo.pageHeight;
+      const pageW = pageInfo.pageWidth;
 
       log("info", `Page ${i + 1} original`, {
         requestId: req.id,
-        origWidth: pageInfo.pageWidth,
-        origHeight: pageInfo.pageHeight,
+        origWidth: pageW,
+        origHeight: pageH,
         origSizeKB: Math.round(page.content.length / 1024),
       });
 
-      // Step-down quality until we fit under the byte cap.
-      // Higher resolution than v4 for better section recognition.
-      const attempts = [
-        { width: 1400, quality: 80 },
-        { width: 1200, quality: 75 },
-        { width: 1000, quality: 70 },
-        { width: 850, quality: 65 },
-        { width: 700, quality: 55 },
-      ];
-
-      let compressed = page.content;
-      const MAX_HEIGHT = 12000;
-
-      for (const attempt of attempts) {
-        try {
-          const buf = await sharp(page.content)
-            .resize(attempt.width, MAX_HEIGHT, {
-              fit: "inside",
-              withoutEnlargement: true,
-            })
-            .jpeg({ quality: attempt.quality })
-            .toBuffer();
-
-          if (buf.length <= TARGET_MAX_BYTES) {
-            compressed = buf;
-            log("info", `Page ${i + 1} compressed`, {
-              requestId: req.id,
-              width: attempt.width,
-              quality: attempt.quality,
-              sizeKB: Math.round(buf.length / 1024),
-            });
-            break;
-          } else {
-            compressed = buf;
-          }
-        } catch {
-          continue;
+      // Compute tile y-ranges in the ORIGINAL raster's coordinate space
+      const tileRanges = [];
+      if (pageH <= TILE_MAX_HEIGHT) {
+        tileRanges.push({ y_start: 0, y_end: pageH });
+      } else {
+        const step = TILE_MAX_HEIGHT - TILE_OVERLAP;
+        let y = 0;
+        while (y < pageH) {
+          const y_end = Math.min(y + TILE_MAX_HEIGHT, pageH);
+          tileRanges.push({ y_start: y, y_end });
+          if (y_end >= pageH) break;
+          y += step;
         }
       }
 
-      compressedPdfPages.push(compressed);
+      log("info", `Page ${i + 1} tiling plan`, {
+        requestId: req.id,
+        tileCount: tileRanges.length,
+        tileRanges: tileRanges.map((t) => `${t.y_start}-${t.y_end}`),
+      });
+
+      // For each tile: crop, then JPEG-compress under the byte cap
+      for (let t = 0; t < tileRanges.length; t++) {
+        const { y_start, y_end } = tileRanges[t];
+        const tileHeight = y_end - y_start;
+
+        // Step-down JPEG quality until under byte cap.
+        // We do NOT resize width — native resolution is preserved so text
+        // and section boundaries stay crisp.
+        const qualityAttempts = [82, 75, 68, 60, 52, 45];
+        let tileBuffer = null;
+        let usedQuality = null;
+
+        for (const q of qualityAttempts) {
+          try {
+            const buf = await sharp(page.content)
+              .extract({
+                left: 0,
+                top: y_start,
+                width: pageW,
+                height: tileHeight,
+              })
+              .jpeg({ quality: q })
+              .toBuffer();
+
+            if (buf.length <= TILE_TARGET_MAX_BYTES) {
+              tileBuffer = buf;
+              usedQuality = q;
+              break;
+            }
+            tileBuffer = buf;
+            usedQuality = q;
+          } catch (e) {
+            log("warn", `Tile compress attempt failed`, {
+              requestId: req.id,
+              quality: q,
+              error: e.message,
+            });
+            continue;
+          }
+        }
+
+        // If still too large at quality 45, try resizing width (last resort)
+        if (tileBuffer && tileBuffer.length > TILE_TARGET_MAX_BYTES) {
+          for (const targetW of [900, 750, 600]) {
+            try {
+              const buf = await sharp(page.content)
+                .extract({
+                  left: 0,
+                  top: y_start,
+                  width: pageW,
+                  height: tileHeight,
+                })
+                .resize(targetW, null, { fit: "inside" })
+                .jpeg({ quality: 55 })
+                .toBuffer();
+              if (buf.length <= TILE_TARGET_MAX_BYTES) {
+                tileBuffer = buf;
+                usedQuality = `55 (resized to ${targetW}w)`;
+                break;
+              }
+              tileBuffer = buf;
+            } catch {
+              continue;
+            }
+          }
+        }
+
+        if (!tileBuffer) {
+          log("error", "Failed to produce tile buffer", {
+            requestId: req.id,
+            pageIdx: i,
+            tileIdx: t,
+          });
+          continue;
+        }
+
+        tiles.push({
+          buffer: tileBuffer,
+          pageIdx: i,
+          tileIdx: t,
+          y_offset: y_start,
+          y_end,
+          quality: usedQuality,
+          sizeKB: Math.round(tileBuffer.length / 1024),
+        });
+
+        log("info", `Tile ${t + 1}/${tileRanges.length} compressed`, {
+          requestId: req.id,
+          pageIdx: i,
+          y_offset: y_start,
+          y_end,
+          heightPx: tileHeight,
+          quality: usedQuality,
+          sizeKB: Math.round(tileBuffer.length / 1024),
+        });
+      }
     }
+
+    log("info", "All tiles prepared", {
+      requestId: req.id,
+      tileCount: tiles.length,
+      totalSizeMB: (tiles.reduce((s, t) => s + t.buffer.length, 0) / 1024 / 1024).toFixed(2),
+    });
 
     // --- Step 1d: Build the Stage 1 user message ---
     // This is the SINGLE call that does all design analysis. Claude sees:
@@ -1428,14 +1521,24 @@ ${imageAssetList || "(no images uploaded)"}
 
 Now analyze the attached design image and produce the JSON specification per the schema rules. Output ONLY the JSON object, no markdown fences, no explanation.`;
 
-    const stage1ImageBlocks = compressedPdfPages.map((buf) => ({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: "image/jpeg",
-        data: buf.toString("base64"),
-      },
-    }));
+    // Build the image blocks. Each tile gets a text label immediately before
+    // it describing its pixel position in the full design, so Claude can
+    // correlate visual content with the band map's global coordinates.
+    const stage1ImageBlocks = [];
+    tiles.forEach((tile, idx) => {
+      stage1ImageBlocks.push({
+        type: "text",
+        text: `--- TILE ${idx + 1} of ${tiles.length} — y_range=${tile.y_offset}-${tile.y_end} (height ${tile.y_end - tile.y_offset}px) ---`,
+      });
+      stage1ImageBlocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/jpeg",
+          data: tile.buffer.toString("base64"),
+        },
+      });
+    });
 
     const stage1UserContent = [
       ...stage1ImageBlocks,
