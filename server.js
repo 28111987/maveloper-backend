@@ -453,6 +453,350 @@ function extractOrderId(filename) {
 
 
 // =====================================================================
+// POST-PROCESSING PIPELINE (v5.1.0) — Deterministic fix-ups after Stage 2
+// =====================================================================
+// These fix failures that prompt rules alone cannot reliably solve:
+//  1. Image URL replacement (local paths -> Dropbox URLs)
+//  2. Near-white normalization (JPEG-shifted near-white -> pure white)
+//  3. Alert-bar text contrast (force readable text color)
+//  4. Activity-feed detection (strip bullet-list wrapping of day/time patterns)
+//  5. Hallucinated thin band removal (drop non-palette thin bands)
+//  6. Cream/accent preservation (already handled by palette lock, no-op here)
+//
+// Universal. No brand-specific strings or hex values.
+// =====================================================================
+
+function hexToRgbTriplet(hex) {
+  if (!hex || !/^#[0-9A-Fa-f]{6}$/.test(hex)) return null;
+  return [
+    parseInt(hex.substring(1, 3), 16),
+    parseInt(hex.substring(3, 5), 16),
+    parseInt(hex.substring(5, 7), 16),
+  ];
+}
+
+function isNearWhite(hex) {
+  const rgb = hexToRgbTriplet(hex);
+  if (!rgb) return false;
+  return rgb[0] >= 248 && rgb[1] >= 248 && rgb[2] >= 248 && hex.toUpperCase() !== "#FFFFFF";
+}
+
+function isBrightWarm(hex) {
+  // Orange / yellow / warm red bgs typically have R > B, G > B, and R+G > 300
+  const rgb = hexToRgbTriplet(hex);
+  if (!rgb) return false;
+  const [r, g, b] = rgb;
+  return r > b + 30 && r + g > 300 && (r + g + b) > 400;
+}
+
+function isDarkColor(hex) {
+  const rgb = hexToRgbTriplet(hex);
+  if (!rgb) return false;
+  const [r, g, b] = rgb;
+  // Luminance approx
+  return (r * 0.299 + g * 0.587 + b * 0.114) < 90;
+}
+
+function saturationOfHex(hex) {
+  const rgb = hexToRgbTriplet(hex);
+  if (!rgb) return 0;
+  return Math.max(...rgb) - Math.min(...rgb);
+}
+
+/**
+ * Fix 1: Replace relative image paths with Dropbox URLs.
+ * Scans for src="...filename" where filename matches a key in imageUrlMap.
+ * Reliable string replace, zero Claude guessing.
+ */
+function fixImageUrls(html, imageUrlMap) {
+  if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
+    return { html, replaced: 0, unmatched: [] };
+  }
+
+  let replaced = 0;
+  const unmatched = [];
+  let output = html;
+
+  // Build a case-insensitive lookup by filename
+  const byName = {};
+  for (const [filename, url] of Object.entries(imageUrlMap)) {
+    byName[filename.toLowerCase()] = url;
+  }
+
+  // Match any src="..." or src='...' attribute
+  output = output.replace(/\bsrc\s*=\s*["']([^"']+)["']/gi, (match, src) => {
+    // Skip already-good URLs (http/https/data/cid)
+    if (/^(https?:|data:|cid:)/i.test(src)) return match;
+
+    // Extract filename (last segment of path)
+    const filename = src.split("/").pop();
+    if (!filename) return match;
+
+    const lookupKey = filename.toLowerCase();
+    const dropboxUrl = byName[lookupKey];
+
+    if (dropboxUrl) {
+      replaced++;
+      return `src="${dropboxUrl}"`;
+    }
+
+    // No match found — if it's not a spacer.gif (which is expected to stay local),
+    // record as unmatched
+    if (!/spacer\.gif$/i.test(filename)) {
+      unmatched.push(filename);
+    }
+    return match;
+  });
+
+  return { html: output, replaced, unmatched };
+}
+
+/**
+ * Fix 2: Normalize near-white colors to pure white.
+ * If a hex is R,G,B all >= 248 but not exactly #FFFFFF, it's a JPEG-shifted
+ * near-white artifact. Replace with #FFFFFF throughout.
+ */
+function fixNearWhite(html, palette) {
+  // Find near-white hex values that appear in the html
+  const hexRegex = /#([0-9A-Fa-f]{6})\b/g;
+  const seen = new Set();
+  const matches = [...html.matchAll(hexRegex)];
+  for (const m of matches) {
+    const hex = "#" + m[1].toUpperCase();
+    if (isNearWhite(hex)) seen.add(hex);
+  }
+
+  let output = html;
+  let replaced = 0;
+  for (const hex of seen) {
+    // Replace in all case forms
+    const upper = hex.toUpperCase();
+    const lower = hex.toLowerCase();
+    // Count occurrences before replacement
+    const upperRe = new RegExp(upper.replace("#", "#"), "g");
+    const lowerRe = new RegExp(lower.replace("#", "#"), "g");
+    const upperCount = (output.match(upperRe) || []).length;
+    const lowerCount = (output.match(lowerRe) || []).length;
+    output = output.split(upper).join("#FFFFFF");
+    output = output.split(lower).join("#FFFFFF");
+    replaced += upperCount + lowerCount;
+  }
+
+  return { html: output, normalizedColors: [...seen], count: replaced };
+}
+
+/**
+ * Fix 3: Alert bar text contrast.
+ * Scan for sections annotated with alert_bar. If bg is bright-warm, force text to
+ * black. If bg is dark, force text to white.
+ */
+function fixAlertBarContrast(html) {
+  let output = html;
+  let fixes = 0;
+
+  // Match <!-- Section_N: alert_bar --> ... <!-- // Section_N -->
+  const alertBarRegex = /<!--\s*Section[^>]*alert[_ ]bar[^>]*-->[\s\S]*?<!--\s*\/\/[^>]*-->/gi;
+
+  output = output.replace(alertBarRegex, (block) => {
+    // Extract bgcolor from the content (first bgcolor we find in the block)
+    const bgMatch = block.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/i);
+    if (!bgMatch) return block;
+    const bg = bgMatch[1].toUpperCase();
+
+    // Determine correct text color based on bg
+    let textColor;
+    if (isDarkColor(bg)) {
+      textColor = "#FFFFFF";
+    } else {
+      // For bright/warm or light bgs, text should be black for contrast
+      textColor = "#000000";
+    }
+
+    // Replace any color: #XXXXXX in inline styles with textColor
+    // Parse style attributes and replace color values within them
+    const fixed = block.replace(
+      /style\s*=\s*"([^"]*)"/gi,
+      (attrMatch, styleVal) => {
+        const updated = styleVal.replace(
+          /\bcolor\s*:\s*#[0-9A-Fa-f]{6}/gi,
+          `color: ${textColor}`
+        );
+        return `style="${updated}"`;
+      }
+    );
+    if (fixed !== block) fixes++;
+    return fixed;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 4: Strip bullet-list wrapping from activity-feed patterns.
+ * If a <ul>...</ul> block contains <li> items matching day+time patterns
+ * (e.g., "Mon/Tue/Wed ... 2.45pm" or "Jan 15 4pm"), unwrap to plain <td> rows.
+ */
+function fixActivityFeed(html) {
+  let output = html;
+  let fixes = 0;
+
+  // Detect <ul>...</ul> blocks
+  const ulRegex = /<ul\b[^>]*>([\s\S]*?)<\/ul>/gi;
+  output = output.replace(ulRegex, (ulBlock, inner) => {
+    // Extract li items
+    const liMatches = [...inner.matchAll(/<li\b([^>]*)>([\s\S]*?)<\/li>/gi)];
+    if (liMatches.length < 2) return ulBlock;
+
+    // Check if items match activity-feed pattern:
+    // day-of-week (Mon|Tue|Wed|...) OR time pattern (e.g. "2.45pm", "4pm", "10:30am")
+    const dayRegex = /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(day)?\b/i;
+    const timeRegex = /\b\d{1,2}[.:]?\d{0,2}\s*(am|pm)\b/i;
+
+    let matches = 0;
+    for (const li of liMatches) {
+      const text = li[2].replace(/<[^>]+>/g, "").trim();
+      if (dayRegex.test(text) || timeRegex.test(text)) matches++;
+    }
+
+    // If majority of items match, treat as activity feed — unwrap
+    if (matches / liMatches.length < 0.5) return ulBlock;
+
+    fixes++;
+    // Convert each <li> to a <tr><td>...</td></tr> as plain text row
+    const rows = liMatches
+      .map((m) => {
+        const liAttrs = m[1] || "";
+        // Extract style from li attrs to preserve font styling
+        const styleMatch = liAttrs.match(/style\s*=\s*["']([^"']*)["']/i);
+        const style = styleMatch ? styleMatch[1] : "";
+        const content = m[2].trim();
+        return `<tr><td align="left" valign="top" style="${style}">${content}</td></tr>`;
+      })
+      .join("\n");
+    return `<table role="presentation" border="0" cellspacing="0" cellpadding="0" width="100%">\n${rows}\n</table>`;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 5: Remove hallucinated thin bands.
+ * Hallucinated thin bands are <tr> blocks whose only purpose is a tiny colored
+ * stripe with a bgcolor that doesn't appear as a REAL section bg anywhere else
+ * in the design.
+ *
+ * Trust rule: a thin-band color is REAL if it either:
+ *  (a) is #FFFFFF, #000000, or a very-dark color (true footer/header dividers)
+ *  (b) appears as the bgcolor on a NON-thin section elsewhere in the HTML
+ *      (i.e., it's a color the design actually uses for content backgrounds)
+ *
+ * A thin_colored_band whose color satisfies neither is dropped as noise.
+ */
+function fixThinBands(html, palette) {
+  // Step 1: collect bgcolors used on REAL content sections (not thin-band-only sections).
+  // Strategy: iterate over thin_colored_band SECTION comment blocks and capture
+  // their bgcolors as "thin-only colors". Any color that appears as bgcolor
+  // ONLY inside thin_colored_band sections is hallucinated noise; any color
+  // that also appears elsewhere is a real design color.
+  //
+  // This avoids the nested <tr> regex problem entirely.
+
+  const thinBandSectionRegex = /<!--\s*Section[^>]*thin[_ ]colored[_ ]band[^>]*-->[\s\S]*?<!--\s*\/\/[^>]*-->/gi;
+  const thinBandColors = new Set();
+  const thinBandBlockList = [];
+  for (const match of html.matchAll(thinBandSectionRegex)) {
+    const block = match[0];
+    thinBandBlockList.push(block);
+    const bgs = [...block.matchAll(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/gi)];
+    for (const m of bgs) thinBandColors.add(m[1].toUpperCase());
+  }
+
+  // Remove all thin-band blocks from a temporary copy to find "other" bgcolors
+  let htmlWithoutThinBands = html;
+  for (const block of thinBandBlockList) {
+    htmlWithoutThinBands = htmlWithoutThinBands.replace(block, "");
+  }
+
+  // Collect bgcolors that appear OUTSIDE thin-band sections (real design colors)
+  const realBgColors = new Set();
+  const bgRegex = /bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/gi;
+  for (const m of htmlWithoutThinBands.matchAll(bgRegex)) {
+    realBgColors.add(m[1].toUpperCase());
+  }
+  // Always trust pure white and pure black
+  realBgColors.add("#FFFFFF");
+  realBgColors.add("#000000");
+
+  let output = html;
+  let removed = 0;
+
+  // Re-scan and remove thin bands whose bgcolor is NOT a real design color
+  const thinBandRemoveRegex = /<!--\s*Section[^>]*thin[_ ]colored[_ ]band[^>]*-->[\s\S]*?<!--\s*\/\/[^>]*-->\s*/gi;
+
+  output = output.replace(thinBandRemoveRegex, (block) => {
+    const bgMatch = block.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/i);
+    if (!bgMatch) return block;
+    const bg = bgMatch[1].toUpperCase();
+
+    // Trust if this color appears elsewhere as a real section bg
+    if (realBgColors.has(bg)) return block;
+
+    // Trust if color is very dark (legit footer dividers)
+    if (isDarkColor(bg)) return block;
+
+    // Trust if color is within distance 20 of any real color
+    const bgRgb = hexToRgbTriplet(bg);
+    for (const t of realBgColors) {
+      const tRgb = hexToRgbTriplet(t);
+      if (!tRgb) continue;
+      const dist = Math.sqrt(
+        (bgRgb[0] - tRgb[0]) ** 2 +
+        (bgRgb[1] - tRgb[1]) ** 2 +
+        (bgRgb[2] - tRgb[2]) ** 2
+      );
+      if (dist < 20) return block;
+    }
+
+    // Drop it — hallucinated thin band
+    removed++;
+    return "";
+  });
+
+  return { html: output, removed };
+}
+
+/**
+ * Main post-processing entry point.
+ * Runs all deterministic fixes in order and returns the fixed HTML + a report.
+ */
+function postProcessHtml(html, { imageUrlMap, palette }) {
+  const report = {};
+
+  const r1 = fixImageUrls(html, imageUrlMap);
+  html = r1.html;
+  report.imageUrls = { replaced: r1.replaced, unmatched: r1.unmatched };
+
+  const r2 = fixNearWhite(html, palette);
+  html = r2.html;
+  report.nearWhite = { normalizedColors: r2.normalizedColors, count: r2.count };
+
+  const r3 = fixAlertBarContrast(html);
+  html = r3.html;
+  report.alertBar = { fixes: r3.fixes };
+
+  const r4 = fixActivityFeed(html);
+  html = r4.html;
+  report.activityFeed = { fixes: r4.fixes };
+
+  const r5 = fixThinBands(html, palette);
+  html = r5.html;
+  report.thinBands = { removed: r5.removed };
+
+  return { html, report };
+}
+
+
+// =====================================================================
 // STAGE 1 PROMPT (v5.0.0) — Full-design analysis with pixel palette
 // Replaces v4.0.1's per-band classification. Claude now sees the full design
 // once, with pixel-exact colors and OCR text provided as authoritative data.
@@ -1029,7 +1373,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.0.0",
+    version: "5.1.0",
   });
 });
 
@@ -1838,7 +2182,25 @@ ${specs.join("\n\n")}
       });
     }
 
-    const html = stage2TextBlock.text;
+    const html_raw = stage2TextBlock.text;
+
+    // --- Post-processing (v5.1.0): deterministic fix-ups ---
+    const postProcessResult = postProcessHtml(html_raw, {
+      imageUrlMap,
+      palette: designSpec?._palette || [],
+    });
+    const html = postProcessResult.html;
+
+    log("info", "Post-processing complete (v5.1.0)", {
+      requestId: req.id,
+      imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
+      imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
+      nearWhiteNormalizedCount: postProcessResult.report.nearWhite.count,
+      nearWhiteColors: postProcessResult.report.nearWhite.normalizedColors,
+      alertBarFixes: postProcessResult.report.alertBar.fixes,
+      activityFeedFixes: postProcessResult.report.activityFeed.fixes,
+      thinBandsRemoved: postProcessResult.report.thinBands.removed,
+    });
 
     // Post-generation validation: count sections in HTML output vs spec
     // Gold-standard HTML uses <!-- Section_Name --> comments for each section
@@ -2098,7 +2460,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.0.0",
+    version: "5.1.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
