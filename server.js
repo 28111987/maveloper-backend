@@ -1373,7 +1373,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.1.0",
+    version: "5.1.2",
   });
 });
 
@@ -1496,20 +1496,56 @@ app.post("/generate", generateLimiter, async (req, res) => {
     }
 
     // --- Step 3: Upload images to Dropbox (if we have images and Dropbox is configured) ---
+    // CRITICAL: If images are present, upload MUST succeed. Otherwise the generated
+    // HTML will have broken image paths. We fail the request rather than ship bad HTML.
     let imageUrlMap = {};
     if (images.length > 0 && dropboxConfigured) {
-      try {
-        imageUrlMap = await uploadImagesToDropbox(orderId, images, log);
-        log("info", "Images uploaded to Dropbox", {
+      const UPLOAD_ATTEMPTS = 2;
+      for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+        try {
+          imageUrlMap = await uploadImagesToDropbox(orderId, images, log);
+          log("info", "Images uploaded to Dropbox", {
+            requestId: req.id,
+            imageCount: Object.keys(imageUrlMap).length,
+            totalImages: images.length,
+            attempt,
+          });
+          // Success: break out of retry loop if we got at least some URLs
+          if (Object.keys(imageUrlMap).length > 0) break;
+          log("warn", `Upload attempt ${attempt} returned empty map`, { requestId: req.id });
+        } catch (dbxErr) {
+          log("error", `Dropbox upload attempt ${attempt} failed`, {
+            requestId: req.id,
+            error: dbxErr.message,
+          });
+          if (attempt < UPLOAD_ATTEMPTS) {
+            // Brief backoff before retry
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+      }
+
+      // HARD FAIL if upload produced zero URLs despite having images
+      if (Object.keys(imageUrlMap).length === 0) {
+        log("error", "Dropbox upload failed completely — aborting to avoid shipping broken HTML", {
           requestId: req.id,
-          imageCount: Object.keys(imageUrlMap).length,
+          imageCount: images.length,
         });
-      } catch (dbxErr) {
-        log("error", "Dropbox upload failed", {
+        return res.status(502).json({
+          error: "Image upload failed",
+          details: "Could not upload images to Dropbox after multiple attempts. Please try again in a moment. If the problem persists, check Dropbox credentials in Railway environment variables.",
           requestId: req.id,
-          error: dbxErr.message,
         });
-        // Non-fatal: continue without Dropbox URLs, Claude will use placeholder paths
+      }
+
+      // PARTIAL fail: log but continue (will have some broken images, not all)
+      if (Object.keys(imageUrlMap).length < images.length) {
+        log("warn", "Partial Dropbox upload — some images failed", {
+          requestId: req.id,
+          uploaded: Object.keys(imageUrlMap).length,
+          total: images.length,
+          missing: images.filter((i) => !imageUrlMap[i.filename]).map((i) => i.filename),
+        });
       }
     }
 
@@ -2184,14 +2220,25 @@ ${specs.join("\n\n")}
 
     const html_raw = stage2TextBlock.text;
 
-    // --- Post-processing (v5.1.0): deterministic fix-ups ---
+    // --- Post-processing (v5.1.1): deterministic fix-ups ---
+    // Log imageUrlMap state BEFORE post-process so we can see what's actually available
+    log("info", "Pre-post-process state check", {
+      requestId: req.id,
+      imageUrlMapSize: Object.keys(imageUrlMap).length,
+      imageUrlMapFilenames: Object.keys(imageUrlMap),
+      paletteSize: (designSpec?._palette || []).length,
+      htmlRawLength: html_raw.length,
+      rawRelativePaths: (html_raw.match(/src="images\/[^"]+"/g) || []).length,
+      rawDropboxUrls: (html_raw.match(/dl\.dropboxusercontent\.com/g) || []).length,
+    });
+
     const postProcessResult = postProcessHtml(html_raw, {
       imageUrlMap,
       palette: designSpec?._palette || [],
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.1.0)", {
+    log("info", "Post-processing complete (v5.1.1)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
@@ -2200,6 +2247,8 @@ ${specs.join("\n\n")}
       alertBarFixes: postProcessResult.report.alertBar.fixes,
       activityFeedFixes: postProcessResult.report.activityFeed.fixes,
       thinBandsRemoved: postProcessResult.report.thinBands.removed,
+      finalRelativePaths: (html.match(/src="images\/[^"]+"/g) || []).length,
+      finalDropboxUrls: (html.match(/dl\.dropboxusercontent\.com/g) || []).length,
     });
 
     // Post-generation validation: count sections in HTML output vs spec
@@ -2460,7 +2509,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.1.0",
+    version: "5.1.2",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
