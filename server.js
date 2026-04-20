@@ -1104,7 +1104,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "4.0.0",
+    version: "4.0.1",
   });
 });
 
@@ -1356,28 +1356,55 @@ app.post("/generate", generateLimiter, async (req, res) => {
     });
 
     // --- For each band: crop, extract accent colors, classify with Claude ---
-    // We process bands in parallel (batch of 5 at a time) to keep latency low.
-    const BAND_ANALYSIS_CONCURRENCY = 5;
+    //
+    // Rate-limit strategy (v4.0.0.1):
+    // - Anthropic free tier / low-tier accounts cap requests/minute
+    // - Each Claude call takes 2-4 seconds, so firing 5 at once can burst >50
+    //   calls/min when the minute-boundary lines up
+    // - Strategy: concurrency=2, retry on 429 with exponential backoff,
+    //   small inter-batch delay to average out requests/minute
+    // - Pre-filter thin/trivial bands (spacers, 1-2px stripes) — classify them
+    //   locally without a Claude call at all. This typically halves the API calls.
+    const BAND_ANALYSIS_CONCURRENCY = 2;
+    const INTER_BATCH_DELAY_MS = 700;   // ~85 bands/min ceiling regardless of batch size
+    const MAX_RATE_LIMIT_RETRIES = 4;
     const bandAnalyses = new Array(allBands.length);
 
-    // Slice OCR text into chunks proportional to band vertical positions.
-    // For each band, we provide OCR text from roughly its vertical region.
-    // This is a heuristic — exact slicing would need positional OCR which
-    // tesseract doesn't provide here. We pass the full OCR text to each band
-    // and let Claude match relevant lines.
+    // For each band, we provide the FULL OCR text and let Claude match relevant lines.
     const totalOcrText = extractedText;
 
-    const analyzeBand = async (band, idx) => {
-      // Skip empty/pure-spacer bands to save API calls
+    /**
+     * Decide whether we can classify a band locally without calling Claude.
+     * Applies only to trivially simple bands where pixel data alone tells
+     * us everything Stage 2 needs. Saves API calls and avoids 429 errors.
+     */
+    const classifyLocally = (band) => {
+      // Pure-white short gap → spacer
       if (band.height < 3 && band.bg_hex === "#FFFFFF") {
+        return { type: "spacer", pad: "0 0 0 0", align: "center", content: [], _meta: { local: true, reason: "empty_spacer" } };
+      }
+      // Thin colored stripe (≤10px) → dedicated type, no Claude needed
+      if (band.is_thin && !band.is_content) {
         return {
-          type: "spacer",
+          type: "thin_colored_band",
           pad: "0 0 0 0",
           align: "center",
-          content: [],
-          _meta: { skipped: true, reason: "empty_spacer" },
+          content: [{ el: "divider", color: band.bg_hex }],
+          _meta: { local: true, reason: "thin_stripe" },
         };
       }
+      // Tall pure-white region that is NOT content-heavy → blank spacer
+      if (!band.is_content && band.bg_hex === "#FFFFFF" && band.height < 40) {
+        return { type: "spacer", pad: "0 0 0 0", align: "center", content: [], _meta: { local: true, reason: "whitespace" } };
+      }
+      return null; // Needs a Claude call
+    };
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const analyzeBand = async (band, idx) => {
+      const local = classifyLocally(band);
+      if (local) return local;
 
       const pageBuffer = pngPages[band.pageIdx].content;
       // Crop the band from its source page PNG
@@ -1414,50 +1441,67 @@ app.post("/generate", generateLimiter, async (req, res) => {
         { type: "text", text: bandInfoText },
       ];
 
-      try {
-        const message = await anthropic.messages.create({
-          model: CLAUDE_MODEL,
-          max_tokens: 4000,
-          system: BAND_PROMPT,
-          messages: [{ role: "user", content: userContent }],
-        });
+      // Retry loop with exponential backoff for 429 rate-limit errors
+      let lastErr = null;
+      for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
+        try {
+          const message = await anthropic.messages.create({
+            model: CLAUDE_MODEL,
+            max_tokens: 4000,
+            system: BAND_PROMPT,
+            messages: [{ role: "user", content: userContent }],
+          });
 
-        const textBlock = message.content.find((b) => b.type === "text");
-        if (!textBlock) {
-          throw new Error("No text block in response");
+          const textBlock = message.content.find((b) => b.type === "text");
+          if (!textBlock) {
+            throw new Error("No text block in response");
+          }
+
+          let raw = textBlock.text.trim();
+          raw = raw.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+
+          const firstBrace = raw.indexOf("{");
+          const lastBrace = raw.lastIndexOf("}");
+          if (firstBrace === -1 || lastBrace === -1) {
+            throw new Error("No JSON object in response");
+          }
+          const jsonStr = raw.substring(firstBrace, lastBrace + 1);
+          return JSON.parse(jsonStr);
+        } catch (err) {
+          lastErr = err;
+          // Detect 429 rate-limit: Anthropic SDK returns status 429 on err.status
+          const is429 = err?.status === 429 || (err?.message && err.message.includes("429"));
+          if (is429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+            // Exponential backoff: 2s, 4s, 8s, 16s
+            const backoffMs = 2000 * Math.pow(2, attempt);
+            log("info", `Band ${idx + 1} hit rate limit, retrying after ${backoffMs}ms`, {
+              requestId: req.id,
+              attempt: attempt + 1,
+            });
+            await sleep(backoffMs);
+            continue;
+          }
+          // Non-429 error or out of retries → fall through to fallback
+          break;
         }
-
-        let raw = textBlock.text.trim();
-        // Strip any accidental markdown fences
-        raw = raw.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
-
-        // Find first { and matching final }
-        const firstBrace = raw.indexOf("{");
-        const lastBrace = raw.lastIndexOf("}");
-        if (firstBrace === -1 || lastBrace === -1) {
-          throw new Error("No JSON object in response");
-        }
-        const jsonStr = raw.substring(firstBrace, lastBrace + 1);
-        return JSON.parse(jsonStr);
-      } catch (err) {
-        log("warn", `Band ${idx + 1} analysis failed, using fallback`, {
-          requestId: req.id,
-          error: err.message,
-          bandHex: band.bg_hex,
-          bandHeight: band.height,
-        });
-        // Fallback: classify by pixel heuristics alone
-        return {
-          type: band.is_thin ? "thin_colored_band" : band.is_content ? "body_text" : "spacer",
-          pad: "0 0 0 0",
-          align: "center",
-          content: [],
-          _meta: { fallback: true },
-        };
       }
+
+      log("warn", `Band ${idx + 1} analysis failed, using fallback`, {
+        requestId: req.id,
+        error: lastErr?.message || "unknown",
+        bandHex: band.bg_hex,
+        bandHeight: band.height,
+      });
+      return {
+        type: band.is_thin ? "thin_colored_band" : band.is_content ? "body_text" : "spacer",
+        pad: "0 0 0 0",
+        align: "center",
+        content: [],
+        _meta: { fallback: true },
+      };
     };
 
-    // Run band analyses in parallel batches
+    // Run band analyses in parallel batches with inter-batch throttling
     for (let i = 0; i < allBands.length; i += BAND_ANALYSIS_CONCURRENCY) {
       const batch = allBands.slice(i, i + BAND_ANALYSIS_CONCURRENCY);
       const results = await Promise.all(
@@ -1466,13 +1510,18 @@ app.post("/generate", generateLimiter, async (req, res) => {
       for (let j = 0; j < results.length; j++) {
         bandAnalyses[i + j] = results[j];
       }
+      // Small gap between batches so we don't saturate the per-minute rate limit
+      if (i + BAND_ANALYSIS_CONCURRENCY < allBands.length) {
+        await sleep(INTER_BATCH_DELAY_MS);
+      }
     }
 
     log("info", "Per-band Claude analysis complete", {
       requestId: req.id,
       bandsAnalyzed: bandAnalyses.length,
+      localCount: bandAnalyses.filter((b) => b._meta?.local).length,
       fallbackCount: bandAnalyses.filter((b) => b._meta?.fallback).length,
-      skippedCount: bandAnalyses.filter((b) => b._meta?.skipped).length,
+      claudeAnalyzedCount: bandAnalyses.filter((b) => !b._meta?.local && !b._meta?.fallback).length,
     });
 
     // --- Assemble the final design spec ---
@@ -1553,7 +1602,7 @@ app.post("/generate", generateLimiter, async (req, res) => {
     const specs = [];
 
     // Width — developer override wins, then fall back to Stage 1 detection
-    const finalWidth = width || designSpec?.width || 600;
+    const finalWidth = emailWidth || designSpec?.width || 600;
     const breakpoint = finalWidth - 1;
     specs.push(`EMAIL WIDTH: Use exactly ${finalWidth}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
 
@@ -1953,7 +2002,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "4.0.0",
+    version: "4.0.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
