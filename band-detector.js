@@ -31,9 +31,10 @@ const ROW_SAMPLE_STEP = 2;
 const BIN_STEP = 16;
 
 // Palette building tunables
-const PALETTE_MIN_PREVALENCE_PX = 50;        // Min total pixel-height a color must cover to enter the palette
-const PALETTE_MAX_COLORS = 20;               // Cap palette size — more than this is noise
+const PALETTE_MIN_PREVALENCE_PX = 30;        // Min total pixel-height a color must cover to enter the palette (lowered from 50 so thinner bands survive)
+const PALETTE_MAX_COLORS = 24;               // Cap palette size — more than this is noise (raised from 20)
 const PALETTE_GRAYSCALE_TOLERANCE = 12;      // R/G/B max-diff to consider a color "grayscale"
+const TINTED_OFFWHITE_SATURATION_THRESHOLD = 6;  // Off-white shades with R-G-B spread >= this are PRESERVED (cream, ivory, etc.) instead of collapsed to white
 
 // -----------------------------------------------------------
 // Color utilities
@@ -284,18 +285,32 @@ export function buildColorPalette(bands) {
 
   const palette = Array.from(buckets.values()).map((b) => {
     const rgb = [b.avg_r, b.avg_g, b.avg_b];
+    const sat = saturation(rgb);
+    const avg = (rgb[0] + rgb[1] + rgb[2]) / 3;
+    // A "tinted off-white" is a light shade that is NOT pure white and has a subtle color tint.
+    // Example: a cream off-white shade (R=245,G=245,B=232 — avg 240, tint spread 13)
+    // We preserve these separately from pure white because they carry design meaning.
+    const is_tinted_offwhite = avg >= 225 && sat >= TINTED_OFFWHITE_SATURATION_THRESHOLD;
+    // A "pure-white-ish" shade has negligible tint and is very bright.
+    const is_pure_whiteish = avg >= 245 && sat < TINTED_OFFWHITE_SATURATION_THRESHOLD;
     return {
       hex: rgbToHex(rgb[0], rgb[1], rgb[2]),
       rgb,
       total_height_px: Math.round(b.total_height_px),
       band_count: b.band_count,
-      is_saturated: saturation(rgb) > 40,
+      saturation: sat,
+      is_saturated: sat > 40,
       is_grayscale: isGrayscale(rgb),
+      is_tinted_offwhite,
+      is_pure_whiteish,
     };
   });
 
-  // Filter: must be saturated OR substantially prevalent
-  const filtered = palette.filter((p) => p.is_saturated || p.total_height_px >= PALETTE_MIN_PREVALENCE_PX);
+  // Filter: keep if saturated OR tinted-offwhite OR sufficiently prevalent
+  // This ensures cream / ivory / off-white brand tints survive
+  const filtered = palette.filter(
+    (p) => p.is_saturated || p.is_tinted_offwhite || p.total_height_px >= PALETTE_MIN_PREVALENCE_PX
+  );
 
   // Sort by prevalence, cap size
   filtered.sort((a, b) => b.total_height_px - a.total_height_px);
