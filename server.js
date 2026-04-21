@@ -10,6 +10,8 @@ import { Dropbox } from "dropbox";
 import path from "path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import jwt from "jsonwebtoken";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -71,6 +73,103 @@ if (dropboxConfigured) {
     clientSecret: DROPBOX_APP_SECRET,
     refreshToken: DROPBOX_REFRESH_TOKEN,
   });
+}
+
+// =====================================================================
+// SUPABASE CONFIG (Phase 1: Auth + Cloud Drafts)
+// =====================================================================
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+
+const supabaseConfigured = Boolean(
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && SUPABASE_JWT_SECRET
+);
+
+if (!supabaseConfigured) {
+  console.warn(
+    "WARNING: Supabase env vars missing — auth middleware will reject all protected requests. " +
+    "Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_JWT_SECRET in Railway Variables."
+  );
+}
+
+// Admin Supabase client — used server-side for writes that bypass RLS.
+// Only reach for this when necessary (audit logs, orchestrated multi-table writes).
+// Prefer user-scoped queries from the frontend whenever possible.
+const supabaseAdmin = supabaseConfigured
+  ? createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  : null;
+
+// =====================================================================
+// AUTH MIDDLEWARE (Phase 1)
+// =====================================================================
+
+/**
+ * Verifies a Supabase JWT sent in the `Authorization: Bearer <token>` header.
+ * On success, populates `req.user` with `{ id, email, role }` and calls next().
+ * On failure, returns 401.
+ *
+ * Use on routes that require auth:
+ *   app.post('/api/drafts/save-generated', requireAuth, handler);
+ */
+function requireAuth(req, res, next) {
+  if (!SUPABASE_JWT_SECRET) {
+    return res.status(503).json({
+      error: "Auth not configured",
+      details: "Backend is missing SUPABASE_JWT_SECRET. Contact admin.",
+    });
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const match = authHeader.match(/^Bearer\s+(.+)$/);
+  if (!match) {
+    return res.status(401).json({ error: "Missing Authorization: Bearer <token> header" });
+  }
+
+  try {
+    const decoded = jwt.verify(match[1], SUPABASE_JWT_SECRET, {
+      algorithms: ["HS256"],
+      audience: "authenticated",
+    });
+    req.user = {
+      id: decoded.sub,
+      email: decoded.email,
+      role: decoded.role,
+    };
+    return next();
+  } catch (err) {
+    return res.status(401).json({
+      error: "Invalid or expired token",
+      details: err.message,
+    });
+  }
+}
+
+/**
+ * Populates `req.user` if a valid token is present, but never rejects the
+ * request. Use on /generate so existing clients keep working while also
+ * tagging generation output with user_id when a user is identified.
+ */
+function optionalAuth(req, res, next) {
+  if (!SUPABASE_JWT_SECRET) return next();
+
+  const authHeader = req.headers.authorization || "";
+  const match = authHeader.match(/^Bearer\s+(.+)$/);
+  if (!match) return next();
+
+  try {
+    const decoded = jwt.verify(match[1], SUPABASE_JWT_SECRET, {
+      algorithms: ["HS256"],
+      audience: "authenticated",
+    });
+    req.user = { id: decoded.sub, email: decoded.email, role: decoded.role };
+  } catch {
+    // Ignore — treat as anonymous.
+  }
+  next();
 }
 
 // =====================================================================
@@ -2338,9 +2437,11 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     dropboxConfigured,
+    supabaseConfigured,
+    authConfigured: Boolean(SUPABASE_JWT_SECRET),
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.2",
+    version: "5.3.0",
   });
 });
 
@@ -2349,7 +2450,7 @@ app.get("/health", (req, res) => {
 // Accepts: { pdfBase64, pdfFilename, assetsZipBase64? }
 // Returns: { html, orderId, pageCount, pageImages, imageUrlMap, requestId }
 // -----------------------------------------------------------------
-app.post("/generate", generateLimiter, async (req, res) => {
+app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
   const startTime = Date.now();
   try {
     const { 
@@ -2416,6 +2517,8 @@ app.post("/generate", generateLimiter, async (req, res) => {
       orderId,
       pdfSizeKB: Math.round(pdfBuffer.length / 1024),
       hasAssetsZip: Boolean(assetsZipBase64),
+      userId: req.user?.id ?? "anonymous",
+      userEmail: req.user?.email ?? "anonymous",
     });
 
     // --- Step 1: Rasterize PDF for Claude Vision ---
@@ -3483,7 +3586,7 @@ ${specs.join("\n\n")}
 // Accepts: { orderId, html, imageUrlMap, images? }
 // Returns: { dropboxUrl, orderId, requestId }
 // -----------------------------------------------------------------
-app.post("/approve", generateLimiter, async (req, res) => {
+app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
   const startTime = Date.now();
   try {
     const { orderId, html, imageUrlMap } = req.body;
@@ -3576,7 +3679,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.2",
+    version: "5.3.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
