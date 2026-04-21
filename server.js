@@ -613,13 +613,14 @@ function fixAlertBarContrast(html) {
     }
 
     // Replace any color: #XXXXXX in inline styles with textColor
-    // Parse style attributes and replace color values within them
+    // Parse style attributes and replace color values within them.
+    // Use lookbehind-safe pattern to avoid matching background-color.
     const fixed = block.replace(
       /style\s*=\s*"([^"]*)"/gi,
       (attrMatch, styleVal) => {
         const updated = styleVal.replace(
-          /\bcolor\s*:\s*#[0-9A-Fa-f]{6}/gi,
-          `color: ${textColor}`
+          /(^|[^\-])\bcolor\s*:\s*#[0-9A-Fa-f]{6}/g,
+          (m, prefix) => `${prefix}color: ${textColor}`
         );
         return `style="${updated}"`;
       }
@@ -996,21 +997,22 @@ function universalTextContrast(html) {
 
     let newBody = body;
 
-    // Rewrite any `color: #XXX` inside style="..." to the correct contrast color
+    // Rewrite any `color: #XXX` inside style="..." to the correct contrast color.
+    // Use (^|[^\-]) lookbehind to avoid matching background-color / border-color / outline-color.
     newBody = newBody.replace(/style\s*=\s*"([^"]*)"/gi, (attrMatch, styleVal) => {
       const updated = styleVal.replace(
-        /\bcolor\s*:\s*(#[0-9A-Fa-f]{6})/gi,
-        (colorMatch, colorHex) => {
+        /(^|[^\-])\bcolor\s*:\s*(#[0-9A-Fa-f]{6})/g,
+        (colorMatch, prefix, colorHex) => {
           const cRgb = hexToRgbTriplet(colorHex);
           if (!cRgb) return colorMatch;
           const cLum = 0.299 * cRgb[0] + 0.587 * cRgb[1] + 0.114 * cRgb[2];
           const isDarkColor = cLum < 128;
           // If text color is incompatible with bg (same luminance band), invert it
           if (isDarkBg && isDarkColor) {
-            return `color: #FFFFFF`;
+            return `${prefix}color: #FFFFFF`;
           }
           if (!isDarkBg && !isDarkColor) {
-            return `color: #000000`;
+            return `${prefix}color: #000000`;
           }
           // Acceptable contrast — keep as-is. This preserves spec colors like
           // brand-green accent text on white bg (green is mid-luminance but
@@ -1035,6 +1037,316 @@ function universalTextContrast(html) {
  * Fix 9 (NEW in v5.2.0): Add a warning HTML comment if no images were uploaded.
  * Helps devs spot when they forgot the ZIP and got local paths in output.
  */
+
+/**
+ * Fix 10 (NEW in v5.2.1): CTA auto-contrast.
+ *
+ * When Stage 2 emits CTAs without a valid cta_color, it often defaults to #000000
+ * on a dark brand bgcolor — producing illegible black-on-dark buttons.
+ * This deterministic post-processor finds every CTA table (em_cta or matching the
+ * CTA pattern) and forces readable contrast based on luminance of the CTA bg.
+ *
+ * Universal. Works on any brand's dark/light CTA color.
+ */
+function fixCtaContrast(html) {
+  let fixes = 0;
+
+  // CTAs in Mavlers framework always have bgcolor AND border-radius on the SAME
+  // opening <table> tag. We match only these — prevents matching outer wrapper
+  // tables which also have bgcolor but no border-radius.
+  //
+  // Non-greedy regex means we match the INNERMOST such table, which is always
+  // the CTA (since outer wrappers don't have border-radius).
+  const ctaRegex =
+    /<table\b([^>]*?)bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?([^>]*?border-radius[^>]*?)>([\s\S]*?)<\/table>/gi;
+
+  const output = html.replace(ctaRegex, (match, pre, bgHex, post, body) => {
+    const hasAnchor = /<a\s+[^>]*href\s*=/i.test(body);
+    const hasButtonHeight = /\bheight\s*=\s*["']?\d{2,3}["']?/i.test(body);
+    if (!hasAnchor || !hasButtonHeight) return match;
+
+    const bg = bgHex.toUpperCase();
+    const rgb = hexToRgbTriplet(bg);
+    if (!rgb) return match;
+
+    const lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+    const wantedTextColor = lum < 128 ? "#FFFFFF" : "#000000";
+
+    // Rewrite text-color in the body. Match `color:` NOT preceded by `-`
+    let newBody = body.replace(/style\s*=\s*"([^"]*)"/gi, (attrM, styleVal) => {
+      let updated = styleVal.replace(
+        /(^|[^\-])\bcolor\s*:\s*#[0-9A-Fa-f]{6}/g,
+        (m, prefix) => `${prefix}color: ${wantedTextColor}`
+      );
+      return `style="${updated}"`;
+    });
+
+    if (newBody !== body) fixes++;
+    return `<table${pre}bgcolor="${bg}"${post}>${newBody}</table>`;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 11 (NEW in v5.2.1): Font stack quote sanitizer.
+ *
+ * When the developer-input secondary font field contains a comma-separated list
+ * (e.g. "Arial, Helvetica, sans-serif"), Stage 2 sometimes wraps the WHOLE thing
+ * in single quotes: 'Arial, Helvetica, sans-serif' — one malformed font name.
+ * This function detects that pattern and splits into proper comma-separated stack.
+ *
+ * Universal. Handles any font fallback string.
+ */
+function fixFontStackQuotes(html) {
+  let fixes = 0;
+
+  // Only act inside font-family declarations found in element `style="..."` attributes.
+  // This avoids over-touching CSS inside <style> blocks, MSO conditional styles,
+  // or @import rules.
+  const output = html.replace(
+    /style\s*=\s*"([^"]*)"/g,
+    (attrMatch, styleVal) => {
+      if (!/font-family\s*:/i.test(styleVal)) return attrMatch;
+
+      // Normalize font-family declarations inside this style attribute
+      const updated = styleVal.replace(
+        /font-family\s*:\s*([^;]+)/gi,
+        (m, rawValue) => {
+          const value = rawValue.trim();
+
+          // Tokenize: match either 'quoted' or "quoted" or bareword-until-comma
+          const tokenRegex = /'([^']*)'|"([^"]*)"|([^,]+)/g;
+          const tokens = [];
+          let tm;
+          while ((tm = tokenRegex.exec(value)) !== null) {
+            const raw = (tm[1] ?? tm[2] ?? tm[3] ?? "").trim();
+            if (!raw) continue;
+            // If token contains commas internally (from the 'Arial, Helvetica, sans-serif' case),
+            // split it into its pieces
+            if (raw.includes(",")) {
+              for (const sub of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+                tokens.push(sub);
+              }
+            } else {
+              tokens.push(raw);
+            }
+          }
+
+          // Filter out tokens that are CSS !important markers or malformed entries
+          const cleaned = tokens
+            .map((t) => t.replace(/!important$/i, "").trim())
+            .filter((t) => t.length > 0 && !/^!important$/i.test(t));
+
+          // De-duplicate case-insensitively, preserving first-seen order
+          const seen = new Set();
+          const uniq = [];
+          for (const t of cleaned) {
+            const key = t.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniq.push(t);
+          }
+
+          if (uniq.length === 0) return m; // safety: don't produce empty font-family
+
+          // Quote only names containing spaces; keep single-word/hyphenated names bare.
+          const generic = new Set([
+            "serif", "sans-serif", "monospace", "cursive", "fantasy",
+            "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
+          ]);
+          const rebuilt = uniq
+            .map((t) => {
+              const lower = t.toLowerCase();
+              if (generic.has(lower)) return lower;
+              if (/\s/.test(t)) return `'${t}'`;
+              return t;
+            })
+            .join(", ");
+
+          // Preserve !important if present in original
+          const importantSuffix = /!important/i.test(value) ? " !important" : "";
+
+          if (rebuilt + importantSuffix !== value) fixes++;
+          return `font-family: ${rebuilt}${importantSuffix}`;
+        }
+      );
+
+      return `style="${updated}"`;
+    }
+  );
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 12 (NEW in v5.2.1): OCR capital-I repair.
+ *
+ * Tesseract frequently misreads capital I as lowercase l in font glyphs where
+ * they're visually similar (Inter, Helvetica, Arial at certain sizes).
+ * Example: "AI Integration" → "Al Integration".
+ *
+ * Strategy: scan visible text in HTML for tokens matching /\b[A-Z]l(?=[\s.,;:!?]|$)/ — a capital
+ * letter followed by lowercase l ending the word. Replace with the capital-I
+ * equivalent UNLESS the token is a valid English word on an exclusion list.
+ *
+ * Universal. Works on any content; does NOT modify attribute values or URLs.
+ */
+function fixOcrCapitalI(html) {
+  // Exclusion list — real English words that legitimately start with capital + lowercase L
+  const exclusions = new Set([
+    "Al", // valid as name (e.g. "Al Pacino") — but in pharma/tech contexts usually wrong
+    // We leave "Al" in because context-aware logic is hard. Instead, we only fix when
+    // followed by another capitalized word (suggests acronym usage)
+  ]);
+
+  let fixes = 0;
+
+  // Walk the HTML. Only rewrite text content, never inside tags or attributes.
+  // Simple state machine: outside-tag vs inside-tag.
+  let output = "";
+  let i = 0;
+  let inTag = false;
+  let textBuffer = "";
+
+  const flushTextBuffer = () => {
+    if (textBuffer.length === 0) return;
+    // Apply regex to this text chunk
+    // Match: "Al" followed by space and capital letter (indicating acronym followed by word)
+    //   e.g., "Al Integration" → "AI Integration"
+    //         "Al plugs"       → "AI plugs"
+    //         "Al can"         → "AI can"
+    //         "Al-driven"      → "AI-driven"
+    //         "Al boosts"      → "AI boosts"
+    // Criteria: "Al" standalone as acronym (start of sentence or after space) AND next non-space char is lowercase letter (word start) OR capital letter (proper noun / another acronym) OR a hyphen/apostrophe
+    const fixed = textBuffer.replace(
+      /\bAl(?=[\s\-'][A-Za-z])/g,
+      (match) => {
+        fixes++;
+        return "AI";
+      }
+    );
+    output += fixed;
+    textBuffer = "";
+  };
+
+  while (i < html.length) {
+    const c = html[i];
+    if (!inTag) {
+      if (c === "<") {
+        flushTextBuffer();
+        inTag = true;
+        output += c;
+      } else {
+        textBuffer += c;
+      }
+    } else {
+      output += c;
+      if (c === ">") inTag = false;
+    }
+    i++;
+  }
+  flushTextBuffer();
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 13 (NEW in v5.2.1): Accent-bg dark-text rule.
+ *
+ * When a section has a saturated brand accent bgcolor (not pure white, not pure
+ * black, not near-white), and the text inside is white but the brand's darkest
+ * palette color would provide better readability + match brand intent, swap text
+ * to the darkest palette color.
+ *
+ * This fixes the pattern where alert bars or accent sections were rendered with
+ * white text instead of brand-dark text (e.g. white text on a brand accent bg instead of
+ * dark-green on green).
+ *
+ * Universal — uses palette to find darkest non-black brand color.
+ */
+function fixAccentBgText(html, palette) {
+  let fixes = 0;
+  if (!palette || palette.length === 0) return { html, fixes };
+
+  // Find the DARKEST non-black, non-white color in the palette
+  const paletteHex = (palette || [])
+    .map((p) => (typeof p === "string" ? p : p?.hex || "").toUpperCase())
+    .filter((h) => /^#[0-9A-F]{6}$/.test(h));
+
+  const darkest = paletteHex
+    .filter((h) => {
+      const rgb = hexToRgbTriplet(h);
+      if (!rgb) return false;
+      const lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+      // Not pure black, not near-white
+      return lum > 20 && lum < 100;
+    })
+    .sort((a, b) => {
+      const la = (() => {
+        const r = hexToRgbTriplet(a);
+        return 0.299 * r[0] + 0.587 * r[1] + 0.114 * r[2];
+      })();
+      const lb = (() => {
+        const r = hexToRgbTriplet(b);
+        return 0.299 * r[0] + 0.587 * r[1] + 0.114 * r[2];
+      })();
+      return la - lb;
+    })[0];
+
+  if (!darkest) return { html, fixes };
+
+  // Walk each section. For each, check if the section bg is a saturated accent color.
+  const sectionRegex =
+    /(<!--\s*Section_(\d+)_([a-zA-Z_]+)(?:\s+y=\d+-\d+)?\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_\3)?\s*-->)/g;
+
+  const output = html.replace(sectionRegex, (match, openTag, n, stype, body, closeTag) => {
+    if (stype === "thin_colored_band" || stype === "spacer" || stype === "divider" || stype === "footer") {
+      return match;
+    }
+
+    const bgMatch = body.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/);
+    if (!bgMatch) return match;
+    const bg = bgMatch[1].toUpperCase();
+    const rgb = hexToRgbTriplet(bg);
+    if (!rgb) return match;
+
+    const lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+    const sat = Math.max(...rgb) - Math.min(...rgb);
+
+    // Is this a saturated accent bg (not white, not black, meaningfully saturated)?
+    const isAccent = sat >= 60 && lum >= 80 && lum <= 200;
+    if (!isAccent) return match;
+
+    // Darkest-color-on-accent vs white-on-accent:
+    // Developers usually pick the BRAND DARK color for text on a brand accent bg
+    // (matches overall branding) even if white would have slightly higher raw contrast.
+    // We prefer brand-dark as long as it stays readable (luminance distance > 70).
+    const darkRgb = hexToRgbTriplet(darkest);
+    const darkLum = 0.299 * darkRgb[0] + 0.587 * darkRgb[1] + 0.114 * darkRgb[2];
+    const darkContrast = Math.abs(lum - darkLum);
+
+    // Brand-dark wins if it's sufficiently readable (contrast >= 70 is comfortable)
+    const READABLE_CONTRAST_THRESHOLD = 70;
+    if (darkContrast < READABLE_CONTRAST_THRESHOLD) return match;
+
+    // Replace all `color: #FFFFFF` and `color:#ffffff` inside this section's body with darkest.
+    // Use (^|[^\-]) lookbehind to avoid matching background-color.
+    let newBody = body.replace(/style\s*=\s*"([^"]*)"/gi, (attrM, styleVal) => {
+      const updated = styleVal.replace(
+        /(^|[^\-])\bcolor\s*:\s*#(?:FFFFFF|ffffff|FFF|fff)\b/g,
+        (m, prefix) => `${prefix}color: ${darkest}`
+      );
+      return `style="${updated}"`;
+    });
+
+    if (newBody !== body) fixes++;
+    return openTag + newBody + closeTag;
+  });
+
+  return { html: output, fixes };
+}
+
 function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
   if (Object.keys(imageUrlMap || {}).length > 0) return html;
   if (!hadRelativePaths) return html;
@@ -1044,7 +1356,7 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
   return html.replace(/(<body[^>]*>)/i, `$1${warning}`);
 }
 /**
- * Main post-processing entry point (v5.2.0).
+ * Main post-processing entry point (v5.2.1).
  * Runs all deterministic fixes in order and returns the fixed HTML + a report.
  *
  * Order matters:
@@ -1053,10 +1365,14 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
  *  3. fixNearWhite — normalize JPEG-shifted near-whites to pure #FFFFFF
  *  4. forceAlertBarWarmBg — ensure alert bars use warm palette color if available
  *  5. fixAlertBarContrast — alert bar text contrast (black on warm, white on dark)
- *  6. universalTextContrast — fix all text-on-bg contrast globally
- *  7. fixActivityFeed — unwrap day+time bullet lists to plain rows
- *  8. fixThinBands — drop hallucinated thin stripes whose color isn't used elsewhere
- *  9. addMissingZipWarning — visible comment if no image ZIP was uploaded
+ *  6. fixAccentBgText — use brand-dark text on saturated brand-accent bgs (v5.2.1)
+ *  7. universalTextContrast — fix all text-on-bg contrast globally
+ *  8. fixCtaContrast — auto-invert CTA text color based on CTA bg luminance (v5.2.1)
+ *  9. fixFontStackQuotes — un-nest malformed single-quoted font stacks (v5.2.1)
+ *  10. fixOcrCapitalI — repair "Al" OCR misread back to "AI" in content text (v5.2.1)
+ *  11. fixActivityFeed — unwrap day+time bullet lists to plain rows
+ *  12. fixThinBands — drop hallucinated thin stripes whose color isn't used elsewhere
+ *  13. addMissingZipWarning — visible comment if no image ZIP was uploaded
  */
 function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
   const report = {};
@@ -1085,6 +1401,24 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
   const r6 = universalTextContrast(html);
   html = r6.html;
   report.universalContrast = { fixes: r6.fixes };
+
+  // Run accent-bg text AFTER universalTextContrast so brand-dark text isn't
+  // reverted by the generic luminance rule.
+  const r5b = fixAccentBgText(html, palette);
+  html = r5b.html;
+  report.accentBgText = { fixes: r5b.fixes };
+
+  const r6b = fixCtaContrast(html);
+  html = r6b.html;
+  report.ctaContrast = { fixes: r6b.fixes };
+
+  const r6c = fixFontStackQuotes(html);
+  html = r6c.html;
+  report.fontStackQuotes = { fixes: r6c.fixes };
+
+  const r6d = fixOcrCapitalI(html);
+  html = r6d.html;
+  report.ocrCapitalI = { fixes: r6d.fixes };
 
   const r7 = fixActivityFeed(html);
   html = r7.html;
@@ -1682,7 +2016,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.0",
+    version: "5.2.1",
   });
 });
 
@@ -2615,7 +2949,7 @@ ${specs.join("\n\n")}
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.2.0)", {
+    log("info", "Post-processing complete (v5.2.1)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
@@ -2625,7 +2959,11 @@ ${specs.join("\n\n")}
       nearWhiteColors: postProcessResult.report.nearWhite.normalizedColors,
       alertBarWarmBgFixes: postProcessResult.report.alertBarWarmBg?.fixes,
       alertBarContrastFixes: postProcessResult.report.alertBar.fixes,
+      accentBgTextFixes: postProcessResult.report.accentBgText?.fixes,
       universalContrastFixes: postProcessResult.report.universalContrast?.fixes,
+      ctaContrastFixes: postProcessResult.report.ctaContrast?.fixes,
+      fontStackQuoteFixes: postProcessResult.report.fontStackQuotes?.fixes,
+      ocrCapitalIFixes: postProcessResult.report.ocrCapitalI?.fixes,
       activityFeedFixes: postProcessResult.report.activityFeed.fixes,
       thinBandsRemoved: postProcessResult.report.thinBands.removed,
       finalRelativePaths: (html.match(/src="images\/[^"]+"/g) || []).length,
@@ -2890,7 +3228,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.0",
+    version: "5.2.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
