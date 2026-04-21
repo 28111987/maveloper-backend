@@ -363,7 +363,7 @@ async function extractImagesFromPdf(pdfBuffer) {
  * Extract images from a user-uploaded ZIP file.
  * Returns array of { filename, buffer }.
  */
-function extractImagesFromZip(zipBase64) {
+async function extractImagesFromZip(zipBase64) {
   const zipBuffer = Buffer.from(zipBase64.replace(/^data:[^;]+;base64,/, ""), "base64");
 
   if (zipBuffer.length > MAX_ZIP_BYTES) {
@@ -387,9 +387,25 @@ function extractImagesFromZip(zipBase64) {
     if (filename.startsWith("._") || entry.entryName.includes("__MACOSX")) continue;
 
     const buffer = entry.getData();
-    if (buffer.length > 0) {
-      images.push({ filename, buffer });
+    if (buffer.length === 0) continue;
+
+    // Read true pixel dimensions via sharp metadata. This is authoritative —
+    // the developer receives image assets that match the design proportions,
+    // but their exact pixel dimensions may be 2× (retina) or different from
+    // the placeholder size in the design PDF. v5.2.2 post-processor uses these
+    // to clamp <img width> to min(placeholder, original).
+    let originalWidth = null;
+    let originalHeight = null;
+    try {
+      const meta = await sharp(buffer).metadata();
+      originalWidth = meta.width || null;
+      originalHeight = meta.height || null;
+    } catch (err) {
+      // GIF or corrupted — fall through; image will still be uploaded but
+      // without dimension metadata. fixImageDimensions will skip it.
     }
+
+    images.push({ filename, buffer, originalWidth, originalHeight });
   }
 
   if (images.length === 0) {
@@ -1039,7 +1055,7 @@ function universalTextContrast(html) {
  */
 
 /**
- * Fix 10 (NEW in v5.2.1): CTA auto-contrast.
+ * Fix 10 (NEW in v5.2.2): CTA auto-contrast.
  *
  * When Stage 2 emits CTAs without a valid cta_color, it often defaults to #000000
  * on a dark brand bgcolor — producing illegible black-on-dark buttons.
@@ -1089,7 +1105,7 @@ function fixCtaContrast(html) {
 }
 
 /**
- * Fix 11 (NEW in v5.2.1): Font stack quote sanitizer.
+ * Fix 11 (NEW in v5.2.2): Font stack quote sanitizer.
  *
  * When the developer-input secondary font field contains a comma-separated list
  * (e.g. "Arial, Helvetica, sans-serif"), Stage 2 sometimes wraps the WHOLE thing
@@ -1180,7 +1196,7 @@ function fixFontStackQuotes(html) {
 }
 
 /**
- * Fix 12 (NEW in v5.2.1): OCR capital-I repair.
+ * Fix 12 (NEW in v5.2.2): OCR capital-I repair.
  *
  * Tesseract frequently misreads capital I as lowercase l in font glyphs where
  * they're visually similar (Inter, Helvetica, Arial at certain sizes).
@@ -1252,7 +1268,7 @@ function fixOcrCapitalI(html) {
 }
 
 /**
- * Fix 13 (NEW in v5.2.1): Accent-bg dark-text rule.
+ * Fix 13 (NEW in v5.2.2): Accent-bg dark-text rule.
  *
  * When a section has a saturated brand accent bgcolor (not pure white, not pure
  * black, not near-white), and the text inside is white but the brand's darkest
@@ -1356,7 +1372,7 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
   return html.replace(/(<body[^>]*>)/i, `$1${warning}`);
 }
 /**
- * Main post-processing entry point (v5.2.1).
+ * Main post-processing entry point (v5.2.2).
  * Runs all deterministic fixes in order and returns the fixed HTML + a report.
  *
  * Order matters:
@@ -1365,16 +1381,304 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
  *  3. fixNearWhite — normalize JPEG-shifted near-whites to pure #FFFFFF
  *  4. forceAlertBarWarmBg — ensure alert bars use warm palette color if available
  *  5. fixAlertBarContrast — alert bar text contrast (black on warm, white on dark)
- *  6. fixAccentBgText — use brand-dark text on saturated brand-accent bgs (v5.2.1)
+ *  6. fixAccentBgText — use brand-dark text on saturated brand-accent bgs (v5.2.2)
  *  7. universalTextContrast — fix all text-on-bg contrast globally
- *  8. fixCtaContrast — auto-invert CTA text color based on CTA bg luminance (v5.2.1)
- *  9. fixFontStackQuotes — un-nest malformed single-quoted font stacks (v5.2.1)
- *  10. fixOcrCapitalI — repair "Al" OCR misread back to "AI" in content text (v5.2.1)
+ *  8. fixCtaContrast — auto-invert CTA text color based on CTA bg luminance (v5.2.2)
+ *  9. fixFontStackQuotes — un-nest malformed single-quoted font stacks (v5.2.2)
+ *  10. fixOcrCapitalI — repair "Al" OCR misread back to "AI" in content text (v5.2.2)
  *  11. fixActivityFeed — unwrap day+time bullet lists to plain rows
  *  12. fixThinBands — drop hallucinated thin stripes whose color isn't used elsewhere
  *  13. addMissingZipWarning — visible comment if no image ZIP was uploaded
  */
-function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
+/**
+ * Fix 14 (NEW in v5.2.2): Strip inline SVG/data-URL backgrounds from styles.
+ *
+ * When Stage 2 generates bullet icons using `background: url('data:image/svg+xml;utf8,<svg ...>')`,
+ * the inner double-quote characters inside the SVG break the HTML style attribute
+ * parsing — browsers show raw SVG code as visible text. This is a CRITICAL bug.
+ *
+ * Fix: detect `background: url('data:image/svg...` or similar inside style attributes,
+ * strip the entire background declaration, and add a `list-style-type: disc` fallback.
+ * This is safe universally — bullets just render with default disc markers.
+ */
+function fixInlineSvgDataUrl(html) {
+  let fixes = 0;
+  let ulFixes = 0;
+
+  // Step 1: Directly strip any `background: url('data:...')` or `background-image: url('data:...')`
+  // declaration and everything up to the next `;` or the end of the style attr's closing quote.
+  // This works even when the inner double-quotes of the SVG have already broken the style
+  // attribute parsing — we just remove the toxic substring by pattern match, not by attr parsing.
+  //
+  // The data URL ends at the first `)` after the `url(` — even though the SVG contains internal
+  // quotes, it does NOT contain literal `)` characters (the closing `/>` is not a paren).
+  //
+  // After stripping the url(...) part, also consume any trailing "no-repeat left 8px" style
+  // keywords and the terminating ";" if present.
+  let output = html.replace(
+    /background(?:-image)?\s*:\s*url\s*\(\s*['"]?data:[^)]*\)(?:\s*(?:no-repeat|repeat|repeat-x|repeat-y|left|right|center|top|bottom|\d+(?:px|%)?))*\s*;?/gi,
+    () => {
+      fixes++;
+      return "";
+    }
+  );
+
+  // Step 2: Clean up any leftover double-semicolons or whitespace artifacts in styles.
+  output = output.replace(/;\s*;+/g, ";").replace(/"\s*;\s*"/g, '";"');
+
+  // Step 3: Any <ul> with list-style-type:none should switch to disc for a visible bullet.
+  output = output.replace(
+    /<ul([^>]*style\s*=\s*"[^"]*list-style-type\s*:\s*none[^"]*"[^>]*)>/gi,
+    (match, attrs) => {
+      const newAttrs = attrs.replace(
+        /list-style-type\s*:\s*none/gi,
+        "list-style-type: disc"
+      );
+      ulFixes++;
+      return `<ul${newAttrs}>`;
+    }
+  );
+
+  return { html: output, fixes, ulFixes };
+}
+
+/**
+ * Fix 15 (NEW in v5.2.2): Clamp image widths to min(placeholder, original).
+ *
+ * Every <img> has a `width="N"` attribute and `max-width: Npx` in its inline
+ * style — that's the placeholder width Stage 2 emitted from the spec. The ZIP
+ * contains the actual source image at its original pixel dimensions. If the
+ * original is SMALLER than the placeholder, we downsize the placeholder to the
+ * original (upscaling a small source looks bad). If original is LARGER, we
+ * keep the placeholder (renders crisp on retina).
+ *
+ * Aspect ratio is always preserved from the ZIP original.
+ *
+ * Universal. Executes on real measured pixel data.
+ */
+function fixImageDimensions(html, imageDimensionsMap) {
+  let fixes = 0;
+  if (!imageDimensionsMap || Object.keys(imageDimensionsMap).length === 0) {
+    return { html, fixes, skipped: "no dimensions map" };
+  }
+
+  // Match each <img> tag. Capture src, width, and inline style so we can rewrite them.
+  const imgRegex = /<img\b([^>]*)>/gi;
+  const output = html.replace(imgRegex, (match, attrs) => {
+    const srcMatch = attrs.match(/src\s*=\s*"([^"]+)"/i);
+    if (!srcMatch) return match;
+    const src = srcMatch[1];
+
+    // Extract filename from src (strip URL params and path)
+    const rawName = src.split("?")[0].split("/").pop();
+    if (!rawName) return match;
+
+    // Try exact match first, then case-insensitive
+    let dims = imageDimensionsMap[rawName];
+    if (!dims) {
+      const lowered = rawName.toLowerCase();
+      for (const key of Object.keys(imageDimensionsMap)) {
+        if (key.toLowerCase() === lowered) {
+          dims = imageDimensionsMap[key];
+          break;
+        }
+      }
+    }
+    if (!dims || !dims.w || !dims.h) return match;
+
+    const origW = dims.w;
+    const origH = dims.h;
+
+    // Read current placeholder width from width attr (prefer) or style max-width
+    const widthAttrMatch = attrs.match(/\bwidth\s*=\s*["']?(\d+)["']?/i);
+    const styleMatch = attrs.match(/style\s*=\s*"([^"]*)"/i);
+    const maxWidthMatch = styleMatch ? styleMatch[1].match(/max-width\s*:\s*(\d+)px/i) : null;
+
+    const placeholderW =
+      (widthAttrMatch ? parseInt(widthAttrMatch[1], 10) : null) ||
+      (maxWidthMatch ? parseInt(maxWidthMatch[1], 10) : null) ||
+      origW;
+
+    // Final width = min(placeholder, original). Only downsizes, never upsizes.
+    const finalW = Math.min(placeholderW, origW);
+    const finalH = Math.round((origH / origW) * finalW);
+
+    // Nothing to change
+    if (finalW === placeholderW && (!widthAttrMatch || parseInt(widthAttrMatch[1], 10) === finalW)) {
+      return match;
+    }
+
+    let newAttrs = attrs;
+
+    // Update width="..." attribute (set or replace)
+    if (widthAttrMatch) {
+      newAttrs = newAttrs.replace(
+        /\bwidth\s*=\s*["']?\d+["']?/i,
+        `width="${finalW}"`
+      );
+    } else {
+      newAttrs = newAttrs.replace(/(<img\b)?/i, "") + ` width="${finalW}"`;
+    }
+
+    // Update max-width inside style attribute
+    if (styleMatch) {
+      const newStyle = styleMatch[1].replace(
+        /max-width\s*:\s*\d+px/gi,
+        `max-width: ${finalW}px`
+      );
+      if (newStyle !== styleMatch[1]) {
+        newAttrs = newAttrs.replace(
+          /style\s*=\s*"[^"]*"/i,
+          `style="${newStyle}"`
+        );
+      }
+    }
+
+    // Add explicit height to help Outlook rendering (optional, but matches gold-standard)
+    const heightAttrMatch = newAttrs.match(/\bheight\s*=\s*["']?(\d+)["']?/i);
+    if (!heightAttrMatch && finalH > 0) {
+      newAttrs = newAttrs + ` height="${finalH}"`;
+    }
+
+    fixes++;
+    return `<img${newAttrs}>`;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 16 (NEW in v5.2.2): Merge adjacent same-bg body_text/heading sections.
+ *
+ * When Stage 1 over-fragments a continuous body copy block into multiple
+ * body_text sections, each becomes its own em_wrapper with redundant padding.
+ * This post-processor detects adjacent sections with the SAME bgcolor AND
+ * similar padding, and collapses them into one wrapper — the content rows
+ * flow into a single table, reducing cumulative padding and matching dev
+ * patterns.
+ */
+function mergeAdjacentSameBgSections(html) {
+  let merges = 0;
+
+  // Find every section open/close pair with y-range + bg attribute
+  const sectionBlockRegex =
+    /(<!--\s*Section_(\d+)_([a-zA-Z_]+)(?:\s+y=\d+-\d+)?\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_\3)?\s*-->)/g;
+
+  const MERGEABLE = new Set(["body_text", "heading", "bullet_list"]);
+
+  // Parse all sections first
+  const sections = [];
+  let m;
+  while ((m = sectionBlockRegex.exec(html)) !== null) {
+    const bgMatch = m[4].match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/);
+    sections.push({
+      full: m[0],
+      open: m[1],
+      n: parseInt(m[2], 10),
+      type: m[3],
+      body: m[4],
+      close: m[5],
+      bg: bgMatch ? bgMatch[1].toUpperCase() : null,
+      start: m.index,
+      end: m.index + m[0].length,
+    });
+  }
+
+  if (sections.length < 2) return { html, merges };
+
+  // Find merge groups: adjacent sections where type is MERGEABLE AND bg matches
+  const groups = [];
+  let cur = [sections[0]];
+  for (let i = 1; i < sections.length; i++) {
+    const prev = cur[cur.length - 1];
+    const s = sections[i];
+    if (
+      MERGEABLE.has(prev.type) &&
+      MERGEABLE.has(s.type) &&
+      prev.bg &&
+      s.bg &&
+      prev.bg === s.bg
+    ) {
+      cur.push(s);
+    } else {
+      if (cur.length > 1) groups.push(cur);
+      cur = [s];
+    }
+  }
+  if (cur.length > 1) groups.push(cur);
+
+  if (groups.length === 0) return { html, merges };
+
+  // Build new HTML by replacing each group with a merged single-wrapper section.
+  // Extract the content rows (everything inside the inner <td class="em_pad*">
+  // <table>...<tbody>...</tbody></table></td>) from each section and concatenate.
+  let output = html;
+  // Replace from bottom to top to keep indices valid
+  for (const group of groups.reverse()) {
+    const firstOpen = group[0].open;
+    const lastClose = group[group.length - 1].close;
+
+    // Extract the inner content rows from each section's body.
+    // Pattern: <table ... class="em_wrapper..." ...><tbody><tr><td ... class="em_pad..."><table...><tbody>INNER_ROWS</tbody></table></td></tr></tbody></table>
+    const innerRows = [];
+    for (const s of group) {
+      const innerMatch = s.body.match(
+        /<table[^>]*class="em_wrapper[^"]*"[^>]*>[\s\S]*?<tbody>\s*<tr>\s*<td[^>]*class="em_pad[^"]*"[^>]*>\s*<table[^>]*>\s*<tbody>([\s\S]*?)<\/tbody>\s*<\/table>\s*<\/td>\s*<\/tr>\s*<\/tbody>\s*<\/table>/i
+      );
+      if (innerMatch) innerRows.push(innerMatch[1].trim());
+    }
+
+    if (innerRows.length !== group.length) continue; // couldn't parse all — skip this group safely
+
+    // Use the FIRST section's wrapper as the canonical wrapper
+    const firstSection = group[0];
+    const mergedInnerRows = innerRows.join("\n");
+    const mergedWrapper = firstSection.body.replace(
+      /(<table[^>]*class="em_wrapper[^"]*"[^>]*>[\s\S]*?<tbody>\s*<tr>\s*<td[^>]*class="em_pad[^"]*"[^>]*>\s*<table[^>]*>\s*<tbody>)([\s\S]*?)(<\/tbody>\s*<\/table>\s*<\/td>\s*<\/tr>\s*<\/tbody>\s*<\/table>)/i,
+      `$1\n${mergedInnerRows}\n$3`
+    );
+    const mergedBlock = firstOpen + mergedWrapper + lastClose;
+
+    // Replace the full range from group[0].start to group[end].end with mergedBlock
+    const rangeStart = group[0].start;
+    const rangeEnd = group[group.length - 1].end;
+    output = output.slice(0, rangeStart) + mergedBlock + output.slice(rangeEnd);
+    merges++;
+  }
+
+  return { html: output, merges };
+}
+
+/**
+ * Fix 17 (NEW in v5.2.2): Diagnostic warning if ZIP was uploaded but Dropbox
+ * returned empty imageUrlMap. Adds a LARGE visible comment block + visible banner.
+ */
+function addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUploaded) {
+  if (!zipWasUploaded) return html;
+  if (Object.keys(imageUrlMap || {}).length > 0) return html;
+  if (!hadRelativePaths) return html;
+
+  const warningComment = `\n<!-- ============================================================\n⚠⚠⚠ MAVELOPER CRITICAL WARNING ⚠⚠⚠\nZIP file was uploaded but Dropbox image-URL map is EMPTY.\nThe Dropbox upload pipeline failed silently.\nAll image paths in this HTML are broken placeholders.\nACTION: Check Railway logs for \"uploadImagesToDropbox\" errors,\nverify DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN in Railway env,\nand confirm the Dropbox app has files.content.write permission.\n============================================================ -->\n`;
+
+  const warningBanner = `
+<tr>
+  <td align="center" valign="top" bgcolor="#FF0000" style="background-color: #FF0000; padding: 20px; font-family: Arial, sans-serif; font-size: 14px; color: #FFFFFF; text-align: center; font-weight: bold;">
+    ⚠ MAVELOPER: Image upload pipeline failed. Image paths in this HTML are broken. Re-generate after checking Dropbox credentials and Railway logs.
+  </td>
+</tr>`;
+
+  // Insert comment after <body>
+  let output = html.replace(/(<body[^>]*>)/i, `$1${warningComment}`);
+  // Insert banner inside em_main_table as first row
+  output = output.replace(
+    /(<table[^>]*class="em_main_table"[^>]*>\s*(?:<tbody>\s*)?)/i,
+    `$1${warningBanner}`
+  );
+
+  return output;
+}
+
+function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded }) {
   const report = {};
   const hadRelativePaths = /src="images\//i.test(html);
 
@@ -1420,6 +1724,16 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
   html = r6d.html;
   report.ocrCapitalI = { fixes: r6d.fixes };
 
+  // v5.2.2: Strip inline SVG/data-URL backgrounds that break style attribute parsing
+  const rSvg = fixInlineSvgDataUrl(html);
+  html = rSvg.html;
+  report.inlineSvgDataUrl = { fixes: rSvg.fixes, ulFixes: rSvg.ulFixes };
+
+  // v5.2.2: Clamp image widths to min(placeholder, original)
+  const rDims = fixImageDimensions(html, imageDimensionsMap);
+  html = rDims.html;
+  report.imageDimensions = { fixes: rDims.fixes, skipped: rDims.skipped };
+
   const r7 = fixActivityFeed(html);
   html = r7.html;
   report.activityFeed = { fixes: r7.fixes };
@@ -1428,7 +1742,14 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
   html = r8.html;
   report.thinBands = { removed: r8.removed };
 
+  // v5.2.2: Merge adjacent same-bg body_text / heading / bullet sections
+  const rMerge = mergeAdjacentSameBgSections(html);
+  html = rMerge.html;
+  report.mergedSections = { merges: rMerge.merges };
+
   html = addMissingZipWarning(html, imageUrlMap, hadRelativePaths);
+  // v5.2.2: Escalate to visible warning if ZIP was uploaded but upload failed
+  html = addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUploaded);
 
   return { html, report };
 }
@@ -1547,6 +1868,7 @@ FINAL CHECKLIST (run before outputting)
 - Multi-color inline headings use "spans" (not duplicated rows)?
 - Colored stripes >= 2px in the band map have a thin_colored_band section?
 - No fake hallucinated sections not visible in the design image?
+- SECTION GROUPING: Adjacent paragraphs of body copy or headings on the SAME background color MUST be grouped into a SINGLE section with multiple content[] entries. Create a NEW section boundary ONLY when one of these changes: (a) background color, (b) section semantic type (e.g. body→cta, heading→image), or (c) a visible horizontal divider in the design. NEVER split a continuous body copy paragraph group into separate body_text sections.
 `;
 
 // =====================================================================
@@ -1923,6 +2245,8 @@ Some designs show the SAME section twice — once styled for dark mode preview, 
 15. **Splitting a "spans" element into two <td> rows** — the developer's reference code always renders multi-color headings as ONE <td> with multiple inline <span> elements. If spec content has a "spans" array, output ONE td with multiple spans. NEVER duplicate the heading text across multiple colored rows.
 16. **Relative image paths** — img src="images/anything.png" is always wrong in v5. If spec has a URL, use it; if spec has empty src, use empty src. NEVER make up a filename.
 17. **Inventing sections not in the spec** — if the spec has 23 sections, output exactly 23 sections. Do not add a "dark logo" or "decorative banner" that isn't in the spec.
+18. **INLINE SVG OR DATA-URL IN STYLE ATTRIBUTES** — NEVER output any inline SVG, any "background: url('data:image/svg...')" declaration, any "background-image: url('data:...')" declaration, or any data URI inside an inline style attribute. The inner quote characters inside the data URI break HTML parsing and cause raw CSS to appear as visible text on the page. For bullets, use <ul>/<li> with list-style-type: disc OR render an icon as an <img> tag inside a 4-column table. NEVER embed SVG markup anywhere in the output.
+19. **Background-image declarations on list items** — a <li> with style="background: url(...)" is always wrong. If an icon bullet is required, render it as a table with 4 columns: one cell for the icon img, one spacer cell, one text cell.
 
 ## FINAL CHECKLIST
 Before outputting, verify:
@@ -2016,7 +2340,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.1",
+    version: "5.2.2",
   });
 });
 
@@ -2113,12 +2437,17 @@ app.post("/generate", generateLimiter, async (req, res) => {
     if (assetsZipBase64) {
       // User provided images via ZIP upload
       try {
-        images = extractImagesFromZip(assetsZipBase64);
+        images = await extractImagesFromZip(assetsZipBase64);
         imageSource = "zip";
         log("info", "Extracted images from ZIP", {
           requestId: req.id,
           imageCount: images.length,
           filenames: images.map((i) => i.filename),
+          dimensions: images.map((i) => ({
+            file: i.filename,
+            w: i.originalWidth,
+            h: i.originalHeight,
+          })),
         });
       } catch (zipErr) {
         return res.status(400).json({
@@ -2942,14 +3271,29 @@ ${specs.join("\n\n")}
       rawDropboxUrls: (html_raw.match(/dl\.dropboxusercontent\.com/g) || []).length,
     });
 
+    // Build a filename -> {w, h} map from the extracted images metadata.
+    // Used by fixImageDimensions post-processor to clamp img widths to
+    // min(PDF placeholder width, ZIP original width).
+    const imageDimensionsMap = {};
+    for (const img of images || []) {
+      if (img.originalWidth && img.originalHeight) {
+        imageDimensionsMap[img.filename] = {
+          w: img.originalWidth,
+          h: img.originalHeight,
+        };
+      }
+    }
+
     const postProcessResult = postProcessHtml(html_raw, {
       imageUrlMap,
       palette: designSpec?._palette || [],
       bandMap: designSpec?._band_map || [],
+      imageDimensionsMap,
+      zipWasUploaded: !!assetsZipBase64,
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.2.1)", {
+    log("info", "Post-processing complete (v5.2.2)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
@@ -2964,6 +3308,10 @@ ${specs.join("\n\n")}
       ctaContrastFixes: postProcessResult.report.ctaContrast?.fixes,
       fontStackQuoteFixes: postProcessResult.report.fontStackQuotes?.fixes,
       ocrCapitalIFixes: postProcessResult.report.ocrCapitalI?.fixes,
+      inlineSvgDataUrlFixes: postProcessResult.report.inlineSvgDataUrl?.fixes,
+      inlineSvgUlFixes: postProcessResult.report.inlineSvgDataUrl?.ulFixes,
+      imageDimensionsFixed: postProcessResult.report.imageDimensions?.fixes,
+      mergedSections: postProcessResult.report.mergedSections?.merges,
       activityFeedFixes: postProcessResult.report.activityFeed.fixes,
       thinBandsRemoved: postProcessResult.report.thinBands.removed,
       finalRelativePaths: (html.match(/src="images\/[^"]+"/g) || []).length,
@@ -3228,7 +3576,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.2.1",
+    version: "5.2.2",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
