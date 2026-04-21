@@ -388,5 +388,14 @@ export function postProcessOcr(rawText) {
   //    as they are valid English single-letter words.
   text = text.replace(/\s([b-hj-z])\s/g, " ");
 
+  // 6. Capital-I → lowercase-l misreads (common in Inter/Arial at small sizes).
+  //    Pattern: "Al" as standalone token followed by a space+capital letter
+  //    (indicating acronym usage like "AI Integration", "AI-driven").
+  //    Fixes: Al → AI
+  text = text.replace(/\bAl(?=[\s\-'][A-Z])/g, "AI");
+  //    Also: "Al" at sentence start followed by lowercase word (acronym as subject)
+  //    "Al plugs into..." → "AI plugs into..."
+  text = text.replace(/\bAl(?=\s[a-z])/g, "AI");
+
   return text;
 }
