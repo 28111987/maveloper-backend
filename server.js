@@ -766,34 +766,339 @@ function fixThinBands(html, palette) {
 }
 
 /**
- * Main post-processing entry point.
- * Runs all deterministic fixes in order and returns the fixed HTML + a report.
+ * Fix 6 (NEW in v5.2.0): Rebind section bgcolors using band_map + y-range in comments.
+ *
+ * Every section comment emitted by Stage 2 contains y=Y1-Y2 (e.g. "Section_8_alert_bar y=345-380").
+ * We parse that y-range, look up the DOMINANT band color covering that range, and override
+ * the section's bgcolor attribute. This is fully deterministic — no Claude guessing.
+ *
+ * Why this exists: Stage 1 Claude sometimes collapses distinct design colors into a
+ * single palette color (e.g. cream off-white shades rendered as pure white). Stage 2 then uses
+ * that wrong color. This function restores the correct color from pixel-sampled data.
  */
-function postProcessHtml(html, { imageUrlMap, palette }) {
+function rebindSectionColors(html, bandMap, palette) {
+  if (!Array.isArray(bandMap) || bandMap.length === 0) {
+    return { html, rebound: 0, checked: 0, skipped: "no band map" };
+  }
+
+  let rebound = 0;
+  let checked = 0;
+
+  // Normalize band_map to a sorted array of { y_start, y_end, hex }
+  const bands = bandMap
+    .map((b) => {
+      const y = b.y || [0, 0];
+      const y_start = Array.isArray(y) ? y[0] : b.y_start || 0;
+      const y_end = Array.isArray(y) ? y[1] : b.y_end || 0;
+      return {
+        y_start: Number(y_start) || 0,
+        y_end: Number(y_end) || 0,
+        hex: (b.bg || b.bg_hex || "").toUpperCase(),
+      };
+    })
+    .filter((b) => b.y_end > b.y_start && /^#[0-9A-F]{6}$/.test(b.hex))
+    .sort((a, b) => a.y_start - b.y_start);
+
+  if (bands.length === 0) {
+    return { html, rebound: 0, checked: 0, skipped: "band map empty after normalize" };
+  }
+
+  // Build palette hex set for validation
+  const paletteSet = new Set(
+    (palette || [])
+      .map((p) => (typeof p === "string" ? p : p?.hex || "").toUpperCase())
+      .filter((h) => /^#[0-9A-F]{6}$/.test(h))
+  );
+
+  // Section block regex matches: <!-- Section_N_type y=Y1-Y2 --> ... <!-- // Section_N_type -->
+  const sectionRegex =
+    /(<!--\s*Section_(\d+)_([a-zA-Z_]+)\s+y=(\d+)-(\d+)\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_\3)?\s*-->)/g;
+
+  const output = html.replace(sectionRegex, (match, openTag, n, stype, y1, y2, body, closeTag) => {
+    checked++;
+    const y_start = parseInt(y1, 10);
+    const y_end = parseInt(y2, 10);
+    if (!(y_end > y_start)) return match;
+
+    // Find dominant band color in this y-range (weighted by pixel coverage)
+    const coverage = new Map();
+    for (const band of bands) {
+      const overlap = Math.max(0, Math.min(band.y_end, y_end) - Math.max(band.y_start, y_start));
+      if (overlap <= 0) continue;
+      coverage.set(band.hex, (coverage.get(band.hex) || 0) + overlap);
+    }
+    if (coverage.size === 0) return match;
+
+    // Skip the content color if the section is a CONTENT-heavy band pattern — thin-colored-bands
+    // already have their bg correctly set by type semantics; don't rebind them.
+    if (stype === "thin_colored_band") return match;
+
+    // Find the MOST-COVERED non-grayscale-muddy color first; fall back to overall dominant
+    let domHex = null;
+    let domCov = 0;
+    for (const [hex, cov] of coverage) {
+      if (cov > domCov) {
+        domCov = cov;
+        domHex = hex;
+      }
+    }
+    if (!domHex) return match;
+
+    // Only rebind if dominant color is actually in the palette (prevents binding to
+    // JPEG shift artifacts the palette already filtered out)
+    if (paletteSet.size > 0 && !paletteSet.has(domHex)) {
+      // Try to find closest palette color by RGB distance
+      const domRgb = hexToRgbTriplet(domHex);
+      let best = null;
+      let bestD = Infinity;
+      for (const p of paletteSet) {
+        const pRgb = hexToRgbTriplet(p);
+        if (!pRgb) continue;
+        const d = Math.sqrt(
+          (domRgb[0] - pRgb[0]) ** 2 +
+            (domRgb[1] - pRgb[1]) ** 2 +
+            (domRgb[2] - pRgb[2]) ** 2
+        );
+        if (d < bestD) {
+          bestD = d;
+          best = p;
+        }
+      }
+      if (best && bestD < 30) {
+        domHex = best;
+      } else {
+        return match; // dominant color not meaningfully in palette; leave Stage 2's choice
+      }
+    }
+
+    // Extract current bgcolor in the section's outer wrapper (first bgcolor inside body)
+    const bgMatch = body.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/);
+    if (!bgMatch) return match;
+    const currentBg = bgMatch[1].toUpperCase();
+
+    // Don't rebind if Stage 2's choice is already correct
+    if (currentBg === domHex) return match;
+
+    // Don't rebind when dominant is pure white and current is pure white — no-op
+    if (currentBg === "#FFFFFF" && domHex === "#FFFFFF") return match;
+
+    // Replace the FIRST bgcolor and background-color occurrence in the section body
+    let newBody = body;
+    let replaced = false;
+    newBody = newBody.replace(
+      /bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/,
+      (bgM) => {
+        if (replaced) return bgM;
+        if (bgM.toUpperCase().includes(currentBg)) {
+          replaced = true;
+          return `bgcolor="${domHex}"`;
+        }
+        return bgM;
+      }
+    );
+    // Replace the matching background-color in the first inline style that contains currentBg
+    newBody = newBody.replace(
+      new RegExp(`background-color\\s*:\\s*${currentBg}`, "i"),
+      `background-color: ${domHex}`
+    );
+
+    if (newBody !== body) rebound++;
+    return openTag + newBody + closeTag;
+  });
+
+  return { html: output, rebound, checked };
+}
+
+/**
+ * Fix 7 (NEW in v5.2.0): Force alert_bar sections to use a warm palette color if available.
+ * Many designs use orange/yellow alert bars. If Stage 2 rendered an alert_bar on white,
+ * check the palette for a bright-warm color and force it.
+ */
+function forceAlertBarWarmBg(html, palette) {
+  let fixes = 0;
+  if (!palette || palette.length === 0) return { html, fixes };
+
+  // Find warmest color in palette (high saturation, R > B)
+  const warm = (palette || [])
+    .map((p) => (typeof p === "string" ? p : p?.hex || "").toUpperCase())
+    .filter((h) => /^#[0-9A-F]{6}$/.test(h))
+    .filter((h) => {
+      const rgb = hexToRgbTriplet(h);
+      if (!rgb) return false;
+      const [r, g, b] = rgb;
+      const sat = Math.max(r, g, b) - Math.min(r, g, b);
+      return sat > 100 && r > b + 40 && r + g > 300; // bright warm (orange/yellow/red)
+    });
+
+  if (warm.length === 0) return { html, fixes };
+  const warmColor = warm[0];
+
+  const alertBarRegex =
+    /(<!--\s*Section_(\d+)_alert_bar(?:\s+y=\d+-\d+)?\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_alert_bar)?\s*-->)/g;
+
+  const output = html.replace(alertBarRegex, (match, openTag, n, body, closeTag) => {
+    const bgMatch = body.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/);
+    if (!bgMatch) return match;
+    const currentBg = bgMatch[1].toUpperCase();
+    if (currentBg === warmColor) return match;
+    // Only override if current bg is white/near-white (likely wrong default)
+    const rgb = hexToRgbTriplet(currentBg);
+    if (!rgb) return match;
+    const avg = (rgb[0] + rgb[1] + rgb[2]) / 3;
+    if (avg < 220) return match; // current bg is not light — don't touch
+
+    let newBody = body.replace(
+      /bgcolor\s*=\s*["']?#[0-9A-Fa-f]{6}["']?/,
+      `bgcolor="${warmColor}"`
+    );
+    newBody = newBody.replace(
+      new RegExp(`background-color\\s*:\\s*${currentBg}`, "i"),
+      `background-color: ${warmColor}`
+    );
+    if (newBody !== body) fixes++;
+    return openTag + newBody + closeTag;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 8 (NEW in v5.2.0): Universal luminance-based text contrast.
+ *
+ * For every section, compute bg luminance. If bg is DARK, force every inline
+ * `color: #XYZ` inside that section to #FFFFFF. If bg is LIGHT, force every
+ * text color currently set to near-white to #000000.
+ *
+ * This eliminates the recurring "white text on bright bg" readability failure.
+ */
+function universalTextContrast(html) {
+  let fixes = 0;
+
+  const sectionRegex =
+    /(<!--\s*Section_(\d+)_([a-zA-Z_]+)(?:\s+y=\d+-\d+)?\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_\3)?\s*-->)/g;
+
+  const output = html.replace(sectionRegex, (match, openTag, n, stype, body, closeTag) => {
+    // Skip thin bands and spacers — no text
+    if (stype === "thin_colored_band" || stype === "spacer" || stype === "divider") {
+      return match;
+    }
+
+    // Determine section bg from FIRST bgcolor in the body (outer wrapper)
+    const bgMatch = body.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/);
+    if (!bgMatch) return match;
+    const bg = bgMatch[1].toUpperCase();
+    const bgRgb = hexToRgbTriplet(bg);
+    if (!bgRgb) return match;
+
+    // Luminance (perceived brightness). < 128 = dark bg, >= 128 = light bg
+    const lum = 0.299 * bgRgb[0] + 0.587 * bgRgb[1] + 0.114 * bgRgb[2];
+    const isDarkBg = lum < 128;
+
+    let newBody = body;
+
+    // Rewrite any `color: #XXX` inside style="..." to the correct contrast color
+    newBody = newBody.replace(/style\s*=\s*"([^"]*)"/gi, (attrMatch, styleVal) => {
+      const updated = styleVal.replace(
+        /\bcolor\s*:\s*(#[0-9A-Fa-f]{6})/gi,
+        (colorMatch, colorHex) => {
+          const cRgb = hexToRgbTriplet(colorHex);
+          if (!cRgb) return colorMatch;
+          const cLum = 0.299 * cRgb[0] + 0.587 * cRgb[1] + 0.114 * cRgb[2];
+          const isDarkColor = cLum < 128;
+          // If text color is incompatible with bg (same luminance band), invert it
+          if (isDarkBg && isDarkColor) {
+            return `color: #FFFFFF`;
+          }
+          if (!isDarkBg && !isDarkColor) {
+            return `color: #000000`;
+          }
+          // Acceptable contrast — keep as-is. This preserves spec colors like
+          // brand-green accent text on white bg (green is mid-luminance but
+          // intentional). Only fix when both are same-luminance-band.
+          return colorMatch;
+        }
+      );
+      return `style="${updated}"`;
+    });
+
+    // Also fix color attributes on <font> tags (rare, but some devs use them)
+    // skipped — master framework forbids <font>
+
+    if (newBody !== body) fixes++;
+    return openTag + newBody + closeTag;
+  });
+
+  return { html: output, fixes };
+}
+
+/**
+ * Fix 9 (NEW in v5.2.0): Add a warning HTML comment if no images were uploaded.
+ * Helps devs spot when they forgot the ZIP and got local paths in output.
+ */
+function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
+  if (Object.keys(imageUrlMap || {}).length > 0) return html;
+  if (!hadRelativePaths) return html;
+
+  const warning = `\n<!-- ⚠ MAVELOPER WARNING: No image ZIP was uploaded. Image paths in this HTML are placeholders. Re-run generation with the image ZIP to get working Dropbox URLs. -->\n`;
+  // Insert right after <body ...>
+  return html.replace(/(<body[^>]*>)/i, `$1${warning}`);
+}
+/**
+ * Main post-processing entry point (v5.2.0).
+ * Runs all deterministic fixes in order and returns the fixed HTML + a report.
+ *
+ * Order matters:
+ *  1. fixImageUrls — replace local image paths with Dropbox URLs
+ *  2. rebindSectionColors — fix section bgcolors using band_map y-ranges (must run BEFORE fixNearWhite)
+ *  3. fixNearWhite — normalize JPEG-shifted near-whites to pure #FFFFFF
+ *  4. forceAlertBarWarmBg — ensure alert bars use warm palette color if available
+ *  5. fixAlertBarContrast — alert bar text contrast (black on warm, white on dark)
+ *  6. universalTextContrast — fix all text-on-bg contrast globally
+ *  7. fixActivityFeed — unwrap day+time bullet lists to plain rows
+ *  8. fixThinBands — drop hallucinated thin stripes whose color isn't used elsewhere
+ *  9. addMissingZipWarning — visible comment if no image ZIP was uploaded
+ */
+function postProcessHtml(html, { imageUrlMap, palette, bandMap }) {
   const report = {};
+  const hadRelativePaths = /src="images\//i.test(html);
 
   const r1 = fixImageUrls(html, imageUrlMap);
   html = r1.html;
   report.imageUrls = { replaced: r1.replaced, unmatched: r1.unmatched };
 
-  const r2 = fixNearWhite(html, palette);
+  const r2 = rebindSectionColors(html, bandMap, palette);
   html = r2.html;
-  report.nearWhite = { normalizedColors: r2.normalizedColors, count: r2.count };
+  report.rebindSectionColors = { rebound: r2.rebound, checked: r2.checked, skipped: r2.skipped };
 
-  const r3 = fixAlertBarContrast(html);
+  const r3 = fixNearWhite(html, palette);
   html = r3.html;
-  report.alertBar = { fixes: r3.fixes };
+  report.nearWhite = { normalizedColors: r3.normalizedColors, count: r3.count };
 
-  const r4 = fixActivityFeed(html);
+  const r4 = forceAlertBarWarmBg(html, palette);
   html = r4.html;
-  report.activityFeed = { fixes: r4.fixes };
+  report.alertBarWarmBg = { fixes: r4.fixes };
 
-  const r5 = fixThinBands(html, palette);
+  const r5 = fixAlertBarContrast(html);
   html = r5.html;
-  report.thinBands = { removed: r5.removed };
+  report.alertBar = { fixes: r5.fixes };
+
+  const r6 = universalTextContrast(html);
+  html = r6.html;
+  report.universalContrast = { fixes: r6.fixes };
+
+  const r7 = fixActivityFeed(html);
+  html = r7.html;
+  report.activityFeed = { fixes: r7.fixes };
+
+  const r8 = fixThinBands(html, palette);
+  html = r8.html;
+  report.thinBands = { removed: r8.removed };
+
+  html = addMissingZipWarning(html, imageUrlMap, hadRelativePaths);
 
   return { html, report };
 }
+
 
 
 // =====================================================================
@@ -961,7 +1266,7 @@ NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the h
 ## GOLD STANDARD: SECTION WRAPPER PATTERN
 Every section MUST follow this exact wrapper pattern — each section is an independent table block:
 
-<!-- Section_Name -->
+<!-- Section_N_type y=Y1-Y2 -->
 <tr>
   <td align="center" valign="top"><table align="center" style="width: 600px;" class="em_wrapper em_dark" width="600" border="0" cellspacing="0" cellpadding="0" bgcolor="#ffffff">
       <tbody>
@@ -975,9 +1280,13 @@ Every section MUST follow this exact wrapper pattern — each section is an inde
       </tbody>
     </table></td>
 </tr>
-<!-- // Section_Name -->
+<!-- // Section_N_type -->
 
-RULES: Each section gets its OWN em_wrapper table. Sections are NOT nested inside one shared wrapper. Use HTML comments to label each section. Adjust padding, bgcolor, and dark-mode class per section.
+CRITICAL RULES:
+1. Each section gets its OWN em_wrapper table. Sections are NOT nested inside one shared wrapper.
+2. The section comment MUST include the y-range from the spec in the format: "Section_N_type y=Y1-Y2" where Y1 is spec.sections[n].y_start and Y2 is spec.sections[n].y_end. Example: Section_8_alert_bar y=345-380. This y-range is MANDATORY and used by downstream post-processing. Without it, section colors cannot be verified.
+3. Adjust padding, bgcolor, and dark-mode class per section based on the spec.
+4. Name the section_type from the spec's "type" field (thin_colored_band, alert_bar, heading, cta, columns, testimonial, image, footer, etc.).
 
 ## GOLD STANDARD: CTA BUTTON
 Every CTA button MUST follow this exact pattern (substitute values from spec):
@@ -1373,7 +1682,7 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.1.3",
+    version: "5.2.0",
   });
 });
 
@@ -2287,7 +2596,7 @@ ${specs.join("\n\n")}
 
     const html_raw = stage2TextBlock.text;
 
-    // --- Post-processing (v5.1.1): deterministic fix-ups ---
+    // --- Post-processing (v5.2.0): deterministic fix-ups ---
     // Log imageUrlMap state BEFORE post-process so we can see what's actually available
     log("info", "Pre-post-process state check", {
       requestId: req.id,
@@ -2302,16 +2611,21 @@ ${specs.join("\n\n")}
     const postProcessResult = postProcessHtml(html_raw, {
       imageUrlMap,
       palette: designSpec?._palette || [],
+      bandMap: designSpec?._band_map || [],
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.1.1)", {
+    log("info", "Post-processing complete (v5.2.0)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
+      sectionColorsRebound: postProcessResult.report.rebindSectionColors?.rebound,
+      sectionColorsChecked: postProcessResult.report.rebindSectionColors?.checked,
       nearWhiteNormalizedCount: postProcessResult.report.nearWhite.count,
       nearWhiteColors: postProcessResult.report.nearWhite.normalizedColors,
-      alertBarFixes: postProcessResult.report.alertBar.fixes,
+      alertBarWarmBgFixes: postProcessResult.report.alertBarWarmBg?.fixes,
+      alertBarContrastFixes: postProcessResult.report.alertBar.fixes,
+      universalContrastFixes: postProcessResult.report.universalContrast?.fixes,
       activityFeedFixes: postProcessResult.report.activityFeed.fixes,
       thinBandsRemoved: postProcessResult.report.thinBands.removed,
       finalRelativePaths: (html.match(/src="images\/[^"]+"/g) || []).length,
@@ -2576,7 +2890,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.1.3",
+    version: "5.2.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
