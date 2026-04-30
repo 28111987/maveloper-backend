@@ -2007,61 +2007,66 @@ N. THIN BAND CAUTION (v5.4.0)
    When in doubt, OMIT the thin band rather than fabricate one.
 
 ========================================
-SCHEMA
-========================================
+SCHEMA — output a JSON object with these fields. ALL fields are OPTIONAL except "width", "sections" (with at least one section). Use the keys you need; omit ones that don't apply. NEVER output placeholder strings like "<exact hex>" or "<number>" — always output real values OR omit the key.
+
+EXAMPLE STRUCTURE (substitute real measured values for the design you are analyzing):
+
 {
-  "width": <developer-specified width>,
-  "font_body": "<developer-specified primary font>",
-  "font_heading": "<developer-specified secondary font, if any, else same as body>",
-  "band_count": <total bands from BAND MAP>,
+  "width": 600,
+  "font_body": "PrimaryFont",
+  "font_heading": "PrimaryFont",
+  "band_count": 16,
   "sections": [
     {
       "n": 1,
-      "type": "thin_colored_band|preheader|nav|logo|hero_image|alert_bar|heading|body_text|cta|columns|divider|spacer|testimonial|image|phone_bar|closing_cta|bullet_list|footer|disclaimer|social|card",
-      "bg": "#<exact hex from palette>",
-      "pad": "T R B L",
-      "align": "left|center|right",
+      "type": "preheader",
+      "bg": "#FFFFFF",
+      "pad": "10 20 10 20",
+      "align": "center",
       "dark_variant": false,
-      "y_start": <pixel y from band map — approximate if merging bands>,
-      "y_end": <pixel y>,
-      "container": {
-        "card_bg": "#<hex if section is a card>",
-        "card_border": "#<hex if border visible>",
-        "card_border_width": 1,
-        "card_radius": 8,
-        "card_pad": "T R B L"
-      },
+      "y_start": 0,
+      "y_end": 70,
       "content": [
-        {
-          "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list|card",
-          "text": "<verbatim from OCR>",
-          "spans": [{ "text": "...", "color": "#hex" }],
-          "size": 16, "weight": 400, "lh": 24,
-          "color": "#hex", "align": "left|center|right", "transform": "uppercase",
-          "letter_spacing": 0,
-          "src": "<Dropbox URL>", "alt": "<description>", "width": <number>, "height": <number>,
-          "cta_bg": "#hex", "cta_color": "#hex", "cta_radius": 8,
-          "cta_h": 48, "cta_size": 16, "cta_weight": 500, "cta_pad": 32,
-          "cta_text": "<button label>",
-          "cta_border_color": "#hex if outlined button",
-          "cta_border_width": 1,
-          "bullets": ["item 1", "item 2"],
-          "cols": [ { "w": "50%", "content": [] } ],
-          "card_bg": "#hex",
-          "card_border": "#hex",
-          "card_border_width": 1,
-          "card_radius": 8,
-          "card_pad": "T R B L"
-        }
+        { "el": "text", "text": "If you can't see this email", "size": 12, "weight": 300, "lh": 15, "color": "#3D3D3D", "align": "left" },
+        { "el": "link", "text": "View Online", "size": 12, "weight": 400, "lh": 15, "color": "#AABBCC", "align": "right", "href": "{{view_as_page_url}}" }
       ]
     }
   ],
-  "palette_used": ["#hex1", "#hex2", "..."]
+  "palette_used": ["#FFFFFF", "#000000", "#AABBCC"]
 }
 
-NOTE on cta_radius default: there is NO default. Set to whatever the design visibly shows. Common values: 4, 6, 8, 12, 16, 24, 30. Do NOT default to 30 unless the button is a true pill shape.
-NOTE on cta_h default: there is NO default. Common heights: 38, 40, 44, 46, 48, 50.
-NOTE on outlined buttons: when a CTA has a visible border around it (typically white-bg button with dark outline, or the secondary CTA pattern), set cta_border_color and cta_border_width.
+ALLOWED section types: thin_colored_band, preheader, nav, logo, hero_image, alert_bar, heading, body_text, cta, columns, divider, spacer, testimonial, image, phone_bar, closing_cta, bullet_list, footer, disclaimer, social, card
+
+ALLOWED content[].el types: text, image, cta, divider, spacer, link, social_icons, columns, bullet_list, card
+
+CONTENT FIELDS BY ELEMENT TYPE:
+- text/heading/body: text, spans (optional, array of {text, color}), size, weight, lh, color, align, transform, letter_spacing
+- image: src, alt, width, height, align
+- cta: cta_text, cta_bg, cta_color, cta_radius, cta_h, cta_size, cta_weight, cta_pad, cta_border_color (optional), cta_border_width (optional), align
+- bullet_list: bullets (array of strings)
+- columns: cols (array of {w: "50%", content: [...]})
+- social_icons: icons (array of {platform: "facebook", url: "#"})
+- divider/spacer: height, color (for divider only)
+
+CARD CONTAINER FIELDS (apply to a content element OR to section.container):
+- card_bg: "#hex"
+- card_border: "#hex" or null
+- card_border_width: number (1-3 typical)
+- card_radius: number (8 typical)
+- card_pad: "T R B L"
+- For card on content[]: also include "el": "card" and "content": [ ... nested elements ... ]
+
+NOTE on cta_radius: there is NO default. Common values: 4, 6, 8, 12, 16, 24, 30. Do NOT default to 30 unless the button is a true pill shape.
+NOTE on cta_h: there is NO default. Common heights: 38, 40, 44, 46, 48, 50.
+
+CRITICAL JSON FORMATTING RULES:
+- Output a SINGLE valid JSON object. No comments. No trailing commas.
+- Every string value must be properly quoted with " and have its closing quote.
+- Every URL value must NOT contain unescaped quotes — escape them with \".
+- All hex colors are 6-character with # prefix: "#1A2B3C" not "1A2B3C" or "#1A2".
+- Numbers do NOT have units: "size": 16 not "size": "16px".
+- Boolean values: true or false (lowercase, no quotes).
+- Validate your JSON mentally before outputting — count opening { vs closing }, opening [ vs closing ].
 
 ========================================
 FINAL CHECKLIST (run before outputting)
@@ -2653,7 +2658,7 @@ app.get("/health", (req, res) => {
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.0",
+    version: "5.4.1",
   });
 });
 
@@ -3351,21 +3356,97 @@ Now analyze the attached design image and produce the JSON specification per the
           outputTokens: stage1Message.usage?.output_tokens,
         });
       } catch (secondErr) {
-        log("error", "Stage 1 JSON parse error (repair also failed)", {
+        // v5.4.1: Last-resort retry — ask Claude to regenerate cleanly with the
+        // parse error as context. This catches mid-string syntax errors that
+        // truncation-repair cannot fix.
+        log("warn", "Stage 1 JSON parse failed, attempting clean-regenerate retry", {
           requestId: req.id,
-          error: firstErr.message,
-          repairError: secondErr.message,
+          firstErr: firstErr.message,
+          repairErr: secondErr.message,
           stopReason: stage1Message.stop_reason,
           outputTokens: stage1Message.usage?.output_tokens,
-          rawLength: rawJson.length,
-          preview: rawJson.slice(0, 500),
-          tail: rawJson.slice(-500),
         });
-        return res.status(502).json({
-          error: "Design analysis failed",
-          details: "Claude's JSON output was malformed. Please try again.",
-          requestId: req.id,
-        });
+
+        const retryUserContent = [
+          ...stage1ImageBlocks,
+          { type: "text", text: stage1UserPrompt },
+          {
+            type: "text",
+            text:
+              "Your previous response was not valid JSON. The parser reported: " +
+              firstErr.message +
+              "\n\nCommon causes: missing closing quote on a string value, trailing comma before } or ], unescaped quote inside a string, partial object at the end. Please regenerate the COMPLETE JSON specification cleanly. Output ONLY the JSON object. Validate every quote, comma, bracket, and brace before outputting. Do not include the previous broken output. Do not include any explanation. Output ONLY a single valid JSON object starting with { and ending with }.",
+          },
+        ];
+
+        let retryMessage = null;
+        try {
+          retryMessage = await anthropic.messages.create({
+            model: CLAUDE_MODEL,
+            max_tokens: 32000,
+            system: STAGE1_PROMPT,
+            messages: [{ role: "user", content: retryUserContent }],
+          });
+        } catch (retryApiErr) {
+          log("error", "Stage 1 clean-regenerate API call failed", {
+            requestId: req.id,
+            error: retryApiErr.message,
+          });
+        }
+
+        const retryTextBlock = retryMessage?.content?.find((b) => b.type === "text");
+        let retryRaw = retryTextBlock?.text?.trim() ?? "";
+        retryRaw = retryRaw
+          .replace(/^```(?:json)?\s*\n?/, "")
+          .replace(/\n?```\s*$/, "")
+          .trim();
+        const retryFirstBrace = retryRaw.indexOf("{");
+        const retryLastBrace = retryRaw.lastIndexOf("}");
+        const retryCandidate =
+          retryFirstBrace !== -1
+            ? retryLastBrace > retryFirstBrace
+              ? retryRaw.substring(retryFirstBrace, retryLastBrace + 1)
+              : retryRaw.substring(retryFirstBrace)
+            : "";
+
+        if (retryCandidate) {
+          try {
+            designSpec = JSON.parse(retryCandidate);
+            log("warn", "Stage 1 clean-regenerate succeeded on retry", {
+              requestId: req.id,
+              retryOutputTokens: retryMessage.usage?.output_tokens,
+            });
+          } catch (retryParseErr) {
+            // Last-ditch repair on retry
+            try {
+              const retryRepaired = autoRepairJson(retryRaw.substring(retryFirstBrace));
+              designSpec = JSON.parse(retryRepaired);
+              log("warn", "Stage 1 clean-regenerate succeeded after auto-repair", {
+                requestId: req.id,
+              });
+            } catch {
+              // give up and fall through
+            }
+          }
+        }
+
+        if (!designSpec) {
+          log("error", "Stage 1 JSON parse error (all retries exhausted)", {
+            requestId: req.id,
+            error: firstErr.message,
+            repairError: secondErr.message,
+            stopReason: stage1Message.stop_reason,
+            outputTokens: stage1Message.usage?.output_tokens,
+            rawLength: rawJson.length,
+            preview: rawJson.slice(0, 500),
+            tail: rawJson.slice(-500),
+          });
+          return res.status(502).json({
+            error: "Design analysis failed",
+            details: "Claude's JSON output was malformed. Please try again.",
+            requestId: req.id,
+          });
+        }
       }
     }
 
@@ -3891,7 +3972,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.0",
+    version: "5.4.1",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
