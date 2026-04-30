@@ -1,6 +1,6 @@
 {
   "name": "maveloper-backend",
-  "version": "5.4.0",
+  "version": "5.4.1",
   "description": "Maveloper backend — PDF to HTML email code generator using Claude Vision + Supabase auth",
   "type": "module",
   "main": "server.js",
