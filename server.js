@@ -808,14 +808,29 @@ function fixActivityFeed(html) {
  *
  * A thin_colored_band whose color satisfies neither is dropped as noise.
  */
-function fixThinBands(html, palette) {
+function fixThinBands(html, palette, bandMap) {
   // Step 1: collect bgcolors used on REAL content sections (not thin-band-only sections).
   // Strategy: iterate over thin_colored_band SECTION comment blocks and capture
   // their bgcolors as "thin-only colors". Any color that appears as bgcolor
   // ONLY inside thin_colored_band sections is hallucinated noise; any color
   // that also appears elsewhere is a real design color.
   //
+  // v5.4.0: Also reject bands flagged as "is_likely_artifact" by the band
+  // detector (thin + low coverage + low saturation). These are JPEG compression
+  // artifacts at section boundaries, not real design elements — even if their
+  // color happens to overlap with a real palette color.
+  //
   // This avoids the nested <tr> regex problem entirely.
+
+  // Build a y-range -> artifact lookup from the band map
+  const artifactColors = new Set();
+  if (Array.isArray(bandMap)) {
+    for (const b of bandMap) {
+      if (b.is_likely_artifact) {
+        artifactColors.add((b.bg_hex || "").toUpperCase());
+      }
+    }
+  }
 
   const thinBandSectionRegex = /<!--\s*Section[^>]*thin[_ ]colored[_ ]band[^>]*-->[\s\S]*?<!--\s*\/\/[^>]*-->/gi;
   const thinBandColors = new Set();
@@ -847,12 +862,19 @@ function fixThinBands(html, palette) {
   let removed = 0;
 
   // Re-scan and remove thin bands whose bgcolor is NOT a real design color
+  // OR which are flagged as likely artifacts by the band detector
   const thinBandRemoveRegex = /<!--\s*Section[^>]*thin[_ ]colored[_ ]band[^>]*-->[\s\S]*?<!--\s*\/\/[^>]*-->\s*/gi;
 
   output = output.replace(thinBandRemoveRegex, (block) => {
     const bgMatch = block.match(/bgcolor\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/i);
     if (!bgMatch) return block;
     const bg = bgMatch[1].toUpperCase();
+
+    // v5.4.0: Drop if band detector flagged this color as a likely artifact
+    if (artifactColors.has(bg)) {
+      removed++;
+      return "";
+    }
 
     // Trust if this color appears elsewhere as a real section bg
     if (realBgColors.has(bg)) return block;
@@ -1837,7 +1859,7 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
   html = r7.html;
   report.activityFeed = { fixes: r7.fixes };
 
-  const r8 = fixThinBands(html, palette);
+  const r8 = fixThinBands(html, palette, bandMap);
   html = r8.html;
   report.thinBands = { removed: r8.removed };
 
@@ -1918,6 +1940,72 @@ G. ALIGNMENT
 H. REPEATED VARIANTS
    If the design shows the same content twice (e.g., dark-variant preheader + light-variant preheader, intentional), output both as separate sections.
 
+I. TYPOGRAPHY MEASUREMENT (v5.4.0 — pixel-grounded measurement, not estimation)
+   When you assign a "size" (font-size) to a text element, measure it from the actual pixel rendering in the tile, not from intuition. Use this method:
+   - Identify a representative uppercase letter (or "x" for lowercase-only words) in the text
+   - Visually measure its CAP-HEIGHT (top of capital letter to baseline) in pixels
+   - font-size ≈ cap-height ÷ 0.7 (cap-height is roughly 70% of font-size for most fonts)
+   - For line-height ("lh"): measure the vertical distance from baseline to baseline of two consecutive lines
+   COMMON BENCHMARKS to ground your measurements:
+   - Body copy at 14px ≈ 10px cap-height
+   - Body copy at 16px ≈ 11-12px cap-height
+   - Body copy at 18px ≈ 13px cap-height
+   - Section heading at 24px ≈ 17px cap-height
+   - Section heading at 28px ≈ 20px cap-height
+   - Hero heading at 36px ≈ 25px cap-height
+   - Hero heading at 46px ≈ 32px cap-height
+   IF YOU ARE UNSURE BETWEEN TWO SIZES, PICK THE LARGER. Designers rarely use tiny text. Hero headlines are commonly 32-50px, NOT 24-28px. Section headings are commonly 24-32px, NOT 18-20px. Body copy is commonly 14-18px.
+   NEVER default a hero headline to 28px without measuring. NEVER default body copy to 14px without measuring.
+
+J. BODY TEXT COLOR — never pure black unless explicitly black
+   Body copy and paragraph text in modern email designs is RARELY pure #000000. It's usually a dark gray.
+   When extracting "color" for body text or paragraphs, scan the palette for the darkest non-pure-black gray that exists, and use THAT instead of defaulting to #000000.
+   Pure #000000 is acceptable ONLY for: section headings if the design clearly uses pure black, footer copyright text on a colored bg, or text-on-light backgrounds where the palette has pure black.
+   If the palette contains a near-black tint, that IS the body text color — use it verbatim, do not collapse to #000000.
+
+K. BORDER-RADIUS DETECTION (v5.4.0 — measure, don't default to pill)
+   For every CTA button and card container, measure the corner radius visually.
+   COMMON RADII in modern email design: 4px, 6px, 8px, 12px, 16px, 24px, 30px (pill).
+   "Pill" radius (≥ 20px) only when the corner curvature visibly equals or exceeds half the button height — i.e., the corners are fully rounded and the sides are straight semicircles.
+   Slightly-rounded buttons (where you can clearly see straight edges in the corners) are typically 4px–12px, NOT 30px.
+   When unsure, measure the visible curvature: a corner that consumes less than 1/4 of the button height is a small radius (4-8px), not pill.
+   DO NOT default to "cta_radius": 30. Inspect every button and pick the actual radius.
+   Apply the same logic to card containers (testimonial cards, feature cards, closing CTA cards, etc.) — they typically use 8px radii, occasionally 12-16px.
+
+L. CARD CONTAINERS (v5.4.0 — detect bordered/colored sub-containers)
+   When a section's content is visually contained inside a SUB-CONTAINER that has its own border, background color, or rounded corners (e.g., a testimonial inside a bordered rounded card, or a "ready to add Flows?" CTA inside a light-purple rounded card), this is a CARD CONTAINER and must be represented in the spec.
+   Use the "card" property on a content element OR add a "container" object on the content array level. Recommended schema: add a "card" object to the content element that visually contains the card's children:
+   {
+     "el": "card",
+     "card_bg": "#<exact hex from palette, e.g. a light tinted shade>",
+     "card_border": "#<exact hex if visible border, else null>",
+     "card_border_width": 1,
+     "card_radius": 8,
+     "card_pad": "T R B L",
+     "content": [ <nested content elements like text, cta, image> ]
+   }
+   Alternatively, set "container" at the section level if the entire section is a card.
+   Detection cues:
+   - Visible 1-2px outlined border in any brand/accent color
+   - Subtle bg tint (e.g., a light tinted shade) different from the section bg
+   - Visible rounded corners on the inner block
+
+M. FOOTER MULTI-COLUMN DETECTION (v5.4.0)
+   Footers in modern email design are commonly TWO-COLUMN: logo + social icons on the LEFT, contact info / address / "Follow us on:" on the RIGHT (or vice versa). Single-column centered footers exist but are LESS common.
+   When detecting a footer section:
+   - If the design shows logo and contact info side-by-side (one on left, one on right), output a "columns" content element with two cols.
+   - If a horizontal divider/line separates the upper logo+social+contact group from the lower legal links (Privacy/Email/Unsubscribe), include the divider explicitly.
+   - The legal links bar at the bottom is typically a SINGLE row with separator pipes "|" between links.
+   - Footer body text on a brand-colored bg is typically a light tint of that brand color, NOT pure white.
+
+N. THIN BAND CAUTION (v5.4.0)
+   The BAND MAP may contain entries for very thin (≤ 4px) bands of unique colors that DO NOT appear elsewhere in the design. These are likely JPEG compression artifacts at section transitions, NOT intentional design elements.
+   Before adding a "thin_colored_band" section, verify visually in the tile image:
+   - Does the thin band appear as a clear, intentional horizontal stripe in the design?
+   - Is the band's color repeated elsewhere in the design (in headings, CTAs, accents)? If yes, it's likely real.
+   - Is the band's color a unique tint that appears nowhere else? If yes, it's likely a JPEG artifact — DO NOT include it as a section.
+   When in doubt, OMIT the thin band rather than fabricate one.
+
 ========================================
 SCHEMA
 ========================================
@@ -1929,32 +2017,51 @@ SCHEMA
   "sections": [
     {
       "n": 1,
-      "type": "thin_colored_band|preheader|nav|logo|hero_image|alert_bar|heading|body_text|cta|columns|divider|spacer|testimonial|image|phone_bar|closing_cta|bullet_list|footer|disclaimer|social",
+      "type": "thin_colored_band|preheader|nav|logo|hero_image|alert_bar|heading|body_text|cta|columns|divider|spacer|testimonial|image|phone_bar|closing_cta|bullet_list|footer|disclaimer|social|card",
       "bg": "#<exact hex from palette>",
       "pad": "T R B L",
       "align": "left|center|right",
       "dark_variant": false,
       "y_start": <pixel y from band map — approximate if merging bands>,
       "y_end": <pixel y>,
+      "container": {
+        "card_bg": "#<hex if section is a card>",
+        "card_border": "#<hex if border visible>",
+        "card_border_width": 1,
+        "card_radius": 8,
+        "card_pad": "T R B L"
+      },
       "content": [
         {
-          "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list",
+          "el": "text|image|cta|divider|spacer|link|social_icons|columns|bullet_list|card",
           "text": "<verbatim from OCR>",
           "spans": [{ "text": "...", "color": "#hex" }],
           "size": 16, "weight": 400, "lh": 24,
           "color": "#hex", "align": "left|center|right", "transform": "uppercase",
+          "letter_spacing": 0,
           "src": "<Dropbox URL>", "alt": "<description>", "width": <number>, "height": <number>,
-          "cta_bg": "#hex", "cta_color": "#hex", "cta_radius": 30,
-          "cta_h": 50, "cta_size": 16, "cta_weight": 700, "cta_pad": 30,
+          "cta_bg": "#hex", "cta_color": "#hex", "cta_radius": 8,
+          "cta_h": 48, "cta_size": 16, "cta_weight": 500, "cta_pad": 32,
           "cta_text": "<button label>",
+          "cta_border_color": "#hex if outlined button",
+          "cta_border_width": 1,
           "bullets": ["item 1", "item 2"],
-          "cols": [ { "w": "50%", "content": [] } ]
+          "cols": [ { "w": "50%", "content": [] } ],
+          "card_bg": "#hex",
+          "card_border": "#hex",
+          "card_border_width": 1,
+          "card_radius": 8,
+          "card_pad": "T R B L"
         }
       ]
     }
   ],
   "palette_used": ["#hex1", "#hex2", "..."]
 }
+
+NOTE on cta_radius default: there is NO default. Set to whatever the design visibly shows. Common values: 4, 6, 8, 12, 16, 24, 30. Do NOT default to 30 unless the button is a true pill shape.
+NOTE on cta_h default: there is NO default. Common heights: 38, 40, 44, 46, 48, 50.
+NOTE on outlined buttons: when a CTA has a visible border around it (typically white-bg button with dark outline, or the secondary CTA pattern), set cta_border_color and cta_border_width.
 
 ========================================
 FINAL CHECKLIST (run before outputting)
@@ -1965,9 +2072,15 @@ FINAL CHECKLIST (run before outputting)
 - Every image has a src that is a Dropbox URL from the assets list (or empty if no match)?
 - Every text element has an "align" field matching the visible alignment?
 - Multi-color inline headings use "spans" (not duplicated rows)?
-- Colored stripes >= 2px in the band map have a thin_colored_band section?
+- Colored stripes >= 5px in the band map have a thin_colored_band section (skip thinner ones unless clearly visible AND color used elsewhere)?
 - No fake hallucinated sections not visible in the design image?
 - SECTION GROUPING: Adjacent paragraphs of body copy or headings on the SAME background color MUST be grouped into a SINGLE section with multiple content[] entries. Create a NEW section boundary ONLY when one of these changes: (a) background color, (b) section semantic type (e.g. body→cta, heading→image), or (c) a visible horizontal divider in the design. NEVER split a continuous body copy paragraph group into separate body_text sections.
+- TYPOGRAPHY: did you measure cap-heights against the benchmarks (rule I)? If a hero heading visually fills 30+ pixels of cap-height, it's at least 40px font-size, NOT 28px.
+- BODY COLOR: did you pick the darkest non-pure-black gray from the palette (rule J)? If palette has a near-black tint, body text is THAT, not #000000.
+- BORDER-RADIUS: did you measure each CTA's corner curvature (rule K)? Default of 30 is FORBIDDEN — measure each one.
+- CARDS: did you check for bordered/colored sub-containers (rule L) and add card properties?
+- FOOTER: if 2-column layout (rule M), use "columns" content with cols, not stacked rows.
+- THIN BANDS: did you verify each thin band is real (rule N) and not a JPEG artifact?
 `;
 
 // =====================================================================
@@ -2017,6 +2130,9 @@ NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the h
 4. Output sections in the EXACT order from the spec. Do NOT rearrange, merge, or skip sections.
 5. Every element goes in a <td> with inline styles. NEVER use <p>, <h1>-<h6>, or <div> (except the hidden preheader div and <ul>/<li> inside bullet_list sections).
 6. TEXT ALIGNMENT — RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. NEVER default to "left" when the spec says otherwise.
+7. CTA BORDER-RADIUS — Use spec.content[].cta_radius VERBATIM. Do NOT default to 30px (pill). Common values: 4, 6, 8, 12, 16, 24, 30. If spec says cta_radius is 8, output 8px. NEVER substitute 30px when the spec says otherwise.
+8. CARD CONTAINERS (v5.4.0) — When a content element has "card_bg", "card_border", "card_radius", or "card_pad", OR when a content element has el="card", OR when section.container is set, render those properties as a wrapping <td> with bgcolor + border + border-radius + padding. See "GOLD STANDARD: CARD CONTAINER" below.
+9. FONT STACK HYGIENE — Use spec.font_body as primary font followed by Arial as fallback in the form: font-family: 'PRIMARY_FONT', Arial, sans-serif. Do NOT include spec.font_heading (the secondary font) in the body stack unless the spec EXPLICITLY uses it for that element. Secondary fonts should ONLY be loaded via Google Fonts <link> tag and used in elements that explicitly call for them.
 
 ## GOLD STANDARD: SECTION WRAPPER PATTERN
 Every section MUST follow this exact wrapper pattern — each section is an independent table block:
@@ -2052,18 +2168,30 @@ Every CTA button MUST follow this exact pattern (substitute values from spec):
   </tr>
 </table>
 
+## OUTLINED CTA BUTTON (white-bg with dark border, e.g. secondary "Learn more")
+When spec.content[].cta_border_color is set, the button has a visible outlined border. Render with the border on the wrapper table:
+
+<table align="center" bgcolor="#CTA_BG_HEX" border="0" cellspacing="0" cellpadding="0" style="background-color:#CTA_BG_HEX; border-radius: [SPEC_RADIUS]px; border: [SPEC_BORDER_WIDTH]px solid #SPEC_BORDER_COLOR;" class="em_border">
+  <tr>
+    <td class="em_defaultlink em_dm_txt_white" align="center" valign="middle" height="[SPEC_HEIGHT]" style="font-size: [SPEC_SIZE]px; font-family: 'FONT_STACK'; font-weight:[SPEC_WEIGHT]; color: #CTA_TEXT_HEX; height:[SPEC_HEIGHT]px; padding:0px [SPEC_PAD]px;"><a href="#" target="_blank" style="text-decoration:none; color:#CTA_TEXT_HEX; line-height:[SPEC_HEIGHT]px; display:block;">CTA TEXT</a></td>
+  </tr>
+</table>
+
 MANDATORY CTA PROPERTIES — ALL values come from the spec, never from defaults:
 - bgcolor + background-color: EXACT value from spec.cta_bg — NEVER substitute #000000 or a guess
-- color (text): EXACT value from spec.cta_color — usually #FFFFFF but not always
-- border-radius: spec value — commonly 4px, 6px, 8px, 25px, 30px (pill-shape). NEVER assume one default.
-- height: spec value — commonly 38px, 40px, 44px, 45px, 50px
-- font-size: spec value — commonly 13px, 14px, 15px, 16px, 18px
-- font-weight: spec value — commonly 400, 600, or 700
-- padding: spec value — horizontal padding varies widely
+- color (text): EXACT value from spec.cta_color — usually #FFFFFF on filled, often dark on outlined
+- border-radius: spec.cta_radius value VERBATIM — NEVER default to 30px. Common values: 4, 6, 8, 12, 16, 24, 30. If spec says 8, output 8px. PILL (30px) is ONLY when spec says 30 AND the design clearly shows full-pill curvature.
+- height: spec.cta_h value — commonly 38px, 40px, 44px, 46px, 48px, 50px
+- font-size: spec.cta_size value — commonly 13px, 14px, 15px, 16px, 18px
+- font-weight: spec.cta_weight value — commonly 400, 500, 600, or 700 (do NOT default to 700)
+- padding: spec.cta_pad value — horizontal padding varies widely
+- border (outlined buttons only): from spec.cta_border_color + spec.cta_border_width
 - class="em_border" on the table (for dark mode border)
 - class="em_defaultlink" on the td
 - align="left" on the table for left-aligned CTAs, align="center" for centered
 - For centered CTA: wrap in a <td align="center"> parent
+
+CRITICAL: For an outlined CTA (cta_border_color is set), the BORDER goes on the wrapper TABLE's style, AND the TD inside should NOT have any border. The bgcolor on outlined buttons is typically white (#FFFFFF) with border-color being dark (e.g., #000000) or brand-colored.
 
 ## GOLD STANDARD: SECTION HEADING
 Section headings use <td>, NOT <h1>-<h6>. ALL values from spec:
@@ -2115,21 +2243,105 @@ Testimonial cards with rounded corners and bg color from spec:
     </tbody>
   </table></td>
 
-## GOLD STANDARD: COLORED CARD (e.g., case study, feature callout)
-Cards with a solid bg color and contrasting text. Use spec values for bg + text color:
+## GOLD STANDARD: CARD CONTAINER (v5.4.0 — for card_bg / card_border / card_radius)
+When the spec has card properties (either at section.container OR on a content[] element with el="card" OR with card_bg/card_border/card_radius set), wrap the inner content in a <td> that carries the card properties. The card sits INSIDE the section's outer wrapper, NOT replacing it.
 
-<td align="center" valign="top" bgcolor="#CARD_BG_HEX" style="padding: [SPEC_PAD]; border-radius: [SPEC_RADIUS]px;"><table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
-    <tbody>
+Pattern for a content[].card or el="card":
+<tr>
+  <td align="center" valign="top" style="padding: [SECTION_PAD];" class="em_pad2"><table width="100%" border="0" cellspacing="0" cellpadding="0" align="center" style="border: [CARD_BW]px solid #CARD_BORDER_HEX; border-radius: [CARD_RADIUS]px;" bgcolor="#CARD_BG_HEX" class="em_dark">
       <tr>
-        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_ON_CARD_HEX; font-weight: 400; padding-bottom: [SPEC_PB]px;"><span style="font-weight: 600;">[ATTRIBUTION]</span> <br />[HEADLINE FROM SPEC]</td>
+        <td align="center" valign="top" style="padding: [CARD_PAD];" class="em_aside15"><table width="100%" border="0" cellspacing="0" cellpadding="0" align="center">
+            <!-- nested content here -->
+          </table></td>
       </tr>
-      <tr>
-        <td align="left" valign="top" class="em_defaultlink em_dm_txt_white" style="font-family: 'FONT_STACK'; font-size:[SPEC_SIZE]px; line-height:[SPEC_LH]px; color: #TEXT_ON_CARD_HEX; font-weight: 400;">[BODY TEXT FROM SPEC]</td>
-      </tr>
-    </tbody>
-  </table></td>
+    </table></td>
+</tr>
 
-## GOLD STANDARD: FOOTER
+Pattern when section.container is set (entire section is a card):
+The same pattern, where the OUTER em_wrapper td has the card border + radius + bg.
+
+CRITICAL CARD RULES:
+- If the spec has card_bg, card_border, card_radius, or card_pad — these MUST be rendered. NEVER drop card properties.
+- The bordered/rounded/colored card structure is what visually distinguishes testimonial cards, "Ready to..." closing-CTA cards, feature cards, etc.
+- The card's inner padding is SEPARATE from the section's outer padding. Apply both.
+- When card_border is null but card_bg is set, render bgcolor + border-radius without border.
+- When card_border is set but card_bg is null, render border + border-radius on transparent/white bg.
+
+EXAMPLE — Testimonial card (accent-bordered rounded white card):
+spec.section.content[0] = {
+  "el": "card",
+  "card_bg": "#FFFFFF",
+  "card_border": "#ACCENT_HEX",
+  "card_border_width": 1,
+  "card_radius": 8,
+  "card_pad": "30 30 30 30",
+  "content": [
+    { "el": "image", "src": "logo.png", "width": 182 },
+    { "el": "text", "text": "...quote...", "size": 18, "lh": 30, "color": "#BODY_TEXT_HEX", "align": "center" },
+    { "el": "text", "text": "- Author Name", "size": 16, "color": "#ACCENT_HEX", "align": "center", "weight": 500 }
+  ]
+}
+
+Output (substitute spec values verbatim):
+<tr>
+  <td align="center" valign="top" style="padding: 0px 50px 50px;" class="em_pad2"><table width="100%" border="0" cellspacing="0" cellpadding="0" align="center" style="border: 1px solid #ACCENT_HEX; border-radius: 8px;" bgcolor="#FFFFFF" class="em_dark">
+      <tr>
+        <td align="center" valign="top" style="padding: 30px 30px;" class="em_aside15"><table width="100%" border="0" cellspacing="0" cellpadding="0" align="center">
+            <tr><td align="center" valign="top"><img ... /></td></tr>
+            <tr><td align="center" valign="top" style="font-family:..., font-size: 18px; line-height: 30px; color: #BODY_TEXT_HEX;">...quote...</td></tr>
+            <tr><td align="center" valign="top" style="font-family:..., font-size: 16px; color: #ACCENT_HEX; font-weight: 500;">- Author Name</td></tr>
+          </table></td>
+      </tr>
+    </table></td>
+</tr>
+
+EXAMPLE — Closing CTA card (light-tinted bg rounded):
+spec.section.container = { "card_bg": "#CARD_BG_HEX", "card_border": null, "card_radius": 8, "card_pad": "30 25 30 25" }
+This renders the entire section as a card with the spec'd light-tint bg + 8px radius.
+
+## GOLD STANDARD: FOOTER (v5.4.0 — supports 2-column layouts)
+
+When the spec's footer section uses a "columns" content element, render with the Mavlers dir="rtl" two-column trick. The dir-rtl trick swaps display order on small screens for proper stacking.
+
+PATTERN — Two-column footer (logo+social on LEFT, contact on RIGHT):
+<table dir="rtl" width="100%" border="0" cellspacing="0" cellpadding="0">
+  <tbody>
+    <tr>
+      <!-- LEFT column (in dir-rtl, this comes second in source but renders first visually) -->
+      <td align="left" valign="top" class="em_clear" dir="ltr"><table width="[COL1_W]" style="width: [COL1_W]px;" align="left" border="0" cellspacing="0" cellpadding="0">
+          <tbody>
+            <tr>
+              <td align="right" valign="top"><table align="right" class="em_wrapper" border="0" cellspacing="0" cellpadding="0">
+                  <tr><td align="left" valign="top"><a href="#" target="_blank" style="text-decoration: none;"><img src="[LOGO_URL]" width="[LOGO_W]" alt="Brand" border="0" style="display:block; max-width:[LOGO_W]px;"/></a></td></tr>
+                </table></td>
+            </tr>
+            <tr>
+              <td align="right" valign="top" class="em_defaultlink em_left" style="padding-top: 17px; font-family: 'FONT_STACK'; font-size:10px; line-height:15px; font-weight: 500; color:#TEXT_HEX; letter-spacing: 1.15px; text-transform: uppercase;">Follow us on:</td>
+            </tr>
+            <tr>
+              <td align="right" valign="top" style="padding-top: 5px;"><table border="0" cellspacing="0" cellpadding="0" align="right" class="em_wrapper">
+                  <tr>
+                    <td align="left" valign="top"><a href="#"><img src="[ICON_URL]" width="14" alt="" border="0" style="display:block; max-width: 14px;"/></a></td>
+                    <td width="9" style="width: 9px; line-height: 0px; font-size: 0px;"></td>
+                    <!-- more icons -->
+                  </tr>
+                </table></td>
+            </tr>
+          </tbody>
+        </table></td>
+      <td width="[GUTTER_W]" style="width: [GUTTER_W]px;" class="em_clear em_hide"><img alt="" src="images/spacer.gif" height="1" width="1" style="display:block;" border="0" /></td>
+      <!-- RIGHT column (renders second visually) -->
+      <td align="left" valign="top" class="em_clear" dir="ltr"><table width="[COL2_W]" style="width: [COL2_W]px;" align="left" border="0" cellspacing="0" cellpadding="0">
+          <tbody>
+            <tr><td align="left" valign="top" class="em_defaultlink em_ptop" style="font-family: 'FONT_STACK'; font-size:10px; line-height:15px; font-weight: 500; color:#TEXT_HEX; text-transform: uppercase; text-decoration: underline;"><a href="#" target="_blank" style="text-decoration: underline; color:#TEXT_HEX;">Contact us</a></td></tr>
+            <tr><td align="left" valign="top" class="em_defaultlink em_ptop" style="padding-top: 22px; font-family: 'FONT_STACK'; font-size:10px; line-height:16px; font-weight: 500; color:#TEXT_HEX; text-transform: uppercase;">[ADDRESS LINE FROM SPEC]</td></tr>
+          </tbody>
+        </table></td>
+    </tr>
+  </tbody>
+</table>
+
+PATTERN — Single-column footer (centered):
 Footer has logo-left + social-icons-right in ONE row, then links row, then copyright bar:
 
 <!-- Footer row 1: Logo + Social Icons -->
@@ -2441,7 +2653,7 @@ app.get("/health", (req, res) => {
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.3.0",
+    version: "5.4.0",
   });
 });
 
@@ -3679,7 +3891,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.3.0",
+    version: "5.4.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
