@@ -222,15 +222,30 @@ export async function detectBands(pngBuffer) {
 
   const bands = merged.map((b, i) => {
     const h = b.y_end - b.y_start;
+    const rowCoverageRatio = b.solidRowCount / Math.max(b.totalRowCount, 1);
+    // v5.4.0: An "is_likely_artifact" flag identifies thin bands that are likely
+    // JPEG compression noise at section boundaries rather than intentional design
+    // elements. Used downstream in fixThinBands() to drop hallucinated thin bands
+    // even when their color happens to overlap with a real palette color.
+    //
+    // Heuristic: a band is likely an artifact if ALL of:
+    //   - height < 5px (very thin)
+    //   - low solid-row coverage (<= 0.5; mixed/transition rows dominate)
+    //   - color saturation is low (gray-leaning, not vivid brand color)
+    const rgb = b.rgb;
+    const sat = saturation(rgb);
+    const isLikelyArtifact = h < 5 && rowCoverageRatio <= 0.5 && sat < 50;
+
     return {
       index: i + 1,
       y_start: b.y_start,
       y_end: b.y_end,
       height: h,
-      bg_hex: rgbToHex(b.rgb[0], b.rgb[1], b.rgb[2]),
+      bg_hex: rgbToHex(rgb[0], rgb[1], rgb[2]),
       is_thin: h <= 10,
-      is_content: b.solidRowCount / Math.max(b.totalRowCount, 1) < 0.5,
-      row_coverage_ratio: b.solidRowCount / Math.max(b.totalRowCount, 1),
+      is_content: rowCoverageRatio < 0.5,
+      row_coverage_ratio: rowCoverageRatio,
+      is_likely_artifact: isLikelyArtifact,
     };
   });
 
