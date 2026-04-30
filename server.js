@@ -7,7 +7,7 @@ import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
-import path from "path";
+import path from "node:path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
@@ -47,12 +47,115 @@ const SERVER_TIMEOUT_MS = 600 * 1000;      // 10 min — must exceed Anthropic t
 const RASTERIZE_SCALE = 1.6;
 const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
+// v5.5.0 tunables — extracted from inline magic numbers
+const STAGE1_MAX_RETRIES = 3;
+const STAGE1_RETRY_INITIAL_BACKOFF_MS = 3000;
+const DROPBOX_BATCH_SIZE = 3;
+const DROPBOX_BATCH_RETRY_DELAY_MS = 2000;
+const DROPBOX_RETRY_INTERVAL_MS = 500;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 30 * 1000;
+const IMAGE_DOWNLOAD_CONCURRENCY = 5;
+const STAGE1_RETRY_API_TIMEOUT_MS = 240 * 1000;     // 4 min for clean-regenerate retry
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 180 * 1000;       // 3 min — must allow in-flight Stage 2 to finish
+
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
   "https://maveloper.lovable.app",
   "http://localhost:3000",
   "http://localhost:5173",
 ];
+
+// =====================================================================
+// MODULE-LEVEL UTILITIES (v5.5.0)
+// =====================================================================
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Strip markdown code fences and isolate the JSON object substring.
+ * Returns the candidate JSON string (between first { and last } if present),
+ * or empty string if no { is found.
+ */
+function extractJsonFromMarkdown(text) {
+  if (!text) return "";
+  const stripped = text
+    .trim()
+    .replace(/^```(?:json)?\s*\n?/, "")
+    .replace(/\n?```\s*$/, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  if (firstBrace === -1) return "";
+  const lastBrace = stripped.lastIndexOf("}");
+  return lastBrace > firstBrace
+    ? stripped.substring(firstBrace, lastBrace + 1)
+    : stripped.substring(firstBrace);
+}
+
+/**
+ * fetch() wrapped with AbortController so a hung server cannot
+ * stall the request past the configured timeout.
+ */
+async function fetchWithTimeout(url, timeoutMs = IMAGE_DOWNLOAD_TIMEOUT_MS, init = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Bounded-concurrency parallel map. Preserves input order in the output array.
+ * Used to parallelize image downloads without overwhelming the network.
+ */
+async function mapWithConcurrency(items, concurrency, asyncFn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      results[idx] = await asyncFn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Classify an Anthropic SDK error as transient (worth retrying) vs permanent.
+ * Per CLAUDE.md the SDK has maxRetries=0 by design, so this layer handles it
+ * explicitly only for the calls where retry is safe.
+ */
+function isRetriableAnthropicError(err) {
+  if (!err) return false;
+  const status = err.status;
+  if (status === 408 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+  const code = err.code || err.cause?.code;
+  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ECONNABORTED" || code === "EAI_AGAIN") {
+    return true;
+  }
+  const msg = err.message || "";
+  if (/timed out|timeout|socket hang up|network/i.test(msg)) return true;
+  return false;
+}
+
+/**
+ * Strip tokens / signed-URL query params for safer logging. Dropbox shared
+ * links carry rlkey + st tokens that grant read access.
+ */
+function redactUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url.split("?")[0];
+  }
+}
 
 // =====================================================================
 // ANTHROPIC CLIENT
@@ -248,17 +351,19 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
   const folderPath = getDropboxFolderPath(orderId);
   const imageUrlMap = {};
   const failedImages = [];
-  const BATCH_SIZE = 3;
 
-  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${BATCH_SIZE})`, { orderId });
+  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${DROPBOX_BATCH_SIZE})`, { orderId });
 
-  for (let i = 0; i < images.length; i += BATCH_SIZE) {
-    const batch = images.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < images.length; i += DROPBOX_BATCH_SIZE) {
+    const batch = images.slice(i, i + DROPBOX_BATCH_SIZE);
     const results = await Promise.allSettled(
       batch.map(async (img) => {
         const dropboxFilePath = `${folderPath}/images/${img.filename}`;
         const { directUrl, sharedUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-        logFn("info", `Dropbox URL for ${img.filename}`, { sharedUrl: sharedUrl?.substring(0, 80), directUrl: directUrl?.substring(0, 80) });
+        logFn("info", `Dropbox URL for ${img.filename}`, {
+          sharedUrl: redactUrl(sharedUrl),
+          directUrl: redactUrl(directUrl),
+        });
         return { filename: img.filename, directUrl };
       })
     );
@@ -275,8 +380,8 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
 
   // Retry failed images one at a time with a delay
   if (failedImages.length > 0) {
-    logFn("info", `Retrying ${failedImages.length} failed uploads after 2s delay`);
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    logFn("info", `Retrying ${failedImages.length} failed uploads after ${DROPBOX_BATCH_RETRY_DELAY_MS}ms delay`);
+    await sleepMs(DROPBOX_BATCH_RETRY_DELAY_MS);
 
     for (const img of failedImages) {
       try {
@@ -287,8 +392,7 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
       } catch (retryErr) {
         logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr.message });
       }
-      // Small delay between retries
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await sleepMs(DROPBOX_RETRY_INTERVAL_MS);
     }
   }
 
@@ -2649,6 +2753,7 @@ const rasterizeWithTimeout = (buffer) => Promise.race([
 // =====================================================================
 
 app.get("/health", (req, res) => {
+  // v5.5.0: do not leak the configured model name to unauthenticated callers.
   res.json({
     status: "ok",
     uptime: process.uptime(),
@@ -2656,9 +2761,8 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
-    model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.1",
+    version: "5.5.0",
   });
 });
 
@@ -2811,8 +2915,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
             error: dbxErr.message,
           });
           if (attempt < UPLOAD_ATTEMPTS) {
-            // Brief backoff before retry
-            await new Promise((r) => setTimeout(r, 2000));
+            await sleepMs(DROPBOX_BATCH_RETRY_DELAY_MS);
           }
         }
       }
@@ -3217,30 +3320,31 @@ Now analyze the attached design image and produce the JSON specification per the
       { type: "text", text: stage1UserPrompt },
     ];
 
-    // --- Step 1e: Call Claude with retry on 429 ---
-    const MAX_STAGE1_RETRIES = 3;
+    // --- Step 1e: Call Claude with retry on transient errors ---
+    // v5.5.0: prompt-caching on system message (large + stable) cuts cost and
+    // latency significantly across retries within the 5-min cache window.
+    // Retry covers 429 + 408/500/502/503/504 + network-class errors.
     let stage1Message = null;
     let stage1LastErr = null;
-    const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    for (let attempt = 0; attempt <= MAX_STAGE1_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= STAGE1_MAX_RETRIES; attempt++) {
       try {
         stage1Message = await anthropic.messages.create({
           model: CLAUDE_MODEL,
           max_tokens: 32000,
-          system: STAGE1_PROMPT,
+          system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
           messages: [{ role: "user", content: stage1UserContent }],
         });
         break; // success
       } catch (err) {
         stage1LastErr = err;
-        const is429 =
-          err?.status === 429 || (err?.message && err.message.includes("429"));
-        if (is429 && attempt < MAX_STAGE1_RETRIES) {
-          const backoffMs = 3000 * Math.pow(2, attempt);
-          log("info", `Stage 1 hit rate limit, retrying after ${backoffMs}ms`, {
+        if (isRetriableAnthropicError(err) && attempt < STAGE1_MAX_RETRIES) {
+          const backoffMs = STAGE1_RETRY_INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+          log("info", `Stage 1 transient error, retrying after ${backoffMs}ms`, {
             requestId: req.id,
             attempt: attempt + 1,
+            status: err?.status,
+            code: err?.code || err?.cause?.code,
           });
           await sleepMs(backoffMs);
           continue;
@@ -3279,14 +3383,9 @@ Now analyze the attached design image and produce the JSON specification per the
       });
     }
 
-    let rawJson = stage1TextBlock.text.trim();
-    rawJson = rawJson
-      .replace(/^```(?:json)?\s*\n?/, "")
-      .replace(/\n?```\s*$/, "")
-      .trim();
-    const firstBrace = rawJson.indexOf("{");
-    const lastBrace = rawJson.lastIndexOf("}");
-    if (firstBrace === -1) {
+    const rawJson = stage1TextBlock.text;
+    const candidateJson = extractJsonFromMarkdown(rawJson);
+    if (!candidateJson) {
       log("error", "Stage 1 returned non-JSON output", {
         requestId: req.id,
         preview: rawJson.slice(0, 300),
@@ -3337,15 +3436,12 @@ Now analyze the attached design image and produce the JSON specification per the
     }
 
     let designSpec;
-    let candidateJson = lastBrace > firstBrace
-      ? rawJson.substring(firstBrace, lastBrace + 1)
-      : rawJson.substring(firstBrace);
 
     try {
       designSpec = JSON.parse(candidateJson);
     } catch (firstErr) {
       // Try auto-repair for truncated output
-      const repaired = autoRepairJson(rawJson.substring(firstBrace));
+      const repaired = autoRepairJson(candidateJson);
       try {
         designSpec = JSON.parse(repaired);
         log("warn", "Stage 1 JSON was truncated — auto-repaired", {
@@ -3359,6 +3455,8 @@ Now analyze the attached design image and produce the JSON specification per the
         // v5.4.1: Last-resort retry — ask Claude to regenerate cleanly with the
         // parse error as context. This catches mid-string syntax errors that
         // truncation-repair cannot fix.
+        // v5.5.0: prompt-cached system, temperature=0 for determinism, dedicated
+        // AbortController timeout so a hung retry cannot block the request.
         log("warn", "Stage 1 JSON parse failed, attempting clean-regenerate retry", {
           requestId: req.id,
           firstErr: firstErr.message,
@@ -3380,36 +3478,33 @@ Now analyze the attached design image and produce the JSON specification per the
         ];
 
         let retryMessage = null;
+        const retryAbort = new AbortController();
+        const retryTimer = setTimeout(() => retryAbort.abort(), STAGE1_RETRY_API_TIMEOUT_MS);
         try {
-          retryMessage = await anthropic.messages.create({
-            model: CLAUDE_MODEL,
-            max_tokens: 32000,
-            system: STAGE1_PROMPT,
-            messages: [{ role: "user", content: retryUserContent }],
-          });
+          retryMessage = await anthropic.messages.create(
+            {
+              model: CLAUDE_MODEL,
+              max_tokens: 32000,
+              temperature: 0,
+              system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
+              messages: [{ role: "user", content: retryUserContent }],
+            },
+            { signal: retryAbort.signal }
+          );
         } catch (retryApiErr) {
           log("error", "Stage 1 clean-regenerate API call failed", {
             requestId: req.id,
             error: retryApiErr.message,
+            aborted: retryAbort.signal.aborted,
           });
+        } finally {
+          clearTimeout(retryTimer);
         }
 
         const retryTextBlock = retryMessage?.content?.find((b) => b.type === "text");
-        let retryRaw = retryTextBlock?.text?.trim() ?? "";
-        retryRaw = retryRaw
-          .replace(/^```(?:json)?\s*\n?/, "")
-          .replace(/\n?```\s*$/, "")
-          .trim();
-        const retryFirstBrace = retryRaw.indexOf("{");
-        const retryLastBrace = retryRaw.lastIndexOf("}");
-        const retryCandidate =
-          retryFirstBrace !== -1
-            ? retryLastBrace > retryFirstBrace
-              ? retryRaw.substring(retryFirstBrace, retryLastBrace + 1)
-              : retryRaw.substring(retryFirstBrace)
-            : "";
+        const retryCandidate = extractJsonFromMarkdown(retryTextBlock?.text || "");
 
-        if (retryCandidate) {
+        if (retryCandidate && retryCandidate.length > 10) {
           try {
             designSpec = JSON.parse(retryCandidate);
             log("warn", "Stage 1 clean-regenerate succeeded on retry", {
@@ -3417,15 +3512,19 @@ Now analyze the attached design image and produce the JSON specification per the
               retryOutputTokens: retryMessage.usage?.output_tokens,
             });
           } catch (retryParseErr) {
-            // Last-ditch repair on retry
             try {
-              const retryRepaired = autoRepairJson(retryRaw.substring(retryFirstBrace));
+              const retryRepaired = autoRepairJson(retryCandidate);
               designSpec = JSON.parse(retryRepaired);
               log("warn", "Stage 1 clean-regenerate succeeded after auto-repair", {
                 requestId: req.id,
+                retryParseErr: retryParseErr.message,
               });
-            } catch {
-              // give up and fall through
+            } catch (lastErr) {
+              log("error", "Stage 1 retry repair failed", {
+                requestId: req.id,
+                retryParseErr: retryParseErr.message,
+                lastErr: lastErr.message,
+              });
             }
           }
         }
@@ -3633,10 +3732,11 @@ ${specs.join("\n\n")}
 
     const stage2StartTime = Date.now();
 
+    // v5.5.0: prompt-caching on the large stable Stage 2 system prompt
     const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 32000,
-      system: STAGE2_PROMPT,
+      system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: stage2Content }],
     });
 
@@ -3906,21 +4006,36 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 
     log("info", "Building delivery ZIP", { requestId: req.id, orderId });
 
-    // Download images from Dropbox URLs to include in ZIP
+    // v5.5.0: parallel image downloads with bounded concurrency + per-fetch
+    // AbortController timeout. Sequential awaits previously caused the ZIP step
+    // to drag past Anthropic timeout on emails with 20+ images.
     const images = [];
     if (imageUrlMap && Object.keys(imageUrlMap).length > 0) {
-      for (const [filename, url] of Object.entries(imageUrlMap)) {
+      const entries = Object.entries(imageUrlMap);
+      const downloaded = await mapWithConcurrency(entries, IMAGE_DOWNLOAD_CONCURRENCY, async ([filename, url]) => {
         try {
-          const response = await fetch(url);
+          const response = await fetchWithTimeout(url, IMAGE_DOWNLOAD_TIMEOUT_MS);
           if (response.ok) {
             const arrayBuffer = await response.arrayBuffer();
-            images.push({ filename, buffer: Buffer.from(arrayBuffer) });
-          } else {
-            log("warn", `Failed to download image: ${filename}`, { requestId: req.id, status: response.status });
+            return { filename, buffer: Buffer.from(arrayBuffer) };
           }
+          log("warn", `Failed to download image: ${filename}`, {
+            requestId: req.id,
+            status: response.status,
+            url: redactUrl(url),
+          });
         } catch (dlErr) {
-          log("warn", `Failed to download image: ${filename}`, { requestId: req.id, error: dlErr.message });
+          log("warn", `Failed to download image: ${filename}`, {
+            requestId: req.id,
+            error: dlErr.message,
+            aborted: dlErr.name === "AbortError",
+            url: redactUrl(url),
+          });
         }
+        return null;
+      });
+      for (const item of downloaded) {
+        if (item) images.push(item);
       }
     }
 
@@ -3972,7 +4087,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.1",
+    version: "5.5.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
@@ -3988,7 +4103,10 @@ process.on("unhandledRejection", (reason) => {
 
 process.on("uncaughtException", (err) => {
   log("error", "Uncaught exception", { error: err.message, stack: err.stack });
-  process.exit(1);
+  // v5.5.0: route through graceful shutdown instead of immediate exit so
+  // in-flight requests (which may be holding large PDF/PNG buffers) get a
+  // chance to finish before the pod is killed.
+  shutdown("uncaughtException");
 });
 
 const shutdown = (signal) => {
@@ -3997,10 +4115,13 @@ const shutdown = (signal) => {
     log("info", "HTTP server closed");
     process.exit(0);
   });
+  // v5.5.0: 30s was too aggressive — Stage 2 alone can run for several minutes
+  // with 32K max_tokens. Drain window must comfortably exceed
+  // ANTHROPIC_TIMEOUT_MS for an in-flight Stage 2 to complete.
   setTimeout(() => {
-    log("error", "Forced shutdown after 30s timeout");
+    log("error", `Forced shutdown after ${SHUTDOWN_DRAIN_TIMEOUT_MS / 1000}s timeout`);
     process.exit(1);
-  }, 30000);
+  }, SHUTDOWN_DRAIN_TIMEOUT_MS).unref();
 };
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

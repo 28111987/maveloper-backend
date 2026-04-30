@@ -1,5 +1,5 @@
 // =====================================================================
-// BAND DETECTION + PALETTE MODULE (v5.0.0)
+// BAND DETECTION + PALETTE MODULE (v5.5.0)
 // =====================================================================
 // Purpose: produce pixel-exact colors and positional data about the email
 // design so Claude's Stage 1 vision pass never has to GUESS colors.
@@ -29,8 +29,12 @@ const COLOR_SIMILARITY_THRESHOLD = 25;
 const DOMINANT_COLOR_RATIO = 0.7;
 const ROW_SAMPLE_STEP = 2;
 const BIN_STEP = 16;
+const BIN_SHIFT = 4;                         // log2(BIN_STEP) — pre-computed for hot loop
+const BIN_BUCKETS_PER_CHANNEL = 256 / BIN_STEP; // 16
+const BIN_TOTAL_BUCKETS = BIN_BUCKETS_PER_CHANNEL * BIN_BUCKETS_PER_CHANNEL * BIN_BUCKETS_PER_CHANNEL; // 4096
 
 // Palette building tunables
+const PALETTE_BIN_STEP = 32;                 // Coarser bin (32) collapses near-identical shades into one palette entry
 const PALETTE_MIN_PREVALENCE_PX = 30;        // Min total pixel-height a color must cover to enter the palette (lowered from 50 so thinner bands survive)
 const PALETTE_MAX_COLORS = 24;               // Cap palette size — more than this is noise (raised from 20)
 const PALETTE_GRAYSCALE_TOLERANCE = 12;      // R/G/B max-diff to consider a color "grayscale"
@@ -77,52 +81,49 @@ function saturation(rgb) {
 // Row-dominant-color analysis
 // -----------------------------------------------------------
 
-function findDominantColor(rowPixels, channels) {
-  const bins = new Map();
+/**
+ * v5.5.0: typed-array bins replace the per-row string-keyed Map. For a 600x12000
+ * design that's millions of fewer string allocations. Caller passes reusable
+ * bin buffers so allocation happens once per detectBands() not once per row.
+ */
+function findDominantColor(rowPixels, channels, binCounts, binR, binG, binB) {
+  binCounts.fill(0);
+  binR.fill(0);
+  binG.fill(0);
+  binB.fill(0);
+
   const totalPixels = rowPixels.length / channels;
+  let nonTransparent = 0;
 
   for (let i = 0; i < rowPixels.length; i += channels) {
+    if (channels === 4 && rowPixels[i + 3] < 128) continue;
     const r = rowPixels[i];
     const g = rowPixels[i + 1];
     const b = rowPixels[i + 2];
-
-    if (channels === 4) {
-      const a = rowPixels[i + 3];
-      if (a < 128) continue;
-    }
-
-    const binR = Math.floor(r / BIN_STEP) * BIN_STEP;
-    const binG = Math.floor(g / BIN_STEP) * BIN_STEP;
-    const binB = Math.floor(b / BIN_STEP) * BIN_STEP;
-    const key = `${binR},${binG},${binB}`;
-
-    const existing = bins.get(key);
-    if (existing) {
-      existing.count++;
-      existing.rSum += r;
-      existing.gSum += g;
-      existing.bSum += b;
-    } else {
-      bins.set(key, { count: 1, rSum: r, gSum: g, bSum: b });
-    }
+    const idx = ((r >>> BIN_SHIFT) * BIN_BUCKETS_PER_CHANNEL + (g >>> BIN_SHIFT)) * BIN_BUCKETS_PER_CHANNEL + (b >>> BIN_SHIFT);
+    binCounts[idx]++;
+    binR[idx] += r;
+    binG[idx] += g;
+    binB[idx] += b;
+    nonTransparent++;
   }
 
-  if (bins.size === 0) {
+  if (nonTransparent === 0) {
     return { hex: "#FFFFFF", count: 0, total: totalPixels, ratio: 0, rgb: [255, 255, 255] };
   }
 
-  let topBin = null;
-  let topCount = 0;
-  for (const [, bin] of bins) {
-    if (bin.count > topCount) {
-      topCount = bin.count;
-      topBin = bin;
+  let topIdx = 0;
+  let topCount = binCounts[0];
+  for (let i = 1; i < BIN_TOTAL_BUCKETS; i++) {
+    if (binCounts[i] > topCount) {
+      topCount = binCounts[i];
+      topIdx = i;
     }
   }
 
-  const avgR = topBin.rSum / topBin.count;
-  const avgG = topBin.gSum / topBin.count;
-  const avgB = topBin.bSum / topBin.count;
+  const avgR = binR[topIdx] / topCount;
+  const avgG = binG[topIdx] / topCount;
+  const avgB = binB[topIdx] / topCount;
 
   return {
     hex: rgbToHex(avgR, avgG, avgB),
@@ -138,6 +139,9 @@ function findDominantColor(rowPixels, channels) {
 // -----------------------------------------------------------
 
 export async function detectBands(pngBuffer) {
+  if (!pngBuffer || !pngBuffer.length) {
+    throw new Error("detectBands: empty or missing pngBuffer");
+  }
   const { data, info } = await sharp(pngBuffer)
     .ensureAlpha()
     .raw()
@@ -146,12 +150,18 @@ export async function detectBands(pngBuffer) {
   const { width, height, channels } = info;
   const rowBytes = width * channels;
 
+  // Reusable bin buffers (allocated once for all rows in this image).
+  const binCounts = new Int32Array(BIN_TOTAL_BUCKETS);
+  const binR = new Int32Array(BIN_TOTAL_BUCKETS);
+  const binG = new Int32Array(BIN_TOTAL_BUCKETS);
+  const binB = new Int32Array(BIN_TOTAL_BUCKETS);
+
   const rowInfo = [];
   for (let y = 0; y < height; y += ROW_SAMPLE_STEP) {
     const rowStart = y * rowBytes;
     const rowEnd = rowStart + rowBytes;
     const rowPixels = data.subarray(rowStart, rowEnd);
-    const dom = findDominantColor(rowPixels, channels);
+    const dom = findDominantColor(rowPixels, channels, binCounts, binR, binG, binB);
     rowInfo.push({
       y,
       hex: dom.hex,
@@ -273,10 +283,10 @@ export function buildColorPalette(bands) {
 
   for (const band of bands) {
     const rgb = hexToRgb(band.bg_hex);
-    // Palette-group bin (32-step) to collapse near-identical shades
-    const binR = Math.floor(rgb[0] / 32) * 32;
-    const binG = Math.floor(rgb[1] / 32) * 32;
-    const binB = Math.floor(rgb[2] / 32) * 32;
+    // Palette-group bin (PALETTE_BIN_STEP) collapses near-identical shades
+    const binR = Math.floor(rgb[0] / PALETTE_BIN_STEP) * PALETTE_BIN_STEP;
+    const binG = Math.floor(rgb[1] / PALETTE_BIN_STEP) * PALETTE_BIN_STEP;
+    const binB = Math.floor(rgb[2] / PALETTE_BIN_STEP) * PALETTE_BIN_STEP;
     const key = `${binR},${binG},${binB}`;
 
     const existing = buckets.get(key);
@@ -336,6 +346,9 @@ export function buildColorPalette(bands) {
  * Sample the exact color at a specific pixel coordinate.
  */
 export async function samplePixelColor(pngBuffer, x, y) {
+  if (!pngBuffer || !pngBuffer.length) {
+    throw new Error("samplePixelColor: empty or missing pngBuffer");
+  }
   const { data, info } = await sharp(pngBuffer)
     .ensureAlpha()
     .raw()
@@ -353,6 +366,9 @@ export async function samplePixelColor(pngBuffer, x, y) {
  * Kept for any future per-region analysis. Not used in v5.0.0 Stage 1 flow.
  */
 export async function cropBand(pngBuffer, y_start, y_end) {
+  if (!pngBuffer || !pngBuffer.length) {
+    throw new Error("cropBand: empty or missing pngBuffer");
+  }
   const meta = await sharp(pngBuffer).metadata();
   const width = meta.width || 0;
   const height = Math.max(1, y_end - y_start);
@@ -375,42 +391,35 @@ export async function cropBand(pngBuffer, y_start, y_end) {
 // No design-specific, email-specific, or brand-specific patterns.
 // -----------------------------------------------------------
 
+// v5.5.0: regex literals hoisted to module scope so they're not recompiled
+// on every postProcessOcr call.
+const OCR_LETTER_SPACED_CAPS = /(?:\b[A-Z]{1,2}\s){2,}[A-Z]{1,2}\b/g;
+const OCR_INNER_WHITESPACE = /\s+/g;
+const OCR_DOUBLE_SPACE = / {2,}/g;
+const OCR_SPACE_BEFORE_PUNCT = /\s+([,.!?;:])/g;
+const OCR_MISSING_SPACE_AFTER_PUNCT = /([.!?])([A-Z])/g;
+const OCR_STRAY_SINGLE_LETTER = /\s([b-hj-z])\s/g;
+const OCR_AL_BEFORE_CAPITAL = /\bAl(?=[\s\-'][A-Z])/g;
+const OCR_AL_BEFORE_LOWER = /\bAl(?=\s[a-z])/g;
+
 export function postProcessOcr(rawText) {
   if (!rawText) return "";
 
   let text = rawText;
 
-  // 1. Collapse letter-spaced ALL-CAPS runs.
-  //    Pattern: 3+ consecutive uppercase tokens of length 1-2 separated by single spaces.
-  //    "E X P E R T" or "EXPE RT M E NTO RS" → consolidated
-  text = text.replace(
-    /(?:\b[A-Z]{1,2}\s){2,}[A-Z]{1,2}\b/g,
-    (match) => match.replace(/\s+/g, "")
-  );
-
+  // 1. Collapse letter-spaced ALL-CAPS runs (3+ consecutive 1-2 char uppercase tokens).
+  text = text.replace(OCR_LETTER_SPACED_CAPS, (match) => match.replace(OCR_INNER_WHITESPACE, ""));
   // 2. Doubled spaces → single space (preserves newlines)
-  text = text.replace(/ {2,}/g, " ");
-
+  text = text.replace(OCR_DOUBLE_SPACE, " ");
   // 3. Stray space before punctuation
-  text = text.replace(/\s+([,.!?;:])/g, "$1");
-
+  text = text.replace(OCR_SPACE_BEFORE_PUNCT, "$1");
   // 4. Missing space after sentence punctuation followed by uppercase
-  //    "dolor.Lorem" → "dolor. Lorem"
-  text = text.replace(/([.!?])([A-Z])/g, "$1 $2");
-
-  // 5. Strip stray single-letter tokens that OCR occasionally inserts.
-  //    " f " mid-sentence (where f is a spurious char). Preserve 'a' and 'i'
-  //    as they are valid English single-letter words.
-  text = text.replace(/\s([b-hj-z])\s/g, " ");
-
-  // 6. Capital-I → lowercase-l misreads (common in Inter/Arial at small sizes).
-  //    Pattern: "Al" as standalone token followed by a space+capital letter
-  //    (indicating acronym usage like "AI Integration", "AI-driven").
-  //    Fixes: Al → AI
-  text = text.replace(/\bAl(?=[\s\-'][A-Z])/g, "AI");
-  //    Also: "Al" at sentence start followed by lowercase word (acronym as subject)
-  //    "Al plugs into..." → "AI plugs into..."
-  text = text.replace(/\bAl(?=\s[a-z])/g, "AI");
+  text = text.replace(OCR_MISSING_SPACE_AFTER_PUNCT, "$1 $2");
+  // 5. Strip stray single-letter tokens (preserve valid 'a' and 'i')
+  text = text.replace(OCR_STRAY_SINGLE_LETTER, " ");
+  // 6. Capital-I → lowercase-l misreads: "Al" as standalone acronym → "AI"
+  text = text.replace(OCR_AL_BEFORE_CAPITAL, "AI");
+  text = text.replace(OCR_AL_BEFORE_LOWER, "AI");
 
   return text;
 }
