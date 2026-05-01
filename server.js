@@ -7,7 +7,7 @@ import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
-import path from "path";
+import path from "node:path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
@@ -47,12 +47,115 @@ const SERVER_TIMEOUT_MS = 600 * 1000;      // 10 min — must exceed Anthropic t
 const RASTERIZE_SCALE = 1.6;
 const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
+// v5.5.0 tunables — extracted from inline magic numbers
+const STAGE1_MAX_RETRIES = 3;
+const STAGE1_RETRY_INITIAL_BACKOFF_MS = 3000;
+const DROPBOX_BATCH_SIZE = 3;
+const DROPBOX_BATCH_RETRY_DELAY_MS = 2000;
+const DROPBOX_RETRY_INTERVAL_MS = 500;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 30 * 1000;
+const IMAGE_DOWNLOAD_CONCURRENCY = 5;
+const STAGE1_RETRY_API_TIMEOUT_MS = 240 * 1000;     // 4 min for clean-regenerate retry
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 180 * 1000;       // 3 min — must allow in-flight Stage 2 to finish
+
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
   "https://maveloper.lovable.app",
   "http://localhost:3000",
   "http://localhost:5173",
 ];
+
+// =====================================================================
+// MODULE-LEVEL UTILITIES (v5.5.0)
+// =====================================================================
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Strip markdown code fences and isolate the JSON object substring.
+ * Returns the candidate JSON string (between first { and last } if present),
+ * or empty string if no { is found.
+ */
+function extractJsonFromMarkdown(text) {
+  if (!text) return "";
+  const stripped = text
+    .trim()
+    .replace(/^```(?:json)?\s*\n?/, "")
+    .replace(/\n?```\s*$/, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  if (firstBrace === -1) return "";
+  const lastBrace = stripped.lastIndexOf("}");
+  return lastBrace > firstBrace
+    ? stripped.substring(firstBrace, lastBrace + 1)
+    : stripped.substring(firstBrace);
+}
+
+/**
+ * fetch() wrapped with AbortController so a hung server cannot
+ * stall the request past the configured timeout.
+ */
+async function fetchWithTimeout(url, timeoutMs = IMAGE_DOWNLOAD_TIMEOUT_MS, init = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Bounded-concurrency parallel map. Preserves input order in the output array.
+ * Used to parallelize image downloads without overwhelming the network.
+ */
+async function mapWithConcurrency(items, concurrency, asyncFn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      results[idx] = await asyncFn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Classify an Anthropic SDK error as transient (worth retrying) vs permanent.
+ * Per CLAUDE.md the SDK has maxRetries=0 by design, so this layer handles it
+ * explicitly only for the calls where retry is safe.
+ */
+function isRetriableAnthropicError(err) {
+  if (!err) return false;
+  const status = err.status;
+  if (status === 408 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+  const code = err.code || err.cause?.code;
+  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ECONNABORTED" || code === "EAI_AGAIN") {
+    return true;
+  }
+  const msg = err.message || "";
+  if (/timed out|timeout|socket hang up|network/i.test(msg)) return true;
+  return false;
+}
+
+/**
+ * Strip tokens / signed-URL query params for safer logging. Dropbox shared
+ * links carry rlkey + st tokens that grant read access.
+ */
+function redactUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url.split("?")[0];
+  }
+}
 
 // =====================================================================
 // ANTHROPIC CLIENT
@@ -248,17 +351,19 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
   const folderPath = getDropboxFolderPath(orderId);
   const imageUrlMap = {};
   const failedImages = [];
-  const BATCH_SIZE = 3;
 
-  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${BATCH_SIZE})`, { orderId });
+  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${DROPBOX_BATCH_SIZE})`, { orderId });
 
-  for (let i = 0; i < images.length; i += BATCH_SIZE) {
-    const batch = images.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < images.length; i += DROPBOX_BATCH_SIZE) {
+    const batch = images.slice(i, i + DROPBOX_BATCH_SIZE);
     const results = await Promise.allSettled(
       batch.map(async (img) => {
         const dropboxFilePath = `${folderPath}/images/${img.filename}`;
         const { directUrl, sharedUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-        logFn("info", `Dropbox URL for ${img.filename}`, { sharedUrl: sharedUrl?.substring(0, 80), directUrl: directUrl?.substring(0, 80) });
+        logFn("info", `Dropbox URL for ${img.filename}`, {
+          sharedUrl: redactUrl(sharedUrl),
+          directUrl: redactUrl(directUrl),
+        });
         return { filename: img.filename, directUrl };
       })
     );
@@ -275,8 +380,8 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
 
   // Retry failed images one at a time with a delay
   if (failedImages.length > 0) {
-    logFn("info", `Retrying ${failedImages.length} failed uploads after 2s delay`);
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    logFn("info", `Retrying ${failedImages.length} failed uploads after ${DROPBOX_BATCH_RETRY_DELAY_MS}ms delay`);
+    await sleepMs(DROPBOX_BATCH_RETRY_DELAY_MS);
 
     for (const img of failedImages) {
       try {
@@ -287,8 +392,7 @@ async function uploadImagesToDropbox(orderId, images, logFn) {
       } catch (retryErr) {
         logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr.message });
       }
-      // Small delay between retries
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await sleepMs(DROPBOX_RETRY_INTERVAL_MS);
     }
   }
 
@@ -623,13 +727,15 @@ function saturationOfHex(hex) {
  * Scans for src="...filename" where filename matches a key in imageUrlMap.
  * Reliable string replace, zero Claude guessing.
  */
-function fixImageUrls(html, imageUrlMap) {
+function fixImageUrls(html, imageUrlMap, imageDimensionsMap) {
   if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
-    return { html, replaced: 0, unmatched: [] };
+    return { html, replaced: 0, unmatched: [], sequentialFallbacks: 0, fallbackUsed: [] };
   }
 
   let replaced = 0;
+  let sequentialFallbacks = 0;
   const unmatched = [];
+  const fallbackUsed = []; // {invented, actual, url} for each sequential fallback
   let output = html;
 
   // Build a case-insensitive lookup by filename
@@ -638,7 +744,19 @@ function fixImageUrls(html, imageUrlMap) {
     byName[filename.toLowerCase()] = url;
   }
 
-  // Match any src="..." or src='...' attribute
+  // v5.4.2: Build an ORDERED list of available image filenames + URLs.
+  // Used as a positional fallback when filename match fails.
+  // Sort by filename (case-insensitive) so order is stable and predictable.
+  const orderedImages = Object.entries(imageUrlMap)
+    .map(([filename, url]) => ({
+      filename,
+      url,
+      width: imageDimensionsMap?.[filename]?.width || null,
+      height: imageDimensionsMap?.[filename]?.height || null,
+    }))
+    .sort((a, b) => a.filename.toLowerCase().localeCompare(b.filename.toLowerCase()));
+
+  // First pass: exact filename matches
   output = output.replace(/\bsrc\s*=\s*["']([^"']+)["']/gi, (match, src) => {
     // Skip already-good URLs (http/https/data/cid)
     if (/^(https?:|data:|cid:)/i.test(src)) return match;
@@ -655,15 +773,52 @@ function fixImageUrls(html, imageUrlMap) {
       return `src="${dropboxUrl}"`;
     }
 
-    // No match found — if it's not a spacer.gif (which is expected to stay local),
-    // record as unmatched
-    if (!/spacer\.gif$/i.test(filename)) {
-      unmatched.push(filename);
-    }
+    // No exact match — leave for second pass to handle
     return match;
   });
 
-  return { html: output, replaced, unmatched };
+  // v5.4.2: Second pass — sequential positional fallback.
+  // For any remaining relative-path images, replace with images from the
+  // ORDERED list in order of appearance in the HTML. This guarantees real
+  // working URLs even when Stage 2 invented filenames that don't match the ZIP.
+  // Logic:
+  //   - Walk through remaining src="images/..." attrs in document order.
+  //   - For each, assign the next available image from orderedImages.
+  //   - Skip spacer.gif (intentionally local).
+  //   - If we run out of images, mark as unmatched.
+  let imageCursor = 0;
+  output = output.replace(/\bsrc\s*=\s*["']([^"']+)["']/gi, (match, src) => {
+    if (/^(https?:|data:|cid:)/i.test(src)) return match;
+
+    const filename = src.split("/").pop();
+    if (!filename) return match;
+
+    // Skip spacer.gif intentionally (these are framework-internal placeholders)
+    if (/^spacer\.gif$/i.test(filename)) return match;
+
+    if (imageCursor < orderedImages.length) {
+      const fallback = orderedImages[imageCursor];
+      imageCursor++;
+      sequentialFallbacks++;
+      fallbackUsed.push({
+        invented: filename,
+        actual: fallback.filename,
+        url: fallback.url,
+      });
+      return `src="${fallback.url}"`;
+    }
+
+    unmatched.push(filename);
+    return match;
+  });
+
+  return {
+    html: output,
+    replaced,
+    sequentialFallbacks,
+    fallbackUsed,
+    unmatched,
+  };
 }
 
 /**
@@ -1799,13 +1954,230 @@ function addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUpl
   return output;
 }
 
-function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded }) {
+// =====================================================================
+// v5.4.2 — DETERMINISTIC POST-PROCESSORS (preserved into v5.5.0)
+// =====================================================================
+// These run on the generated HTML after Stage 2. They fix bugs that no
+// amount of prompt rules can reliably eliminate, by acting on the actual
+// generated HTML structure.
+
+/**
+ * v5.4.2 Fix: Strip the user-specified secondary font from body font-family
+ * stacks. Stage 2 has been observed to incorrectly inline the secondary font
+ * into every element's font-family, even though the user only intended
+ * that font to be loaded but not used as body fallback.
+ *
+ * Universal: works for any quoted font name passed via `secondaryFont`.
+ */
+function fixSecondaryFontInBodyStack(html, secondaryFont) {
+  if (!secondaryFont || typeof secondaryFont !== "string") {
+    return { html, fixes: 0 };
+  }
+  const sf = secondaryFont.trim();
+  if (sf.length === 0) return { html, fixes: 0 };
+
+  let fixes = 0;
+  // Match any quoted form: 'FontName', "FontName", or unquoted FontName surrounded by commas.
+  const escapedSf = sf.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+
+  const output = html.replace(
+    /font-family\s*:\s*([^;"]+)/gi,
+    (match, value) => {
+      if (!new RegExp(`\\b${escapedSf}\\b`, "i").test(value)) {
+        return match;
+      }
+      // Tokenize the font-family value
+      const tokens = value
+        .split(",")
+        .map((t) => t.trim().replace(/^['"]|['"]$/g, ""))
+        .filter((t) => t.length > 0 && t.toLowerCase() !== sf.toLowerCase());
+
+      if (tokens.length === 0) return match; // safety
+
+      // Re-quote tokens with spaces; preserve generics
+      const generic = new Set([
+        "serif", "sans-serif", "monospace", "cursive", "fantasy",
+        "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
+      ]);
+      const rebuilt = tokens
+        .map((t) => {
+          const lower = t.toLowerCase();
+          if (generic.has(lower)) return lower;
+          if (/\s/.test(t)) return `'${t}'`;
+          return t;
+        })
+        .join(", ");
+
+      fixes++;
+      return `font-family: ${rebuilt}`;
+    }
+  );
+
+  return { html: output, fixes };
+}
+
+/**
+ * v5.4.2 Fix: Convert Google Fonts @import in <style> block to a proper <link>
+ * tag in <head>. @import is slower and can be blocked by some email clients;
+ * <link> is the recommended pattern.
+ *
+ * Universal: detects any @import url('https://fonts.googleapis.com/...') pattern.
+ */
+function convertGoogleFontImportToLink(html) {
+  const importRegex = /@import\s+url\s*\(\s*['"]?(https:\/\/fonts\.googleapis\.com\/[^'")]+)['"]?\s*\)\s*;?/gi;
+  const matches = [...html.matchAll(importRegex)];
+  if (matches.length === 0) return { html, fixes: 0 };
+
+  let output = html;
+  const linkTags = [];
+  for (const m of matches) {
+    const fontUrl = m[1];
+    linkTags.push(`<link href="${fontUrl}" rel="stylesheet" />`);
+  }
+
+  // Strip the @import lines
+  output = output.replace(importRegex, "");
+
+  // Strip empty <style>...</style> blocks left after stripping @import
+  output = output.replace(/<style[^>]*>\s*<\/style>/gi, "");
+  // Strip wrapping <!--[if !mso]><!--> ... <!--<![endif]--> if it now contains nothing meaningful
+  output = output.replace(
+    /<!--\[if !mso\]><!-->\s*<!--<!\[endif\]-->/gi,
+    ""
+  );
+
+  // Insert link tags before the closing </head>
+  const linkBlock = "  " + linkTags.join("\n  ") + "\n";
+  output = output.replace(/(<\/head>)/i, `${linkBlock}$1`);
+
+  return { html: output, fixes: matches.length };
+}
+
+/**
+ * v5.4.2 Fix: Repair malformed self-closing img tags where Stage 2 emitted
+ *   style="..."/ height="X">
+ * The forward-slash got placed BEFORE the closing-tag bracket but other
+ * attributes appear after it. Repair to:
+ *   style="..." height="X"/>
+ *
+ * Universal: matches any <img> tag with /-misplaced.
+ */
+function fixMalformedSelfClosingImg(html) {
+  let fixes = 0;
+  const output = html.replace(
+    /<img\s+([^>]*?)style\s*=\s*"([^"]*)"\s*\/\s+([^>]+?)\s*\/?\s*>/gi,
+    (match, before, styleVal, afterAttrs) => {
+      fixes++;
+      return `<img ${before}style="${styleVal}" ${afterAttrs.trim()}/>`;
+    }
+  );
+  return { html: output, fixes };
+}
+
+/**
+ * v5.4.2 Fix: Merge stacked-color heading rows into a single cell with spans.
+ *
+ * Stage 2 frequently violates the spans rule, splitting a 2-color headline
+ * (e.g., one phrase in dark color, another phrase in accent color, on adjacent
+ * visual lines) into TWO adjacent <tr> rows with identical font but different
+ * color. The developer reference always uses ONE cell with multiple <span>s.
+ *
+ * Heuristic: detect adjacent <tr><td...>TEXT</td></tr> pairs where:
+ *   - Both <td>s have align="center"
+ *   - Both have the same font-family + font-size + line-height + font-weight
+ *   - Colors differ
+ *   - Texts are short (<80 chars each)
+ *   - No image or other complex content between them
+ * Merge into one <td> with two <span>s.
+ *
+ * Universal: works for any 2-color split heading.
+ */
+function fixStackedHeadingRows(html) {
+  let fixes = 0;
+  const rowPairRegex =
+    /<tr>\s*<td\s+align="center"\s+valign="top"\s+(class="[^"]*"\s+)?style="([^"]*)"\s*>([^<]{1,80})<\/td>\s*<\/tr>\s*<tr>\s*<td\s+align="center"\s+valign="top"\s+(class="[^"]*"\s+)?style="([^"]*)"\s*>([^<]{1,80})<\/td>\s*<\/tr>/gi;
+
+  let output = html;
+  let prev = null;
+  // Loop because merging shrinks the HTML and may expose new pairs
+  while (prev !== output) {
+    prev = output;
+    output = output.replace(
+      rowPairRegex,
+      (match, cls1, style1, text1, cls2, style2, text2) => {
+        // Extract font + color from each style
+        const extract = (s) => {
+          const ff = (s.match(/font-family\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const fs = (s.match(/font-size\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const lh = (s.match(/line-height\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const fw = (s.match(/font-weight\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const col = (s.match(/(?:^|;)\s*color\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          return { ff, fs, lh, fw, col };
+        };
+        const a = extract(style1);
+        const b = extract(style2);
+
+        // Must match font, size, line-height, weight; must differ on color
+        if (!a.ff || a.ff !== b.ff) return match;
+        if (a.fs !== b.fs) return match;
+        if (a.lh !== b.lh) return match;
+        if (a.fw !== b.fw) return match;
+        if (!a.col || !b.col) return match;
+        if (a.col.toLowerCase() === b.col.toLowerCase()) return match;
+
+        // Text content sanity check: not empty
+        if (!text1.trim() || !text2.trim()) return match;
+
+        // Build the merged <td>: keep style1 (without color) on the td, use spans for colors
+        const baseStyle = style1
+          .replace(/(?:^|;)\s*color\s*:\s*[^;]+;?/i, "")
+          .replace(/;;+/g, ";")
+          .trim();
+        const merged = `<tr>
+                          <td align="center" valign="top" ${cls1 || ""}style="${baseStyle}"><span style="color: ${a.col};">${text1.trim()}</span><br /><span style="color: ${b.col};">${text2.trim()}</span></td>
+                        </tr>`;
+        fixes++;
+        return merged;
+      }
+    );
+  }
+
+  return { html: output, fixes };
+}
+
+function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded, secondaryFont }) {
   const report = {};
   const hadRelativePaths = /src="images\//i.test(html);
 
-  const r1 = fixImageUrls(html, imageUrlMap);
+  // v5.4.2: fixImageUrls now has filename match + sequential positional fallback
+  const r1 = fixImageUrls(html, imageUrlMap, imageDimensionsMap);
   html = r1.html;
-  report.imageUrls = { replaced: r1.replaced, unmatched: r1.unmatched };
+  report.imageUrls = {
+    replaced: r1.replaced,
+    sequentialFallbacks: r1.sequentialFallbacks,
+    fallbackUsed: r1.fallbackUsed,
+    unmatched: r1.unmatched,
+  };
+
+  // v5.4.2: Convert Google Fonts @import to <link> in <head>
+  const rGFont = convertGoogleFontImportToLink(html);
+  html = rGFont.html;
+  report.googleFontLinkConvert = { fixes: rGFont.fixes };
+
+  // v5.4.2: Repair malformed self-closing img tags
+  const rImgMal = fixMalformedSelfClosingImg(html);
+  html = rImgMal.html;
+  report.malformedImgFix = { fixes: rImgMal.fixes };
+
+  // v5.4.2: Strip user-specified secondary font from body font-family stacks
+  const rSecFont = fixSecondaryFontInBodyStack(html, secondaryFont);
+  html = rSecFont.html;
+  report.secondaryFontStrip = { fixes: rSecFont.fixes };
+
+  // v5.4.2: Merge stacked-color heading rows into single cell with spans
+  const rStacked = fixStackedHeadingRows(html);
+  html = rStacked.html;
+  report.stackedHeadingMerge = { fixes: rStacked.fixes };
 
   const r2 = rebindSectionColors(html, bandMap, palette);
   html = r2.html;
@@ -2649,6 +3021,7 @@ const rasterizeWithTimeout = (buffer) => Promise.race([
 // =====================================================================
 
 app.get("/health", (req, res) => {
+  // v5.5.0: do not leak the configured model name to unauthenticated callers.
   res.json({
     status: "ok",
     uptime: process.uptime(),
@@ -2656,9 +3029,8 @@ app.get("/health", (req, res) => {
     dropboxConfigured,
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
-    model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.1",
+    version: "5.5.0",
   });
 });
 
@@ -2811,8 +3183,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
             error: dbxErr.message,
           });
           if (attempt < UPLOAD_ATTEMPTS) {
-            // Brief backoff before retry
-            await new Promise((r) => setTimeout(r, 2000));
+            await sleepMs(DROPBOX_BATCH_RETRY_DELAY_MS);
           }
         }
       }
@@ -3217,30 +3588,31 @@ Now analyze the attached design image and produce the JSON specification per the
       { type: "text", text: stage1UserPrompt },
     ];
 
-    // --- Step 1e: Call Claude with retry on 429 ---
-    const MAX_STAGE1_RETRIES = 3;
+    // --- Step 1e: Call Claude with retry on transient errors ---
+    // v5.5.0: prompt-caching on system message (large + stable) cuts cost and
+    // latency significantly across retries within the 5-min cache window.
+    // Retry covers 429 + 408/500/502/503/504 + network-class errors.
     let stage1Message = null;
     let stage1LastErr = null;
-    const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    for (let attempt = 0; attempt <= MAX_STAGE1_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= STAGE1_MAX_RETRIES; attempt++) {
       try {
         stage1Message = await anthropic.messages.create({
           model: CLAUDE_MODEL,
           max_tokens: 32000,
-          system: STAGE1_PROMPT,
+          system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
           messages: [{ role: "user", content: stage1UserContent }],
         });
         break; // success
       } catch (err) {
         stage1LastErr = err;
-        const is429 =
-          err?.status === 429 || (err?.message && err.message.includes("429"));
-        if (is429 && attempt < MAX_STAGE1_RETRIES) {
-          const backoffMs = 3000 * Math.pow(2, attempt);
-          log("info", `Stage 1 hit rate limit, retrying after ${backoffMs}ms`, {
+        if (isRetriableAnthropicError(err) && attempt < STAGE1_MAX_RETRIES) {
+          const backoffMs = STAGE1_RETRY_INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+          log("info", `Stage 1 transient error, retrying after ${backoffMs}ms`, {
             requestId: req.id,
             attempt: attempt + 1,
+            status: err?.status,
+            code: err?.code || err?.cause?.code,
           });
           await sleepMs(backoffMs);
           continue;
@@ -3279,14 +3651,9 @@ Now analyze the attached design image and produce the JSON specification per the
       });
     }
 
-    let rawJson = stage1TextBlock.text.trim();
-    rawJson = rawJson
-      .replace(/^```(?:json)?\s*\n?/, "")
-      .replace(/\n?```\s*$/, "")
-      .trim();
-    const firstBrace = rawJson.indexOf("{");
-    const lastBrace = rawJson.lastIndexOf("}");
-    if (firstBrace === -1) {
+    const rawJson = stage1TextBlock.text;
+    const candidateJson = extractJsonFromMarkdown(rawJson);
+    if (!candidateJson) {
       log("error", "Stage 1 returned non-JSON output", {
         requestId: req.id,
         preview: rawJson.slice(0, 300),
@@ -3337,15 +3704,12 @@ Now analyze the attached design image and produce the JSON specification per the
     }
 
     let designSpec;
-    let candidateJson = lastBrace > firstBrace
-      ? rawJson.substring(firstBrace, lastBrace + 1)
-      : rawJson.substring(firstBrace);
 
     try {
       designSpec = JSON.parse(candidateJson);
     } catch (firstErr) {
       // Try auto-repair for truncated output
-      const repaired = autoRepairJson(rawJson.substring(firstBrace));
+      const repaired = autoRepairJson(candidateJson);
       try {
         designSpec = JSON.parse(repaired);
         log("warn", "Stage 1 JSON was truncated — auto-repaired", {
@@ -3359,6 +3723,8 @@ Now analyze the attached design image and produce the JSON specification per the
         // v5.4.1: Last-resort retry — ask Claude to regenerate cleanly with the
         // parse error as context. This catches mid-string syntax errors that
         // truncation-repair cannot fix.
+        // v5.5.0: prompt-cached system, temperature=0 for determinism, dedicated
+        // AbortController timeout so a hung retry cannot block the request.
         log("warn", "Stage 1 JSON parse failed, attempting clean-regenerate retry", {
           requestId: req.id,
           firstErr: firstErr.message,
@@ -3380,36 +3746,33 @@ Now analyze the attached design image and produce the JSON specification per the
         ];
 
         let retryMessage = null;
+        const retryAbort = new AbortController();
+        const retryTimer = setTimeout(() => retryAbort.abort(), STAGE1_RETRY_API_TIMEOUT_MS);
         try {
-          retryMessage = await anthropic.messages.create({
-            model: CLAUDE_MODEL,
-            max_tokens: 32000,
-            system: STAGE1_PROMPT,
-            messages: [{ role: "user", content: retryUserContent }],
-          });
+          retryMessage = await anthropic.messages.create(
+            {
+              model: CLAUDE_MODEL,
+              max_tokens: 32000,
+              temperature: 0,
+              system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
+              messages: [{ role: "user", content: retryUserContent }],
+            },
+            { signal: retryAbort.signal }
+          );
         } catch (retryApiErr) {
           log("error", "Stage 1 clean-regenerate API call failed", {
             requestId: req.id,
             error: retryApiErr.message,
+            aborted: retryAbort.signal.aborted,
           });
+        } finally {
+          clearTimeout(retryTimer);
         }
 
         const retryTextBlock = retryMessage?.content?.find((b) => b.type === "text");
-        let retryRaw = retryTextBlock?.text?.trim() ?? "";
-        retryRaw = retryRaw
-          .replace(/^```(?:json)?\s*\n?/, "")
-          .replace(/\n?```\s*$/, "")
-          .trim();
-        const retryFirstBrace = retryRaw.indexOf("{");
-        const retryLastBrace = retryRaw.lastIndexOf("}");
-        const retryCandidate =
-          retryFirstBrace !== -1
-            ? retryLastBrace > retryFirstBrace
-              ? retryRaw.substring(retryFirstBrace, retryLastBrace + 1)
-              : retryRaw.substring(retryFirstBrace)
-            : "";
+        const retryCandidate = extractJsonFromMarkdown(retryTextBlock?.text || "");
 
-        if (retryCandidate) {
+        if (retryCandidate && retryCandidate.length > 10) {
           try {
             designSpec = JSON.parse(retryCandidate);
             log("warn", "Stage 1 clean-regenerate succeeded on retry", {
@@ -3417,15 +3780,19 @@ Now analyze the attached design image and produce the JSON specification per the
               retryOutputTokens: retryMessage.usage?.output_tokens,
             });
           } catch (retryParseErr) {
-            // Last-ditch repair on retry
             try {
-              const retryRepaired = autoRepairJson(retryRaw.substring(retryFirstBrace));
+              const retryRepaired = autoRepairJson(retryCandidate);
               designSpec = JSON.parse(retryRepaired);
               log("warn", "Stage 1 clean-regenerate succeeded after auto-repair", {
                 requestId: req.id,
+                retryParseErr: retryParseErr.message,
               });
-            } catch {
-              // give up and fall through
+            } catch (lastErr) {
+              log("error", "Stage 1 retry repair failed", {
+                requestId: req.id,
+                retryParseErr: retryParseErr.message,
+                lastErr: lastErr.message,
+              });
             }
           }
         }
@@ -3633,10 +4000,11 @@ ${specs.join("\n\n")}
 
     const stage2StartTime = Date.now();
 
+    // v5.5.0: prompt-caching on the large stable Stage 2 system prompt
     const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 32000,
-      system: STAGE2_PROMPT,
+      system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: stage2Content }],
     });
 
@@ -3686,13 +4054,19 @@ ${specs.join("\n\n")}
       bandMap: designSpec?._band_map || [],
       imageDimensionsMap,
       zipWasUploaded: !!assetsZipBase64,
+      secondaryFont: secondaryFont || designSpec?.font_heading,
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.2.2)", {
+    log("info", "Post-processing complete (v5.5.0)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
+      imageUrlsSequentialFallbacks: postProcessResult.report.imageUrls.sequentialFallbacks,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
+      googleFontLinkConvertFixes: postProcessResult.report.googleFontLinkConvert?.fixes,
+      malformedImgFixes: postProcessResult.report.malformedImgFix?.fixes,
+      secondaryFontStripFixes: postProcessResult.report.secondaryFontStrip?.fixes,
+      stackedHeadingMergeFixes: postProcessResult.report.stackedHeadingMerge?.fixes,
       sectionColorsRebound: postProcessResult.report.rebindSectionColors?.rebound,
       sectionColorsChecked: postProcessResult.report.rebindSectionColors?.checked,
       nearWhiteNormalizedCount: postProcessResult.report.nearWhite.count,
@@ -3906,21 +4280,36 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 
     log("info", "Building delivery ZIP", { requestId: req.id, orderId });
 
-    // Download images from Dropbox URLs to include in ZIP
+    // v5.5.0: parallel image downloads with bounded concurrency + per-fetch
+    // AbortController timeout. Sequential awaits previously caused the ZIP step
+    // to drag past Anthropic timeout on emails with 20+ images.
     const images = [];
     if (imageUrlMap && Object.keys(imageUrlMap).length > 0) {
-      for (const [filename, url] of Object.entries(imageUrlMap)) {
+      const entries = Object.entries(imageUrlMap);
+      const downloaded = await mapWithConcurrency(entries, IMAGE_DOWNLOAD_CONCURRENCY, async ([filename, url]) => {
         try {
-          const response = await fetch(url);
+          const response = await fetchWithTimeout(url, IMAGE_DOWNLOAD_TIMEOUT_MS);
           if (response.ok) {
             const arrayBuffer = await response.arrayBuffer();
-            images.push({ filename, buffer: Buffer.from(arrayBuffer) });
-          } else {
-            log("warn", `Failed to download image: ${filename}`, { requestId: req.id, status: response.status });
+            return { filename, buffer: Buffer.from(arrayBuffer) };
           }
+          log("warn", `Failed to download image: ${filename}`, {
+            requestId: req.id,
+            status: response.status,
+            url: redactUrl(url),
+          });
         } catch (dlErr) {
-          log("warn", `Failed to download image: ${filename}`, { requestId: req.id, error: dlErr.message });
+          log("warn", `Failed to download image: ${filename}`, {
+            requestId: req.id,
+            error: dlErr.message,
+            aborted: dlErr.name === "AbortError",
+            url: redactUrl(url),
+          });
         }
+        return null;
+      });
+      for (const item of downloaded) {
+        if (item) images.push(item);
       }
     }
 
@@ -3972,7 +4361,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.4.1",
+    version: "5.5.0",
     dropboxConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
@@ -3988,7 +4377,10 @@ process.on("unhandledRejection", (reason) => {
 
 process.on("uncaughtException", (err) => {
   log("error", "Uncaught exception", { error: err.message, stack: err.stack });
-  process.exit(1);
+  // v5.5.0: route through graceful shutdown instead of immediate exit so
+  // in-flight requests (which may be holding large PDF/PNG buffers) get a
+  // chance to finish before the pod is killed.
+  shutdown("uncaughtException");
 });
 
 const shutdown = (signal) => {
@@ -3997,10 +4389,13 @@ const shutdown = (signal) => {
     log("info", "HTTP server closed");
     process.exit(0);
   });
+  // v5.5.0: 30s was too aggressive — Stage 2 alone can run for several minutes
+  // with 32K max_tokens. Drain window must comfortably exceed
+  // ANTHROPIC_TIMEOUT_MS for an in-flight Stage 2 to complete.
   setTimeout(() => {
-    log("error", "Forced shutdown after 30s timeout");
+    log("error", `Forced shutdown after ${SHUTDOWN_DRAIN_TIMEOUT_MS / 1000}s timeout`);
     process.exit(1);
-  }, 30000);
+  }, SHUTDOWN_DRAIN_TIMEOUT_MS).unref();
 };
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
