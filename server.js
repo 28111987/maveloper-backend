@@ -727,13 +727,15 @@ function saturationOfHex(hex) {
  * Scans for src="...filename" where filename matches a key in imageUrlMap.
  * Reliable string replace, zero Claude guessing.
  */
-function fixImageUrls(html, imageUrlMap) {
+function fixImageUrls(html, imageUrlMap, imageDimensionsMap) {
   if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
-    return { html, replaced: 0, unmatched: [] };
+    return { html, replaced: 0, unmatched: [], sequentialFallbacks: 0, fallbackUsed: [] };
   }
 
   let replaced = 0;
+  let sequentialFallbacks = 0;
   const unmatched = [];
+  const fallbackUsed = []; // {invented, actual, url} for each sequential fallback
   let output = html;
 
   // Build a case-insensitive lookup by filename
@@ -742,7 +744,19 @@ function fixImageUrls(html, imageUrlMap) {
     byName[filename.toLowerCase()] = url;
   }
 
-  // Match any src="..." or src='...' attribute
+  // v5.4.2: Build an ORDERED list of available image filenames + URLs.
+  // Used as a positional fallback when filename match fails.
+  // Sort by filename (case-insensitive) so order is stable and predictable.
+  const orderedImages = Object.entries(imageUrlMap)
+    .map(([filename, url]) => ({
+      filename,
+      url,
+      width: imageDimensionsMap?.[filename]?.width || null,
+      height: imageDimensionsMap?.[filename]?.height || null,
+    }))
+    .sort((a, b) => a.filename.toLowerCase().localeCompare(b.filename.toLowerCase()));
+
+  // First pass: exact filename matches
   output = output.replace(/\bsrc\s*=\s*["']([^"']+)["']/gi, (match, src) => {
     // Skip already-good URLs (http/https/data/cid)
     if (/^(https?:|data:|cid:)/i.test(src)) return match;
@@ -759,15 +773,52 @@ function fixImageUrls(html, imageUrlMap) {
       return `src="${dropboxUrl}"`;
     }
 
-    // No match found — if it's not a spacer.gif (which is expected to stay local),
-    // record as unmatched
-    if (!/spacer\.gif$/i.test(filename)) {
-      unmatched.push(filename);
-    }
+    // No exact match — leave for second pass to handle
     return match;
   });
 
-  return { html: output, replaced, unmatched };
+  // v5.4.2: Second pass — sequential positional fallback.
+  // For any remaining relative-path images, replace with images from the
+  // ORDERED list in order of appearance in the HTML. This guarantees real
+  // working URLs even when Stage 2 invented filenames that don't match the ZIP.
+  // Logic:
+  //   - Walk through remaining src="images/..." attrs in document order.
+  //   - For each, assign the next available image from orderedImages.
+  //   - Skip spacer.gif (intentionally local).
+  //   - If we run out of images, mark as unmatched.
+  let imageCursor = 0;
+  output = output.replace(/\bsrc\s*=\s*["']([^"']+)["']/gi, (match, src) => {
+    if (/^(https?:|data:|cid:)/i.test(src)) return match;
+
+    const filename = src.split("/").pop();
+    if (!filename) return match;
+
+    // Skip spacer.gif intentionally (these are framework-internal placeholders)
+    if (/^spacer\.gif$/i.test(filename)) return match;
+
+    if (imageCursor < orderedImages.length) {
+      const fallback = orderedImages[imageCursor];
+      imageCursor++;
+      sequentialFallbacks++;
+      fallbackUsed.push({
+        invented: filename,
+        actual: fallback.filename,
+        url: fallback.url,
+      });
+      return `src="${fallback.url}"`;
+    }
+
+    unmatched.push(filename);
+    return match;
+  });
+
+  return {
+    html: output,
+    replaced,
+    sequentialFallbacks,
+    fallbackUsed,
+    unmatched,
+  };
 }
 
 /**
@@ -1903,13 +1954,230 @@ function addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUpl
   return output;
 }
 
-function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded }) {
+// =====================================================================
+// v5.4.2 — DETERMINISTIC POST-PROCESSORS (preserved into v5.5.0)
+// =====================================================================
+// These run on the generated HTML after Stage 2. They fix bugs that no
+// amount of prompt rules can reliably eliminate, by acting on the actual
+// generated HTML structure.
+
+/**
+ * v5.4.2 Fix: Strip the user-specified secondary font from body font-family
+ * stacks. Stage 2 has been observed to incorrectly inline the secondary font
+ * into every element's font-family, even though the user only intended
+ * that font to be loaded but not used as body fallback.
+ *
+ * Universal: works for any quoted font name passed via `secondaryFont`.
+ */
+function fixSecondaryFontInBodyStack(html, secondaryFont) {
+  if (!secondaryFont || typeof secondaryFont !== "string") {
+    return { html, fixes: 0 };
+  }
+  const sf = secondaryFont.trim();
+  if (sf.length === 0) return { html, fixes: 0 };
+
+  let fixes = 0;
+  // Match any quoted form: 'FontName', "FontName", or unquoted FontName surrounded by commas.
+  const escapedSf = sf.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+
+  const output = html.replace(
+    /font-family\s*:\s*([^;"]+)/gi,
+    (match, value) => {
+      if (!new RegExp(`\\b${escapedSf}\\b`, "i").test(value)) {
+        return match;
+      }
+      // Tokenize the font-family value
+      const tokens = value
+        .split(",")
+        .map((t) => t.trim().replace(/^['"]|['"]$/g, ""))
+        .filter((t) => t.length > 0 && t.toLowerCase() !== sf.toLowerCase());
+
+      if (tokens.length === 0) return match; // safety
+
+      // Re-quote tokens with spaces; preserve generics
+      const generic = new Set([
+        "serif", "sans-serif", "monospace", "cursive", "fantasy",
+        "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
+      ]);
+      const rebuilt = tokens
+        .map((t) => {
+          const lower = t.toLowerCase();
+          if (generic.has(lower)) return lower;
+          if (/\s/.test(t)) return `'${t}'`;
+          return t;
+        })
+        .join(", ");
+
+      fixes++;
+      return `font-family: ${rebuilt}`;
+    }
+  );
+
+  return { html: output, fixes };
+}
+
+/**
+ * v5.4.2 Fix: Convert Google Fonts @import in <style> block to a proper <link>
+ * tag in <head>. @import is slower and can be blocked by some email clients;
+ * <link> is the recommended pattern.
+ *
+ * Universal: detects any @import url('https://fonts.googleapis.com/...') pattern.
+ */
+function convertGoogleFontImportToLink(html) {
+  const importRegex = /@import\s+url\s*\(\s*['"]?(https:\/\/fonts\.googleapis\.com\/[^'")]+)['"]?\s*\)\s*;?/gi;
+  const matches = [...html.matchAll(importRegex)];
+  if (matches.length === 0) return { html, fixes: 0 };
+
+  let output = html;
+  const linkTags = [];
+  for (const m of matches) {
+    const fontUrl = m[1];
+    linkTags.push(`<link href="${fontUrl}" rel="stylesheet" />`);
+  }
+
+  // Strip the @import lines
+  output = output.replace(importRegex, "");
+
+  // Strip empty <style>...</style> blocks left after stripping @import
+  output = output.replace(/<style[^>]*>\s*<\/style>/gi, "");
+  // Strip wrapping <!--[if !mso]><!--> ... <!--<![endif]--> if it now contains nothing meaningful
+  output = output.replace(
+    /<!--\[if !mso\]><!-->\s*<!--<!\[endif\]-->/gi,
+    ""
+  );
+
+  // Insert link tags before the closing </head>
+  const linkBlock = "  " + linkTags.join("\n  ") + "\n";
+  output = output.replace(/(<\/head>)/i, `${linkBlock}$1`);
+
+  return { html: output, fixes: matches.length };
+}
+
+/**
+ * v5.4.2 Fix: Repair malformed self-closing img tags where Stage 2 emitted
+ *   style="..."/ height="X">
+ * The forward-slash got placed BEFORE the closing-tag bracket but other
+ * attributes appear after it. Repair to:
+ *   style="..." height="X"/>
+ *
+ * Universal: matches any <img> tag with /-misplaced.
+ */
+function fixMalformedSelfClosingImg(html) {
+  let fixes = 0;
+  const output = html.replace(
+    /<img\s+([^>]*?)style\s*=\s*"([^"]*)"\s*\/\s+([^>]+?)\s*\/?\s*>/gi,
+    (match, before, styleVal, afterAttrs) => {
+      fixes++;
+      return `<img ${before}style="${styleVal}" ${afterAttrs.trim()}/>`;
+    }
+  );
+  return { html: output, fixes };
+}
+
+/**
+ * v5.4.2 Fix: Merge stacked-color heading rows into a single cell with spans.
+ *
+ * Stage 2 frequently violates the spans rule, splitting a 2-color headline
+ * (e.g., one phrase in dark color, another phrase in accent color, on adjacent
+ * visual lines) into TWO adjacent <tr> rows with identical font but different
+ * color. The developer reference always uses ONE cell with multiple <span>s.
+ *
+ * Heuristic: detect adjacent <tr><td...>TEXT</td></tr> pairs where:
+ *   - Both <td>s have align="center"
+ *   - Both have the same font-family + font-size + line-height + font-weight
+ *   - Colors differ
+ *   - Texts are short (<80 chars each)
+ *   - No image or other complex content between them
+ * Merge into one <td> with two <span>s.
+ *
+ * Universal: works for any 2-color split heading.
+ */
+function fixStackedHeadingRows(html) {
+  let fixes = 0;
+  const rowPairRegex =
+    /<tr>\s*<td\s+align="center"\s+valign="top"\s+(class="[^"]*"\s+)?style="([^"]*)"\s*>([^<]{1,80})<\/td>\s*<\/tr>\s*<tr>\s*<td\s+align="center"\s+valign="top"\s+(class="[^"]*"\s+)?style="([^"]*)"\s*>([^<]{1,80})<\/td>\s*<\/tr>/gi;
+
+  let output = html;
+  let prev = null;
+  // Loop because merging shrinks the HTML and may expose new pairs
+  while (prev !== output) {
+    prev = output;
+    output = output.replace(
+      rowPairRegex,
+      (match, cls1, style1, text1, cls2, style2, text2) => {
+        // Extract font + color from each style
+        const extract = (s) => {
+          const ff = (s.match(/font-family\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const fs = (s.match(/font-size\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const lh = (s.match(/line-height\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const fw = (s.match(/font-weight\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          const col = (s.match(/(?:^|;)\s*color\s*:\s*([^;]+)/i) || [])[1]?.trim();
+          return { ff, fs, lh, fw, col };
+        };
+        const a = extract(style1);
+        const b = extract(style2);
+
+        // Must match font, size, line-height, weight; must differ on color
+        if (!a.ff || a.ff !== b.ff) return match;
+        if (a.fs !== b.fs) return match;
+        if (a.lh !== b.lh) return match;
+        if (a.fw !== b.fw) return match;
+        if (!a.col || !b.col) return match;
+        if (a.col.toLowerCase() === b.col.toLowerCase()) return match;
+
+        // Text content sanity check: not empty
+        if (!text1.trim() || !text2.trim()) return match;
+
+        // Build the merged <td>: keep style1 (without color) on the td, use spans for colors
+        const baseStyle = style1
+          .replace(/(?:^|;)\s*color\s*:\s*[^;]+;?/i, "")
+          .replace(/;;+/g, ";")
+          .trim();
+        const merged = `<tr>
+                          <td align="center" valign="top" ${cls1 || ""}style="${baseStyle}"><span style="color: ${a.col};">${text1.trim()}</span><br /><span style="color: ${b.col};">${text2.trim()}</span></td>
+                        </tr>`;
+        fixes++;
+        return merged;
+      }
+    );
+  }
+
+  return { html: output, fixes };
+}
+
+function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded, secondaryFont }) {
   const report = {};
   const hadRelativePaths = /src="images\//i.test(html);
 
-  const r1 = fixImageUrls(html, imageUrlMap);
+  // v5.4.2: fixImageUrls now has filename match + sequential positional fallback
+  const r1 = fixImageUrls(html, imageUrlMap, imageDimensionsMap);
   html = r1.html;
-  report.imageUrls = { replaced: r1.replaced, unmatched: r1.unmatched };
+  report.imageUrls = {
+    replaced: r1.replaced,
+    sequentialFallbacks: r1.sequentialFallbacks,
+    fallbackUsed: r1.fallbackUsed,
+    unmatched: r1.unmatched,
+  };
+
+  // v5.4.2: Convert Google Fonts @import to <link> in <head>
+  const rGFont = convertGoogleFontImportToLink(html);
+  html = rGFont.html;
+  report.googleFontLinkConvert = { fixes: rGFont.fixes };
+
+  // v5.4.2: Repair malformed self-closing img tags
+  const rImgMal = fixMalformedSelfClosingImg(html);
+  html = rImgMal.html;
+  report.malformedImgFix = { fixes: rImgMal.fixes };
+
+  // v5.4.2: Strip user-specified secondary font from body font-family stacks
+  const rSecFont = fixSecondaryFontInBodyStack(html, secondaryFont);
+  html = rSecFont.html;
+  report.secondaryFontStrip = { fixes: rSecFont.fixes };
+
+  // v5.4.2: Merge stacked-color heading rows into single cell with spans
+  const rStacked = fixStackedHeadingRows(html);
+  html = rStacked.html;
+  report.stackedHeadingMerge = { fixes: rStacked.fixes };
 
   const r2 = rebindSectionColors(html, bandMap, palette);
   html = r2.html;
@@ -3786,13 +4054,19 @@ ${specs.join("\n\n")}
       bandMap: designSpec?._band_map || [],
       imageDimensionsMap,
       zipWasUploaded: !!assetsZipBase64,
+      secondaryFont: secondaryFont || designSpec?.font_heading,
     });
     const html = postProcessResult.html;
 
-    log("info", "Post-processing complete (v5.2.2)", {
+    log("info", "Post-processing complete (v5.5.0)", {
       requestId: req.id,
       imageUrlsReplaced: postProcessResult.report.imageUrls.replaced,
+      imageUrlsSequentialFallbacks: postProcessResult.report.imageUrls.sequentialFallbacks,
       imageUrlsUnmatched: postProcessResult.report.imageUrls.unmatched,
+      googleFontLinkConvertFixes: postProcessResult.report.googleFontLinkConvert?.fixes,
+      malformedImgFixes: postProcessResult.report.malformedImgFix?.fixes,
+      secondaryFontStripFixes: postProcessResult.report.secondaryFontStrip?.fixes,
+      stackedHeadingMergeFixes: postProcessResult.report.stackedHeadingMerge?.fixes,
       sectionColorsRebound: postProcessResult.report.rebindSectionColors?.rebound,
       sectionColorsChecked: postProcessResult.report.rebindSectionColors?.checked,
       nearWhiteNormalizedCount: postProcessResult.report.nearWhite.count,
