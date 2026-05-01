@@ -1,1 +1,63 @@
-
+2026-05-01T11:02:12.404858915Z [inf]  Starting Container
+2026-05-01T11:02:13.502350707Z [err]  npm warn config production Use `--omit=dev` instead.
+2026-05-01T11:02:13.502360599Z [inf]  
+2026-05-01T11:02:13.502365724Z [inf]  
+2026-05-01T11:02:13.502370271Z [inf]  > maveloper-backend@5.5.0 start
+2026-05-01T11:02:13.502377028Z [inf]  Maveloper backend running on port 8080
+2026-05-01T11:02:13.502380785Z [inf]  > node server.js
+2026-05-01T11:05:05.850961453Z [inf]  Processing request
+2026-05-01T11:05:05.850971035Z [inf]  Rasterizing PDF
+2026-05-01T11:05:05.850980978Z [inf]  Extracted images from ZIP
+2026-05-01T11:05:05.850989267Z [inf]  Uploading 27 images to Dropbox (parallel, batch size 3)
+2026-05-01T11:05:06.839237939Z [inf]  Dropbox URL for footer_logo.png
+2026-05-01T11:05:06.839271751Z [inf]  Dropbox URL for banner_img.png
+2026-05-01T11:05:06.839280180Z [inf]  Dropbox URL for divider_line.png
+2026-05-01T11:05:09.052279006Z [inf]  Dropbox URL for icon1.png
+2026-05-01T11:05:09.052285844Z [inf]  Dropbox URL for icon2.png
+2026-05-01T11:05:11.155356613Z [inf]  Dropbox URL for icon3.png
+2026-05-01T11:05:14.437216658Z [inf]  Dropbox URL for img11.png
+2026-05-01T11:05:15.429679235Z [inf]  Dropbox URL for img10.png
+2026-05-01T11:05:15.429687802Z [inf]  Dropbox URL for img1.png
+2026-05-01T11:05:19.213348618Z [inf]  Dropbox URL for img12.png
+2026-05-01T11:05:20.275667261Z [inf]  Dropbox URL for img14.png
+2026-05-01T11:05:22.261559440Z [inf]  Dropbox URL for img13.png
+2026-05-01T11:05:26.304845477Z [inf]  Dropbox URL for img15.png
+2026-05-01T11:05:27.203750672Z [inf]  Dropbox URL for img16.png
+2026-05-01T11:05:27.203815998Z [inf]  Dropbox URL for img17.png
+2026-05-01T11:05:30.481570460Z [inf]  Dropbox URL for img3.png
+2026-05-01T11:05:31.438825718Z [inf]  Dropbox URL for img2.png
+2026-05-01T11:05:32.409571212Z [inf]  Dropbox URL for img18.png
+2026-05-01T11:05:36.481664331Z [inf]  Dropbox URL for img4.png
+2026-05-01T11:05:36.481671065Z [inf]  Dropbox URL for img5.png
+2026-05-01T11:05:37.342301834Z [inf]  Dropbox URL for img6.png
+2026-05-01T11:05:41.634248016Z [inf]  Dropbox URL for img8.png
+2026-05-01T11:05:41.634253615Z [inf]  Dropbox URL for img9.png
+2026-05-01T11:05:42.505605329Z [inf]  Dropbox URL for img7.png
+2026-05-01T11:05:46.058590775Z [inf]  Dropbox URL for logo_img1.png
+2026-05-01T11:05:47.163249765Z [inf]  Dropbox URL for logo_img2.png
+2026-05-01T11:05:47.960880476Z [inf]  Dropbox URL for spacer.gif
+2026-05-01T11:05:47.960888518Z [inf]  Dropbox upload complete: 27/27 succeeded
+2026-05-01T11:05:47.960889936Z [inf]  Text extraction complete
+2026-05-01T11:05:47.960898820Z [inf]  Images uploaded to Dropbox
+2026-05-01T11:05:47.960907134Z [inf]  Stage 1 starting (v5.0.0)
+2026-05-01T11:05:47.960915346Z [err]  Tesseract OCR failed
+2026-05-01T11:05:47.964015621Z [inf]  Page 1 band detection
+2026-05-01T11:05:47.966351058Z [inf]  Page 1 original
+2026-05-01T11:05:47.966360468Z [inf]  Page 1 tiling plan
+2026-05-01T11:05:47.966381802Z [inf]  Band detection + palette complete
+2026-05-01T11:05:48.052334026Z [inf]  All tiles prepared
+2026-05-01T11:05:48.052482494Z [inf]  Tile 1/1 compressed
+2026-05-01T11:06:58.763181074Z [inf]  Stage 1 response received
+2026-05-01T11:06:58.763187382Z [wrn]  Some meaningful bands not covered by Stage 1 sections
+2026-05-01T11:06:58.763194363Z [inf]  Stage 1 complete (v5.0.0)
+2026-05-01T11:06:58.763200216Z [inf]  Stage 2: Sending spec to Claude for HTML generation
+2026-05-01T11:09:09.944200570Z [inf]  Pre-post-process state check
+2026-05-01T11:09:09.944210243Z [inf]  Post-processing complete (v5.5.0)
+2026-05-01T11:09:09.944217140Z [inf]  Stage 2 complete: HTML generated
+2026-05-01T11:09:09.944224303Z [wrn]  SECTION COUNT MISMATCH — HTML has fewer sections than spec
+2026-05-01T11:09:09.946207525Z [inf]  Sending response to frontend
+2026-05-01T11:09:09.946313237Z [inf]  Generation complete (two-stage pipeline)
+2026-05-01T11:11:05.405589269Z [inf]  Building delivery ZIP
+2026-05-01T11:11:05.405596005Z [inf]  ZIP built
+2026-05-01T11:11:05.405601451Z [inf]  Uploading ZIP to Dropbox: /maveloper/05-2026/OF118971610143.zip
+2026-05-01T11:11:10.978370110Z [inf]  ZIP uploaded to Dropbox
