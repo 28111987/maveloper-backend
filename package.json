@@ -1,14 +1,16 @@
 {
   "name": "maveloper-backend",
-  "version": "5.4.1",
+  "version": "5.5.0",
   "description": "Maveloper backend — PDF to HTML email code generator using Claude Vision + Supabase auth",
+  "private": true,
   "type": "module",
   "main": "server.js",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check band-detector.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
