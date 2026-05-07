@@ -469,7 +469,111 @@ function extractRadius(node) {
 function walkSection(sectionNode, ctx) {
   const elements = [];
   collect(sectionNode, elements, ctx, /* isRoot */ true);
-  return elements;
+  return collapseRepeats(elements);
+}
+
+/**
+ * Detect and collapse exact-repeat patterns in a content array.
+ *
+ * Why: Real-world Figma files (e.g., Kenect newsletter) contain hidden
+ * duplicate layers from designer iterations. The walker visits both copies
+ * because they aren't marked visible:false. Without this collapse, Stage 2
+ * faithfully renders content twice.
+ *
+ * Two patterns handled:
+ *   1. WHOLE-ARRAY REPEAT: [A,B,C,A,B,C] → [A,B,C]
+ *   2. HEADER + REPEATING TAIL: [H, A,B,C, A,B,C] → [H, A,B,C]
+ *      (e.g., Kenect "New Release" section with title + 2x duplicated card)
+ *
+ * Safety: legitimate layouts with DIFFERENT text per repeat (e.g., the
+ * common Mavlers stat-grid pattern "47% IRR" / "0.40x DPI") are NOT
+ * collapsed because contentEquals returns false on different text.
+ * Only EXACT character-for-character repeats fold.
+ */
+function collapseRepeats(content) {
+  const len = content.length;
+  if (len < 2) return content;
+
+  // Pattern 1: whole-array period
+  for (let n = 1; n <= Math.floor(len / 2); n++) {
+    if (len % n !== 0) continue;
+    if (isPeriodic(content, 0, len, n)) {
+      return content.slice(0, n);
+    }
+  }
+
+  // Pattern 2: header (length k) + repeating tail (period n)
+  for (let k = 1; k <= len - 2; k++) {
+    const tailLen = len - k;
+    for (let n = 1; n <= Math.floor(tailLen / 2); n++) {
+      if (tailLen % n !== 0) continue;
+      if (isPeriodic(content, k, len, n)) {
+        return content.slice(0, k + n);
+      }
+    }
+  }
+
+  return content;
+}
+
+/**
+ * Check whether content[start..end] consists of a period-n pattern repeated.
+ * Requires (end - start) % n === 0.
+ */
+function isPeriodic(content, start, end, n) {
+  for (let i = start + n; i < end; i++) {
+    if (!contentEquals(content[i], content[start + ((i - start) % n)])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Strict equality check for content elements. Used by collapseRepeats and
+ * the cross-section dedup pass. Two elements are equal only if they would
+ * render identically.
+ */
+function contentEquals(a, b) {
+  if (!a || !b) return false;
+  if (a.el !== b.el) return false;
+  if (a.el === "text") {
+    return a.text === b.text && a.size === b.size && a.color === b.color && a.weight === b.weight;
+  }
+  if (a.el === "cta") {
+    return a.cta_text === b.cta_text && a.cta_bg === b.cta_bg && a.cta_color === b.cta_color;
+  }
+  if (a.el === "image") {
+    return a.alt === b.alt && a.width === b.width && a.height === b.height;
+  }
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Cross-section dedup: if section N and section N+1 have identical
+ * content arrays AND same bg, drop the duplicate.
+ *
+ * Why: in some Figma files, an entire section is duplicated (e.g., Kenect's
+ * Audi North Park testimonial card appearing twice in adjacent positions).
+ * Within a section, collapseRepeats handles intra-section repeats; this
+ * function handles section-level repeats.
+ */
+function dedupAdjacentSections(sections) {
+  const out = [];
+  for (const s of sections) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.bg === s.bg &&
+      prev.type === s.type &&
+      prev.content.length === s.content.length &&
+      prev.content.every((c, i) => contentEquals(c, s.content[i]))
+    ) {
+      continue; // identical to previous — skip
+    }
+    out.push(s);
+  }
+  return out;
 }
 
 function collect(node, out, ctx, isRoot = false) {
@@ -817,6 +921,13 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     throw new Error("Parsed Figma frame produced zero content sections. Check the frame contains visible text/images.");
   }
 
+  // v6.0.1: cross-section dedup. Removes adjacent sections with identical
+  // content + bg + type (e.g., Kenect's Audi North Park testimonial card
+  // duplicated by hidden layers in the source file).
+  const dedupedSections = dedupAdjacentSections(sections);
+  // Renumber after dedup so 'n' fields stay sequential
+  dedupedSections.forEach((s, i) => { s.n = i + 1; });
+
   // 8. Detect fonts from text nodes (most-frequent wins)
   const fontCounts = new Map();
   (function countFonts(n) {
@@ -834,8 +945,8 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     width: devOverrides.emailWidth || emailWidth,
     font_body: devOverrides.primaryFont || detectedFont,
     font_heading: devOverrides.secondaryFont || detectedFont,
-    sections,
-    band_count: sections.length,
+    sections: dedupedSections,
+    band_count: dedupedSections.length,
   };
   designSpec._palette = buildPalette(designSpec);
   designSpec.palette_used = designSpec._palette;
