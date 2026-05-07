@@ -10,6 +10,7 @@ import { Dropbox } from "dropbox";
 import path from "node:path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
+import { figmaToDesignSpec } from "./figma-parser.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 
@@ -31,6 +32,14 @@ const dropboxConfigured = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET && DROPB
 if (!dropboxConfigured) {
   console.warn("WARNING: Dropbox credentials not fully configured. Image upload and ZIP delivery will be disabled.");
   console.warn("Set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN in Railway Variables.");
+}
+
+// v6.0.0: Figma API token for the /generate-from-figma endpoint.
+// Optional — if not set, only the PDF /generate endpoint is available.
+const FIGMA_API_TOKEN = process.env.FIGMA_API_TOKEN;
+const figmaConfigured = Boolean(FIGMA_API_TOKEN);
+if (!figmaConfigured) {
+  console.warn("WARNING: FIGMA_API_TOKEN not set. /generate-from-figma will return 503 until configured.");
 }
 
 // =====================================================================
@@ -3027,10 +3036,11 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     apiKeyConfigured: Boolean(process.env.CLAUDE_API_KEY),
     dropboxConfigured,
+    figmaConfigured,
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "5.5.0",
+    version: "6.0.0",
   });
 });
 
@@ -4247,6 +4257,259 @@ ${specs.join("\n\n")}
   }
 });
 
+// =====================================================================
+// POST /generate-from-figma — v6.0.0 Figma path
+// Accepts: { figmaUrl, emailWidth?, primaryFont?, secondaryFont?, espPlatform?, darkMode? }
+// Returns: { html, orderId, designSpec, pendingImageRefs, figmaSource, requestId }
+//
+// Pipeline:
+//   1. Parse Figma URL → fetch node tree from Figma REST API
+//   2. Convert node tree to designSpec JSON (skips Stage 1 vision entirely)
+//   3. Send designSpec to Stage 2 (existing prompt, unchanged)
+//   4. Run post-processors (most are no-ops on the Figma path; HTML hygiene
+//      helpers like font-stack and malformed-img fixes still apply)
+//   5. Return HTML + pendingImageRefs (Phase A: devs export images manually)
+//
+// Phase A scope: image src fields are empty in the spec; HTML output will
+// have src="" on every image. Phase B will add automatic Figma /v1/images
+// export + Dropbox upload.
+// =====================================================================
+app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { figmaUrl, emailWidth, primaryFont, secondaryFont, espPlatform, darkMode } = req.body;
+
+    // --- Validate input ---
+    if (!figmaUrl || typeof figmaUrl !== "string") {
+      return res.status(400).json({
+        error: "Missing figmaUrl",
+        details: "Request body must include a figmaUrl field with a Figma share link.",
+        requestId: req.id,
+      });
+    }
+
+    if (!figmaConfigured) {
+      return res.status(503).json({
+        error: "Figma not configured",
+        details: "FIGMA_API_TOKEN env var is not set on the backend. Contact the Maveloper admin.",
+        requestId: req.id,
+      });
+    }
+
+    log("info", "Figma generation starting", {
+      requestId: req.id,
+      figmaUrl: figmaUrl.split("?")[0], // strip query params for cleaner logs
+      userId: req.user?.id ?? "anonymous",
+      userEmail: req.user?.email ?? "anonymous",
+    });
+
+    // --- Stage 1 (Figma): parse URL → fetch → produce designSpec ---
+    let figmaResult;
+    try {
+      figmaResult = await figmaToDesignSpec({
+        figmaUrl,
+        token: FIGMA_API_TOKEN,
+        devOverrides: { emailWidth, primaryFont, secondaryFont },
+      });
+    } catch (figmaErr) {
+      // Surface user-facing errors (bad URL, multi-frame ambiguity) as 400.
+      // Network / token / API errors are 502.
+      const msg = figmaErr.message || "";
+      const isUserError =
+        figmaErr.code === "MULTIPLE_EMAIL_FRAMES" ||
+        /Figma URL|Figma frame|Figma node|email-shaped|email design frame|Right-click|Copy link/i.test(msg);
+      log("warn", "Figma parse failed", {
+        requestId: req.id,
+        error: msg,
+        code: figmaErr.code,
+        userError: isUserError,
+      });
+      return res.status(isUserError ? 400 : 502).json({
+        error:
+          figmaErr.code === "MULTIPLE_EMAIL_FRAMES"
+            ? "Multiple email frames in URL"
+            : isUserError
+            ? "Invalid Figma URL"
+            : "Figma fetch failed",
+        details: msg,
+        candidates: figmaErr.candidates ?? undefined, // structured list for picker UI
+        requestId: req.id,
+      });
+    }
+
+    const { designSpec, imageRefs, fileName, sourceFrame, warnings, fileKey, nodeId, layoutMode } = figmaResult;
+
+    // --- Extract Order ID from frame name (Mavlers convention: OF/OID + digits) ---
+    const orderIdMatch = sourceFrame.name?.match(/(?:OID|OF)\d{8,}/i);
+    const orderId = orderIdMatch ? orderIdMatch[0].toUpperCase() : `FIGMA-${Date.now()}`;
+
+    log("info", "Figma parse complete", {
+      requestId: req.id,
+      orderId,
+      fileName,
+      frameName: sourceFrame.name,
+      frameWidth: sourceFrame.width,
+      sections: designSpec.sections.length,
+      imageRefs: imageRefs.length,
+      layoutMode,
+      warnings,
+    });
+
+    // --- Build developer specs (mirrors PDF flow) ---
+    const finalWidth = emailWidth || designSpec.width;
+    const finalFont = primaryFont || designSpec.font_body;
+
+    const specs = [];
+    specs.push(`EMAIL_WIDTH: ${finalWidth}px`);
+    specs.push(`PRIMARY_FONT: ${finalFont}`);
+    if (secondaryFont) specs.push(`SECONDARY_FONT: ${secondaryFont}`);
+    if (espPlatform && espPlatform !== "none") specs.push(`ESP_PLATFORM: ${espPlatform}`);
+    if (darkMode === true) specs.push(`DARK_MODE: true (force dark mode CSS)`);
+    if (darkMode === false) specs.push(`DARK_MODE: false (skip dark mode CSS)`);
+
+    // --- Image handling: Phase A is manual export ---
+    // imageUrlMap is empty; HTML will have src="" on each <img>. Devs export
+    // images from Figma and paste URLs themselves. pendingImageRefs is returned
+    // to the frontend so the dev sees a list of what to export.
+    const imageUrlMap = {};
+    const imageSection = `
+
+=== IMAGE ASSETS REFERENCE ===
+PHASE A NOTE: Image src fields in the spec are intentionally empty. Mavlers devs will replace placeholders manually after generation.
+- Leave src="" on each <img> tag in the HTML.
+- Preserve the alt text from the spec verbatim.
+- Preserve the width/height from the spec verbatim.
+- Do NOT fabricate filenames, image URLs, or guess based on alt text.
+=== END IMAGE ASSETS REFERENCE ===`;
+
+    // --- Stage 2 invocation (uses existing STAGE2_PROMPT, unchanged) ---
+    const stage2UserPrompt = `Generate production-ready Mavlers-grade HTML email code from the following design specification. Output ONLY the HTML starting with <!DOCTYPE. No markdown. No explanation.
+
+=== DESIGN SPECIFICATION (from Figma parser) ===
+${JSON.stringify(designSpec, null, 2)}
+=== END DESIGN SPECIFICATION ===
+
+=== DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
+${specs.join("\n\n")}
+=== END DEVELOPER SPECIFICATIONS ===${imageSection}`;
+
+    log("info", "Stage 2: Sending Figma spec to Claude", {
+      requestId: req.id,
+      specSections: designSpec.sections.length,
+      imageRefs: imageRefs.length,
+      devSpecs: specs.length,
+      finalWidth,
+      finalFont,
+      espPlatform: espPlatform || "none",
+      darkMode: darkMode ?? "auto",
+    });
+
+    const stage2StartTime = Date.now();
+
+    const stage2Response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 32000,
+      system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
+      messages: [{ role: "user", content: [{ type: "text", text: stage2UserPrompt }] }],
+    });
+
+    const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
+    if (!stage2TextBlock || !stage2TextBlock.text) {
+      log("error", "Stage 2 (Figma): Claude returned no text", {
+        requestId: req.id,
+        contentBlocks: stage2Response.content?.length || 0,
+      });
+      return res.status(502).json({
+        error: "HTML generation failed",
+        details: "Claude could not generate HTML from the Figma spec. Please try again.",
+        requestId: req.id,
+      });
+    }
+
+    const html_raw = stage2TextBlock.text;
+
+    // --- Post-processing: most rules are no-ops on Figma path, but HTML
+    //     hygiene rules (font stacks, malformed self-closing img, Google
+    //     Fonts link conversion) still apply.
+    const postProcessResult = postProcessHtml(html_raw, {
+      imageUrlMap,
+      palette: designSpec._palette || [],
+      bandMap: [], // Figma path has no band map
+      imageDimensionsMap: {}, // Phase A: no dimension data without exporting
+      zipWasUploaded: false,
+      secondaryFont: secondaryFont || designSpec.font_heading,
+    });
+    const html = postProcessResult.html;
+
+    log("info", "Figma generation complete", {
+      requestId: req.id,
+      orderId,
+      stage2DurationMs: Date.now() - stage2StartTime,
+      totalPipelineDurationMs: Date.now() - startTime,
+      htmlLength: html.length,
+      specSections: designSpec.sections.length,
+      googleFontLinkConvertFixes: postProcessResult.report.googleFontLinkConvert?.fixes,
+      malformedImgFixes: postProcessResult.report.malformedImgFix?.fixes,
+      fontStackQuoteFixes: postProcessResult.report.fontStackQuotes?.fixes,
+      secondaryFontStripFixes: postProcessResult.report.secondaryFontStrip?.fixes,
+    });
+
+    // --- Return response ---
+    res.json({
+      html,
+      orderId,
+      pageCount: 1, // Figma has no pages concept — single frame in, single HTML out
+      pageImages: [], // Frontend renders Figma thumbnail directly via Figma's public CDN
+      imageUrlMap,
+      imageSource: "figma",
+      imageCount: 0,
+      pendingImageRefs: imageRefs, // Devs export these from Figma manually in Phase A
+      figmaSource: {
+        fileKey,
+        nodeId,
+        fileName,
+        frameName: sourceFrame.name,
+        frameWidth: sourceFrame.width,
+        layoutMode,
+      },
+      designSpec,
+      warnings,
+      requestId: req.id,
+    });
+  } catch (err) {
+    log("error", "Figma generation error", {
+      requestId: req.id,
+      error: err.message,
+      errorBody: err.error ? JSON.stringify(err.error).substring(0, 2000) : "no error body",
+      status: err.status,
+      durationMs: Date.now() - startTime,
+    });
+
+    let userMessage = "An unexpected error occurred. Please try again.";
+    let statusCode = 500;
+
+    if (err.message?.includes("timed out") || err.message?.includes("timeout")) {
+      userMessage = "Figma API or Claude took too long. Try again.";
+      statusCode = 504;
+    } else if (err.status === 429) {
+      userMessage = "Maveloper is currently overloaded. Please wait a minute and try again.";
+      statusCode = 429;
+    } else if (err.status === 401) {
+      userMessage = "Backend configuration error. Please contact the Maveloper admin.";
+      statusCode = 500;
+    } else if (err.message?.includes("Not allowed by CORS")) {
+      userMessage = "Request blocked by CORS policy.";
+      statusCode = 403;
+    }
+
+    res.status(statusCode).json({
+      error: "Figma generation failed",
+      details: userMessage,
+      requestId: req.id,
+    });
+  }
+});
+
 // -----------------------------------------------------------------
 // POST /approve — Package ZIP and upload to Dropbox
 // Called after dev reviews preview and clicks "Approve & Upload"
@@ -4361,8 +4624,9 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "5.5.0",
+    version: "6.0.0",
     dropboxConfigured,
+    figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
 });
