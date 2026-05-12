@@ -378,6 +378,44 @@ function extractBgHex(node) {
 }
 
 /**
+ * v6.3.0: Walk up the parent chain to find the nearest ancestor with a
+ * solid bg fill. Used when a section's immediate frame has no fill —
+ * the section visually inherits the bg of its enclosing email frame,
+ * not the default white.
+ *
+ * Mavlers designs commonly use this pattern: email frame has dark fill,
+ * sections inside are transparent (no fill), text inside sections is
+ * white. Without ancestor walk, the parser produced bg=#FFFFFF for these
+ * sections → white-on-white invisible text in the output.
+ *
+ * parentMap: built by buildParentMap() during initial node walk.
+ */
+function extractEffectiveBg(node, parentMap, fallback = "#FFFFFF") {
+  let cur = node;
+  while (cur) {
+    const ownBg = extractBgHex(cur);
+    if (ownBg) return ownBg;
+    cur = parentMap.get(cur.id);
+  }
+  return fallback;
+}
+
+/**
+ * Build a Map from nodeId → parent node, so we can walk ancestor chains
+ * without Figma providing parent pointers (their API doesn't include them).
+ * Called once at the top of figmaToDesignSpec().
+ */
+function buildParentMap(root) {
+  const map = new Map();
+  function walk(node, parent) {
+    if (parent) map.set(node.id, parent);
+    for (const c of node.children || []) walk(c, node);
+  }
+  walk(root, null);
+  return map;
+}
+
+/**
  * Returns the first IMAGE fill (if any) on a node, plus the imageRef.
  * imageRef is what Figma's /v1/images endpoint takes to export the asset.
  */
@@ -1021,10 +1059,18 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
   // 6. Detect sections
   const sectionNodes = detectSections(contentRoot);
 
+  // v6.3.0: build parent map for ancestor-aware bg resolution. Without
+  // this, sections with no fill default to white even when the email
+  // frame's actual bg is dark — causing white-on-white invisible text.
+  const parentMap = buildParentMap(emailFrame);
+
   // 7. Walk each section into spec form
   const ctx = { imageRefs: [] };
   const sections = [];
   const frameOrigin = emailFrame.absoluteBoundingBox?.y ?? 0;
+  // v6.3.0: email frame's bg becomes the fallback for sections without
+  // their own fill (matches how Figma visually renders nested frames).
+  const emailFallbackBg = extractBgHex(emailFrame) || "#FFFFFF";
 
   sectionNodes.forEach((node, idx) => {
     const content = walkSection(node, ctx);
@@ -1033,7 +1079,10 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     const bbox = node.absoluteBoundingBox || {};
     const yStart = Math.round((bbox.y ?? 0) - frameOrigin);
     const yEnd = Math.round(yStart + (bbox.height ?? 0));
-    const bg = extractBgHex(node) || "#FFFFFF";
+    // v6.3.0: ancestor-aware bg. If the section frame has no fill,
+    // walk up the parent chain until we find one. Final fallback is
+    // the email frame's bg, then white.
+    const bg = extractEffectiveBg(node, parentMap, emailFallbackBg);
     const pad = extractPadding(node);
     const align = mapTextAlign((node.children || [])[0]?.style?.textAlignHorizontal); // best guess
 
