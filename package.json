@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "7.0.0",
-  "description": "Maveloper backend — Stage 2 powered by Claude Opus 4.7 (multimodal: JSON spec + Figma render). Major model upgrade for stronger layout reasoning.",
+  "version": "8.0.0",
+  "description": "Maveloper backend — Stage 2 with human-coded reference library (Opus + multimodal + few-shot reference HTML for Mavlers pattern matching)",
   "private": true,
   "type": "module",
   "main": "server.js",
