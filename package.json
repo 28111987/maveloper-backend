@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "6.6.0",
-  "description": "Maveloper backend — Stage 2 now multimodal: sees the Figma render alongside the JSON spec, improving layout decisions (grids, side-by-side, capsules)",
+  "version": "7.0.0",
+  "description": "Maveloper backend — Stage 2 powered by Claude Opus 4.7 (multimodal: JSON spec + Figma render). Major model upgrade for stronger layout reasoning.",
   "private": true,
   "type": "module",
   "main": "server.js",
