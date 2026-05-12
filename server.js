@@ -3041,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.5.1",
+    version: "6.6.0",
   });
 });
 
@@ -4381,6 +4381,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     // the parent email frame for the side-by-side preview pane.
     let imageUrlMap = {};
     let previewImageUrl = null;
+    let previewBufferForStage2 = null;  // v6.6.0: held for Stage 2 visual input
     let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0, bgImageCount: 0 };
     const imageExportStartTime = Date.now();
 
@@ -4492,6 +4493,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
         // Pull out the email frame preview separately
         const previewBuffer = previewNodeId ? bufferMap.get(previewNodeId) : null;
         if (previewNodeId) bufferMap.delete(previewNodeId);
+        previewBufferForStage2 = previewBuffer; // v6.6.0: pass to Stage 2 as visual reference
 
         if (dropboxConfigured) {
           const takenFilenames = new Set();
@@ -4596,8 +4598,36 @@ ${imageUrlList}
 No images were exported for this email. Leave src="" on each <img> tag.
 === END IMAGE ASSETS REFERENCE ===`;
 
-    // --- Stage 2 invocation (uses existing STAGE2_PROMPT, unchanged) ---
-    const stage2UserPrompt = `Generate production-ready Mavlers-grade HTML email code from the following design specification. Output ONLY the HTML starting with <!DOCTYPE. No markdown. No explanation.
+    // --- Stage 2 invocation ---
+    // v6.6.0: Stage 2 now receives the rendered Figma frame as a visual
+    // reference IMAGE input alongside the JSON spec. Claude sees what the
+    // email should look like while writing the HTML — like a human dev
+    // referencing the design while coding. This is intended to help with
+    // layout decisions (grids vs stacks, side-by-side vs vertical) that
+    // the JSON spec alone can't fully convey.
+    const hasVisualReference = Boolean(previewBufferForStage2);
+    const visualReferenceInstructions = hasVisualReference
+      ? `
+
+=== VISUAL REFERENCE (FIGMA RENDER) ===
+An image of the source Figma design is attached. Use it to understand LAYOUT and STRUCTURE:
+- Multi-column layouts (e.g., 2-column profile sections, 3×2 candidate card grids)
+- Horizontal vs vertical arrangement of related elements
+- Side-by-side CTA banners vs stacked CTA blocks
+- Capsule/pill styling on tags, labels, status badges
+- Card grouping and spacing rhythm
+- Section dividers and visual separators
+
+CRITICAL RULES:
+1. The JSON spec is the AUTHORITATIVE source for ALL TEXT CONTENT. Use spec text verbatim — never transcribe text from the image.
+2. The JSON spec is the AUTHORITATIVE source for COLORS, IMAGE URLs, FONT SIZES, and explicit dimensions.
+3. The IMAGE is the AUTHORITATIVE source for LAYOUT STRUCTURE — column counts, element grouping, horizontal vs vertical arrangement.
+4. When the spec is ambiguous about layout (e.g., 6 cards in a row — grid or list?), the image resolves it.
+5. Match the image's layout structure precisely. If the image shows 3×2 grid, output a 3×2 grid. If side-by-side CTA, output side-by-side. Do NOT default to vertical stacking.
+=== END VISUAL REFERENCE ===`
+      : "";
+
+    const stage2UserPrompt = `Generate production-ready Mavlers-grade HTML email code from the following design specification and visual reference. Output ONLY the HTML starting with <!DOCTYPE. No markdown. No explanation.
 
 === DESIGN SPECIFICATION (from Figma parser) ===
 ${JSON.stringify(designSpec, null, 2)}
@@ -4605,7 +4635,25 @@ ${JSON.stringify(designSpec, null, 2)}
 
 === DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
 ${specs.join("\n\n")}
-=== END DEVELOPER SPECIFICATIONS ===${imageSection}`;
+=== END DEVELOPER SPECIFICATIONS ===${imageSection}${visualReferenceInstructions}`;
+
+    const stage2StartTime = Date.now();
+
+    // v6.6.0: build the user content array — image first (Anthropic best
+    // practice for multimodal attention), then text. If no preview buffer
+    // is available (Figma image render failed), fall back to text-only.
+    const userContent = [];
+    if (hasVisualReference) {
+      userContent.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: previewBufferForStage2.toString("base64"),
+        },
+      });
+    }
+    userContent.push({ type: "text", text: stage2UserPrompt });
 
     log("info", "Stage 2: Sending Figma spec to Claude", {
       requestId: req.id,
@@ -4616,15 +4664,15 @@ ${specs.join("\n\n")}
       finalFont,
       espPlatform: espPlatform || "none",
       darkMode: darkMode ?? "auto",
+      hasVisualReference,              // v6.6.0 diagnostic
+      previewBytesKB: previewBufferForStage2 ? Math.round(previewBufferForStage2.length / 1024) : 0,
     });
-
-    const stage2StartTime = Date.now();
 
     const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 32000,
       system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: [{ type: "text", text: stage2UserPrompt }] }],
+      messages: [{ role: "user", content: userContent }],
     });
 
     const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
@@ -4838,7 +4886,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.5.1",
+    version: "6.6.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
