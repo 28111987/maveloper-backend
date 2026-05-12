@@ -951,13 +951,10 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
   designSpec._palette = buildPalette(designSpec);
   designSpec.palette_used = designSpec._palette;
 
-  // Strip internal-only fields (_figmaNodeId tracks image nodes for Phase B
-  // export). These are not understood by Stage 2's prompt and would confuse it.
-  for (const s of designSpec.sections) {
-    for (const c of s.content) {
-      delete c._figmaNodeId;
-    }
-  }
+  // v6.1.0: _figmaNodeId on image elements is intentionally left in the spec
+  // here. The server's Phase B image-export step uses it to match Dropbox
+  // URLs back to spec elements, then strips it before sending to Stage 2.
+  // (Previously stripped in v6.0.x because Phase A had no use for it.)
 
   return {
     designSpec,
