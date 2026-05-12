@@ -58,6 +58,8 @@ export async function fetchRawImageRefUrls({ fileKey, token, fetchImpl = fetch }
 }
 
 
+/**
+ * Render and download Figma nodes as PNG buffers.
  *
  * @param {Object} opts
  * @param {string} opts.fileKey         - Figma file key
