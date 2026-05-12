@@ -25,7 +25,39 @@ const PNG_DOWNLOAD_TIMEOUT_MS = 30 * 1000;
 const PNG_DOWNLOAD_CONCURRENCY = 5;       // parallel downloads from signed URLs
 
 /**
- * Render and download Figma nodes as PNG buffers.
+ * v6.5.0: Fetch the raw image URL for each imageRef in a Figma file.
+ *
+ * Why this exists: /v1/images renders nodes as COMPOSITED PNGs — for a
+ * frame with an image fill AND child text overlays, the result contains
+ * both the image AND the text baked in. When we use that as a CSS
+ * background-image and also emit the text as live HTML on top, the text
+ * appears twice ("double-print" bug).
+ *
+ * The /v1/files/{key}/images endpoint returns the raw, uncomposited
+ * image data (just the underlying bitmap) keyed by imageRef.
+ *
+ * @param {Object} opts
+ * @param {string} opts.fileKey
+ * @param {string} opts.token
+ * @param {Function} [opts.fetchImpl]
+ * @returns {Promise<Map<string, string>>}  imageRef → CDN download URL
+ */
+export async function fetchRawImageRefUrls({ fileKey, token, fetchImpl = fetch }) {
+  const url = `${FIGMA_API_BASE}/files/${fileKey}/images`;
+  const response = await fetchImpl(url, { headers: { "X-Figma-Token": token } });
+  if (!response.ok) {
+    throw new Error(`Figma /v1/files/.../images returned ${response.status}`);
+  }
+  const json = await response.json();
+  const map = new Map();
+  const images = json?.meta?.images || {};
+  for (const [ref, signedUrl] of Object.entries(images)) {
+    if (signedUrl) map.set(ref, signedUrl);
+  }
+  return map;
+}
+
+
  *
  * @param {Object} opts
  * @param {string} opts.fileKey         - Figma file key
@@ -111,6 +143,7 @@ export function patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap) {
         missing++;
       }
       delete section.bg_image._figmaNodeId;
+      delete section.bg_image._imageRef;  // v6.5.0
     }
 
     for (const el of section.content || []) {
@@ -124,7 +157,8 @@ export function patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap) {
       } else {
         missing++;
       }
-      delete el._figmaNodeId;  // strip internal marker regardless
+      delete el._figmaNodeId;  // strip internal markers regardless
+      delete el._imageRef;     // v6.5.0
     }
   }
   return { patched, missing };
