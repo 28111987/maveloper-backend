@@ -47,7 +47,12 @@ if (!figmaConfigured) {
 // CONFIGURATION
 // =====================================================================
 const PORT = process.env.PORT || 3000;
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
+// v7.0.0: Default to Claude Opus 4.7 for stronger layout reasoning from
+// the multimodal Stage 2 input (JSON spec + Figma render image). To switch
+// back to Sonnet without redeploy: set CLAUDE_MODEL=claude-sonnet-4-5 in
+// Railway env vars and restart. Cost trade-off: Opus is ~10× per generation
+// but materially better at multi-step layout reasoning.
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
 const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
 const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
@@ -3041,7 +3046,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.6.0",
+    version: "7.0.0",
   });
 });
 
@@ -4726,6 +4731,7 @@ ${specs.join("\n\n")}
       imageSource: "figma",
       imageCount: Object.keys(imageUrlMap).length,
       imageExportReport,                                    // v6.1.0: visibility into export status
+      model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic — which Claude model produced this
       figmaSource: {
         fileKey,
         nodeId,
@@ -4886,7 +4892,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.6.0",
+    version: "7.0.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
