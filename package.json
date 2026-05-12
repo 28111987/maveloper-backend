@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "6.0.1",
-  "description": "Maveloper backend — Figma URL or PDF to HTML email code generator using Claude Vision + Supabase auth",
+  "version": "6.1.0",
+  "description": "Maveloper backend — Figma URL or PDF to HTML email code generator with Claude Vision + Supabase auth + automated image export",
   "private": true,
   "type": "module",
   "main": "server.js",
@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check band-detector.js && node --check figma-parser.js"
+    "check": "node --check server.js && node --check band-detector.js && node --check figma-parser.js && node --check figma-image-export.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
