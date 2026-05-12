@@ -11,7 +11,7 @@ import path from "node:path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 import { figmaToDesignSpec } from "./figma-parser.js";
-import { renderFigmaNodes, makeFilename, patchSpecImageSrcs } from "./figma-image-export.js";
+import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrls } from "./figma-image-export.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 
@@ -3041,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.4.0",
+    version: "6.5.0",
   });
 });
 
@@ -4390,11 +4390,17 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       // 2. Section bg_images (v6.2.0 hero-with-overlay pattern)
       // 3. The email frame itself (for the preview pane)
       const inlineImageNodeIds = imageRefs.map((r) => r.nodeId);
+      // v6.5.0: bg_image collection now also captures imageRef so we can
+      // fetch the RAW (uncomposited) image instead of a frame render.
+      // Without this fix, frames with image fill + text children render
+      // as PNGs containing the text — which then duplicates when the HTML
+      // overlay text is rendered on top of the bg ("double print" bug).
       const bgImageNodes = [];
       for (const s of designSpec.sections || []) {
         if (s.bg_image && s.bg_image._figmaNodeId) {
           bgImageNodes.push({
             nodeId: s.bg_image._figmaNodeId,
+            imageRef: s.bg_image._imageRef,   // v6.5.0
             name: s.bg_image.alt || `section-${s.n}-bg`,
             width: s.bg_image.width,
             height: s.bg_image.height,
@@ -4418,15 +4424,16 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       }
       const dedupedInlineIds = Array.from(renderKeyToNodeId.values());
 
-      // Collect ALL nodeIds to render (deduped inline + bg images + preview)
+      // Collect ALL nodeIds to render via /v1/images (inline + preview).
+      // v6.5.0: bg_images NO LONGER go through /v1/images — they use raw
+      // image-ref URLs via /v1/files/.../images to avoid double-print.
       const previewNodeId = sourceFrame.id;
       const allNodeIds = [
         ...dedupedInlineIds,
-        ...bgImageNodes.map((b) => b.nodeId),
         ...(previewNodeId ? [previewNodeId] : []),
       ];
 
-      if (allNodeIds.length > 0) {
+      if (allNodeIds.length > 0 || bgImageNodes.length > 0) {
         log("info", "Phase B: requesting Figma render", {
           requestId: req.id,
           inlineImagesTotal: imageRefs.length,
@@ -4436,13 +4443,51 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
           includesPreview: Boolean(previewNodeId),
         });
 
-        const bufferMap = await renderFigmaNodes({
-          fileKey,
-          nodeIds: allNodeIds,
-          token: FIGMA_API_TOKEN,
-          logFn: (level, msg, meta) => log(level, msg, { requestId: req.id, ...meta }),
-        });
+        // Inline images + preview: composited renders via /v1/images
+        const bufferMap = allNodeIds.length > 0
+          ? await renderFigmaNodes({
+              fileKey,
+              nodeIds: allNodeIds,
+              token: FIGMA_API_TOKEN,
+              logFn: (level, msg, meta) => log(level, msg, { requestId: req.id, ...meta }),
+            })
+          : new Map();
         imageExportReport.rendered = bufferMap.size;
+
+        // v6.5.0: Background images use RAW image-ref URLs (no compositing).
+        // This prevents the "double print" bug where /v1/images bakes child
+        // text into the bg PNG, then the HTML also renders the text on top.
+        if (bgImageNodes.length > 0) {
+          try {
+            const refsNeeded = bgImageNodes.filter((b) => b.imageRef).map((b) => b.imageRef);
+            if (refsNeeded.length > 0) {
+              const rawUrlMap = await fetchRawImageRefUrls({ fileKey, token: FIGMA_API_TOKEN });
+              for (const bg of bgImageNodes) {
+                if (!bg.imageRef) continue;
+                const signedUrl = rawUrlMap.get(bg.imageRef);
+                if (!signedUrl) {
+                  log("warn", "Phase B: no raw URL for imageRef", { requestId: req.id, imageRef: bg.imageRef });
+                  continue;
+                }
+                try {
+                  const r = await fetch(signedUrl);
+                  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                  const buf = Buffer.from(await r.arrayBuffer());
+                  bufferMap.set(bg.nodeId, buf);
+                  imageExportReport.rendered++;
+                } catch (downloadErr) {
+                  log("warn", "Phase B: raw bg image download failed", {
+                    requestId: req.id, imageRef: bg.imageRef, error: downloadErr.message,
+                  });
+                }
+              }
+            }
+          } catch (rawErr) {
+            log("warn", "Phase B: raw image-ref fetch failed, bg_images will be empty", {
+              requestId: req.id, error: rawErr.message,
+            });
+          }
+        }
 
         // Pull out the email frame preview separately
         const previewBuffer = previewNodeId ? bufferMap.get(previewNodeId) : null;
@@ -4793,7 +4838,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.4.0",
+    version: "6.5.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
