@@ -799,9 +799,24 @@ function pushImageElement(node, out, ctx, { source }) {
   // /v1/images to render whatever it is.
   const imgFill = source === "fill" ? extractImageFill(node) : null;
 
+  // v6.4.0: renderKey for dedup. Two INSTANCEs of the same component at
+  // the same size render to the same PNG; emit one render, reuse URL.
+  //   - INSTANCE: key by componentId+size (Figma instances share master)
+  //   - Image-fill nodes: key by imageRef+size (same imageRef = same bitmap)
+  //   - Everything else: key by nodeId (always unique)
+  let renderKey;
+  if (node.type === "INSTANCE" && node.componentId) {
+    renderKey = `instance:${node.componentId}:${w}x${h}`;
+  } else if (imgFill?.imageRef) {
+    renderKey = `imageref:${imgFill.imageRef}:${w}x${h}`;
+  } else {
+    renderKey = `node:${node.id}`;
+  }
+
   ctx.imageRefs.push({
     nodeId: node.id,
-    imageRef: imgFill?.imageRef ?? null, // null for atomic units; Phase B renders by nodeId
+    imageRef: imgFill?.imageRef ?? null,
+    renderKey,                                  // v6.4.0
     width: w,
     height: h,
     name: node.name,
