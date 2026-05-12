@@ -830,6 +830,7 @@ function pushImageElement(node, out, ctx, { source }) {
     width: w,
     height: h,
     _figmaNodeId: node.id,
+    _imageRef: imgFill?.imageRef ?? null, // v6.5.0: raw imageRef for bg_image extraction
   });
 }
 
@@ -1124,6 +1125,7 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
       if (img.width >= sectionWidth * 0.85 && content.length > 1) {
         section.bg_image = {
           _figmaNodeId: img._figmaNodeId,
+          _imageRef: img._imageRef,   // v6.5.0: enables raw image URL extraction
           src: "",                    // populated by Phase B
           width: img.width,
           height: img.height,
