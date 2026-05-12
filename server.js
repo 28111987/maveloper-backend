@@ -3041,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.5.0",
+    version: "6.5.1",
   });
 });
 
@@ -4838,7 +4838,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.5.0",
+    version: "6.5.1",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
