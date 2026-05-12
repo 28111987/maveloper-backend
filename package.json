@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "6.4.0",
-  "description": "Maveloper backend — Figma URL or PDF to HTML email code generator with deep parser, atomic-unit detection, ancestor-aware bg inheritance, component-master image dedup, and automated image export",
+  "version": "6.5.0",
+  "description": "Maveloper backend — Figma URL or PDF to HTML email code generator with raw imageRef bg_image extraction, deep parser, ancestor-aware bg inheritance, component dedup, and automated image export",
   "private": true,
   "type": "module",
   "main": "server.js",
