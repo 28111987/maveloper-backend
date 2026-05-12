@@ -8,6 +8,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import AdmZip from "adm-zip";
 import { Dropbox } from "dropbox";
 import path from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 import { figmaToDesignSpec } from "./figma-parser.js";
@@ -53,6 +55,44 @@ const PORT = process.env.PORT || 3000;
 // Railway env vars and restart. Cost trade-off: Opus is ~10× per generation
 // but materially better at multi-step layout reasoning.
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
+
+// =====================================================================
+// v8.0.0 — REFERENCE HTML LIBRARY
+//
+// Map Figma fileKey → human-coded HTML reference path. When a request
+// arrives for one of these files, Stage 2 receives the human-coded
+// HTML as a few-shot example, instructed to MATCH ITS STYLISTIC
+// PATTERNS (bordered cards, capsule pills, vertical-line dividers,
+// red status colors, side-by-side layouts) while adapting structure
+// and content to the new spec.
+//
+// To add a new reference:
+//   1. Drop the human-coded HTML into ./references/<name>.html
+//   2. Map the Figma fileKey to that path in REFERENCE_LIBRARY below
+//   3. Restart the server (references load at boot)
+// =====================================================================
+const __dirname_v8 = path.dirname(fileURLToPath(import.meta.url));
+const REFERENCE_LIBRARY = {
+  // Arsenal Pulse — Candidate Intelligence Report
+  "GPBtdVIKA5RMOHK3TITYvZ": path.join(__dirname_v8, "references", "arsenal-pulse.html"),
+  // Add more entries as human-coded references become available
+};
+
+const REFERENCE_CACHE = new Map();
+for (const [fileKey, refPath] of Object.entries(REFERENCE_LIBRARY)) {
+  try {
+    if (existsSync(refPath)) {
+      const content = readFileSync(refPath, "utf-8");
+      REFERENCE_CACHE.set(fileKey, content);
+      console.log(`[v8.0.0] Loaded reference HTML for ${fileKey}: ${refPath} (${Math.round(content.length / 1024)}KB)`);
+    } else {
+      console.warn(`[v8.0.0] Reference path missing: ${refPath}`);
+    }
+  } catch (err) {
+    console.warn(`[v8.0.0] Failed to load reference ${refPath}:`, err.message);
+  }
+}
+
 const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
 const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
@@ -3046,7 +3086,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "7.0.0",
+    version: "8.0.0",
   });
 });
 
@@ -4632,6 +4672,59 @@ CRITICAL RULES:
 === END VISUAL REFERENCE ===`
       : "";
 
+    // v8.0.0: Reference HTML injection — when a human-coded reference exists
+    // for this Figma file, embed it as a few-shot example so Stage 2 learns
+    // the exact Mavlers visual patterns (capsule borders, vertical-line ticker
+    // dividers, bordered card containers, red status indicators, two-column
+    // profile blocks, side-by-side CTA layouts).
+    const referenceHtml = REFERENCE_CACHE.get(fileKey);
+    const referenceSection = referenceHtml
+      ? `
+
+=== HUMAN-CODED REFERENCE EXAMPLE ===
+A senior Mavlers email developer has hand-coded the FINAL VERSION of this exact email design. Their HTML output is provided below as a GOLD-STANDARD REFERENCE for the QUALITY LEVEL and STYLISTIC PATTERNS you must match.
+
+YOUR HTML OUTPUT MUST MATCH THIS REFERENCE in the following dimensions:
+
+1. CARD STYLING
+   - Bordered card containers (border: 1px solid + background-color)
+   - Capsule pills with border-radius:50px+ and visible 1px border
+   - Card padding, internal spacing, corner radii — MATCH PRECISELY
+   - NEVER add visible borders/outlines to elements that don't have them in the reference (e.g., candidate cards in the reference have NO red border outlines)
+
+2. SECTION SEPARATORS & LABELS
+   - Section labels like "01 THIS WEEK'S OUTLIERS" use a horizontal-row layout: number left, divider line middle, label right (NOT collapsed together)
+   - Ticker bars use THIN VERTICAL LINE dividers between items (1px wide), NOT bullet dots (•)
+   - Stats rows sit inside a bordered horizontal strip with vertical line dividers between each stat
+
+3. COLOR USAGE
+   - "CANDIDATE STATUS" labels are RED (#FF2323 or similar bright red), not grey
+   - Status indicator dots (small red circles) appear inside pills like "ACTIVELY EXPLORING"
+   - Red CTAs use the exact red from the reference
+
+4. LAYOUT PATTERNS
+   - "Interested in exploring further?" sits side-by-side with a RED SQUARE CARD containing the REQUEST INTRO button + arrow — NOT a standalone button
+   - Profile Overview + Operating Impact sit inside ONE bordered card container with two columns inside it — NOT two separate floating columns
+   - Footer mail/web icons are rendered as small images (or icon-font), not Unicode characters
+
+5. TYPOGRAPHY
+   - Hero text mixes font WEIGHTS within a heading: e.g., "The" thin + "Outliers" thick
+   - Eyebrow labels (CANDIDATE INTELLIGENCE REPORT, PROFILE OVERVIEW) use uniform letter-spacing
+
+6. CONTENT COMPLETENESS
+   - If the reference has 6 ticker items, your output has 6 ticker items — do not drop "Precision Over Volume" or any other item
+
+CRITICAL RULES FOR USING THE REFERENCE:
+- The reference's TEXT CONTENT may differ from your spec — IGNORE the reference's text. Your text comes from the JSON SPEC ONLY.
+- The reference's IMAGE URLs are NOT yours — use the image URLs from the spec ONLY.
+- COPY the reference's CSS PATTERNS (border styles, padding values, color usage, layout structure) but APPLY THEM to YOUR SPEC's content.
+- This is a stylistic reference for HOW to lay out Mavlers emails, not WHAT content to include.
+
+=== REFERENCE HTML (copy patterns, NOT content) ===
+${referenceHtml}
+=== END HUMAN-CODED REFERENCE EXAMPLE ===`
+      : "";
+
     const stage2UserPrompt = `Generate production-ready Mavlers-grade HTML email code from the following design specification and visual reference. Output ONLY the HTML starting with <!DOCTYPE. No markdown. No explanation.
 
 === DESIGN SPECIFICATION (from Figma parser) ===
@@ -4640,7 +4733,7 @@ ${JSON.stringify(designSpec, null, 2)}
 
 === DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
 ${specs.join("\n\n")}
-=== END DEVELOPER SPECIFICATIONS ===${imageSection}${visualReferenceInstructions}`;
+=== END DEVELOPER SPECIFICATIONS ===${imageSection}${visualReferenceInstructions}${referenceSection}`;
 
     const stage2StartTime = Date.now();
 
@@ -4669,8 +4762,10 @@ ${specs.join("\n\n")}
       finalFont,
       espPlatform: espPlatform || "none",
       darkMode: darkMode ?? "auto",
-      hasVisualReference,              // v6.6.0 diagnostic
+      hasVisualReference,                            // v6.6.0
       previewBytesKB: previewBufferForStage2 ? Math.round(previewBufferForStage2.length / 1024) : 0,
+      hasReferenceHtml: Boolean(referenceHtml),      // v8.0.0
+      referenceHtmlKB: referenceHtml ? Math.round(referenceHtml.length / 1024) : 0,
     });
 
     const stage2Response = await anthropic.messages.create({
@@ -4732,6 +4827,7 @@ ${specs.join("\n\n")}
       imageCount: Object.keys(imageUrlMap).length,
       imageExportReport,                                    // v6.1.0: visibility into export status
       model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic — which Claude model produced this
+      referenceHtmlUsed: Boolean(REFERENCE_CACHE.get(fileKey)), // v8.0.0: was a human-coded reference injected
       figmaSource: {
         fileKey,
         nodeId,
@@ -4892,7 +4988,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "7.0.0",
+    version: "8.0.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
