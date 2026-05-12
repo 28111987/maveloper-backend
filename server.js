@@ -3041,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.3.0",
+    version: "6.4.0",
   });
 });
 
@@ -4403,9 +4403,25 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       }
       imageExportReport.bgImageCount = bgImageNodes.length;
 
+      // v6.4.0: dedup imageRefs by renderKey before calling Figma.
+      // Multiple INSTANCEs sharing a component master at the same size
+      // render to identical PNGs — render once, reuse URL across all
+      // instances. Cuts ~20% off Arsenal Pulse render count and avoids
+      // duplicate Dropbox uploads.
+      const renderKeyToNodeId = new Map();  // renderKey → first nodeId seen
+      const nodeIdToRenderKey = new Map();  // nodeId → renderKey (for patching)
+      for (const ref of imageRefs) {
+        nodeIdToRenderKey.set(ref.nodeId, ref.renderKey);
+        if (!renderKeyToNodeId.has(ref.renderKey)) {
+          renderKeyToNodeId.set(ref.renderKey, ref.nodeId);
+        }
+      }
+      const dedupedInlineIds = Array.from(renderKeyToNodeId.values());
+
+      // Collect ALL nodeIds to render (deduped inline + bg images + preview)
       const previewNodeId = sourceFrame.id;
       const allNodeIds = [
-        ...inlineImageNodeIds,
+        ...dedupedInlineIds,
         ...bgImageNodes.map((b) => b.nodeId),
         ...(previewNodeId ? [previewNodeId] : []),
       ];
@@ -4413,7 +4429,9 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       if (allNodeIds.length > 0) {
         log("info", "Phase B: requesting Figma render", {
           requestId: req.id,
-          inlineImages: inlineImageNodeIds.length,
+          inlineImagesTotal: imageRefs.length,
+          inlineImagesUnique: dedupedInlineIds.length,
+          dedupSavings: imageRefs.length - dedupedInlineIds.length,
           bgImages: bgImageNodes.length,
           includesPreview: Boolean(previewNodeId),
         });
@@ -4433,19 +4451,28 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
         if (dropboxConfigured) {
           const takenFilenames = new Set();
           const nodeIdToFilename = new Map();
+          const renderKeyToFilename = new Map(); // v6.4.0: share filename across renderKey
           const dropboxImages = [];
 
-          // Inline images
+          // Inline images: one upload per unique renderKey, all sharing instances point to it
           for (const ref of imageRefs) {
+            // Use existing filename if another instance with same renderKey was processed
+            const existingFilename = renderKeyToFilename.get(ref.renderKey);
+            if (existingFilename) {
+              nodeIdToFilename.set(ref.nodeId, existingFilename);
+              continue;
+            }
+            // First time seeing this renderKey — render & upload
             const buf = bufferMap.get(ref.nodeId);
             if (!buf) continue;
             const filename = makeFilename(ref.name, ref.width, ref.height, takenFilenames);
+            renderKeyToFilename.set(ref.renderKey, filename);
             nodeIdToFilename.set(ref.nodeId, filename);
             dropboxImages.push({ filename, buffer: buf });
           }
-          // Background images
+          // Background images (no dedup — heroes are typically unique)
           for (const bg of bgImageNodes) {
-            if (nodeIdToFilename.has(bg.nodeId)) continue; // already covered (rare)
+            if (nodeIdToFilename.has(bg.nodeId)) continue;
             const buf = bufferMap.get(bg.nodeId);
             if (!buf) continue;
             const filename = makeFilename(`bg-${bg.name}`, bg.width, bg.height, takenFilenames);
@@ -4766,7 +4793,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.3.0",
+    version: "6.4.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
