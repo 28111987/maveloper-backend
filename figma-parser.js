@@ -460,11 +460,29 @@ function extractRadius(node) {
 // =====================================================================
 
 /**
+ * Constants for atomic-visual-unit detection (v6.2.0).
+ * An "atomic visual unit" is a node that should be rasterized via Figma's
+ * /v1/images endpoint and emitted as a single <img> in the HTML, rather
+ * than walked-into. Examples: icons (vector arrows, location pins),
+ * component instances (sector tags, status pills, ticker bars),
+ * decorative shape compositions.
+ */
+const ATOMIC_VECTOR_MAX_SIZE = 200;       // small VECTORs (icons) get rasterized
+const ATOMIC_GROUP_MAX_SIZE = 300;        // small vector-only GROUPs get rasterized
+
+/**
  * Walk a section subtree and emit content[] elements.
  * Order is determined by absolute Y (top-down), then absolute X (left-right).
  *
  * imageRefs: collected as a side-effect — caller uses these in Phase B
  * to call Figma's /v1/images endpoint and upload to Dropbox.
+ *
+ * v6.2.0 changes:
+ *   - Image-fill frames no longer early-return; their overlay text/CTA
+ *     children are extracted (set as section bg_image at the orchestrator
+ *     level so HTML renders `<td background="...">`).
+ *   - Atomic visual units (INSTANCE, COMPONENT, small VECTOR/GROUP) are
+ *     captured as exportable images instead of being walked-into.
  */
 function walkSection(sectionNode, ctx) {
   const elements = [];
@@ -586,27 +604,32 @@ function collect(node, out, ctx, isRoot = false) {
     return;
   }
 
-  // ------ IMAGE FILL on a RECTANGLE / FRAME ------
+  // ------ ATOMIC VISUAL UNITS (v6.2.0) ------
+  // INSTANCE, COMPONENT, small VECTOR, and vector-only GROUP are designed
+  // atomic units (icons, sector tags, dividers, decorative graphics).
+  // Rasterize them via Figma /v1/images rather than walking into them.
+  // Skip for root nodes (a section root shouldn't become a single image).
+  if (!isRoot && isAtomicVisualUnit(node)) {
+    pushImageElement(node, out, ctx, { source: "atomic" });
+    return;
+  }
+
+  // ------ IMAGE FILL on a CONTAINER (v6.2.0 fix for Bug 1A) ------
+  // Previously: image-fill frames early-returned, dropping overlay text.
+  // Now: emit image element AND continue walking children for overlay
+  // content. Section-level bg_image is set by the orchestrator if the
+  // image fill is on the section root (handled separately in figmaToDesignSpec).
   const imgFill = extractImageFill(node);
   if (imgFill && imgFill.imageRef) {
-    const w = Math.round(getNodeWidth(node));
-    const h = Math.round(getNodeHeight(node));
-    // Track for Phase B export
-    ctx.imageRefs.push({
-      nodeId: node.id,
-      imageRef: imgFill.imageRef,
-      width: w,
-      height: h,
-      name: node.name,
-    });
-    out.push({
-      el: "image",
-      src: "", // Phase B fills this with Dropbox URL after export
-      alt: node.name || "Image",
-      width: w,
-      height: h,
-      _figmaNodeId: node.id, // internal — stripped before Stage 2
-    });
+    pushImageElement(node, out, ctx, { source: "fill" });
+    // CRITICAL: do NOT return — keep walking children for overlay text/CTA.
+    // (Pre-v6.2.0 had `return;` here, which dropped hero text like
+    // "The Outliers Waiting For You" in Arsenal Pulse.)
+  }
+
+  // ------ Non-container RECTANGLE / VECTOR without image fill: skip ------
+  // (Vectors and rectangles handled above as atomic units if they qualify.)
+  if (!CONTAINER_TYPES.has(node.type) && !imgFill) {
     return;
   }
 
@@ -638,10 +661,123 @@ function collect(node, out, ctx, isRoot = false) {
     return;
   }
 
-  // ------ Decorative shapes: ignore in v6.0.0 (handled by post-processors) ------
-  // VECTOR / RECTANGLE without image fill, no children = decorative element.
-  // Skipped to keep the spec clean. Future: detect dividers (thin rect spanning width).
   return;
+}
+
+/**
+ * Detect whether a node is an "atomic visual unit" — a designed graphical
+ * atom that should be rasterized rather than walked into.
+ *
+ * Heuristics (v6.2.0):
+ *   - INSTANCE: ALWAYS atomic (designer chose to make it reusable)
+ *   - COMPONENT: ALWAYS atomic (same reason)
+ *   - VECTOR: atomic if both dimensions ≤ 200px (typical icon size)
+ *   - GROUP: atomic if entirely composed of VECTOR/RECTANGLE/ELLIPSE
+ *     (no text, no nested frames) and ≤ 300px on either axis
+ *
+ * NOT atomic:
+ *   - Any FRAME (these are layout containers — walk into them)
+ *   - Large vectors (≥ 200px — could be a section bg, recurse to confirm)
+ *   - Groups containing text or frames (not visual atoms)
+ *
+ * Why not capture standalone RECTANGLEs without image fills: those are
+ * usually section dividers / accent bars / button bgs handled by the
+ * CTA detector. Capturing every solid-fill rectangle would produce dozens
+ * of tiny images per email.
+ */
+function isAtomicVisualUnit(node) {
+  if (!node || node.visible === false) return false;
+
+  // Components and instances are atomic ONLY if they have no TEXT descendants.
+  // Pure visual instances (icons, decorative graphics) get rasterized; instances
+  // that contain text (link/button components like "VIEW FULL PROFILE",
+  // status pills like "ACTIVELY EXPLORING") are walked into so their text is
+  // extracted and CTA detection can fire.
+  if (node.type === "COMPONENT" || node.type === "INSTANCE") {
+    if (getNodeWidth(node) <= 0 || getNodeHeight(node) <= 0) return false;
+    return !hasTextDescendant(node);
+  }
+
+  // Small vectors are icons
+  if (node.type === "VECTOR" || node.type === "STAR" || node.type === "REGULAR_POLYGON" ||
+      node.type === "POLYGON" || node.type === "BOOLEAN_OPERATION") {
+    const w = getNodeWidth(node);
+    const h = getNodeHeight(node);
+    return w > 0 && h > 0 && w <= ATOMIC_VECTOR_MAX_SIZE && h <= ATOMIC_VECTOR_MAX_SIZE;
+  }
+
+  // Vector-only groups are decorative compositions
+  if (node.type === "GROUP") {
+    const w = getNodeWidth(node);
+    const h = getNodeHeight(node);
+    if (w > ATOMIC_GROUP_MAX_SIZE || h > ATOMIC_GROUP_MAX_SIZE) return false;
+    if (w <= 0 || h <= 0) return false;
+    // Walk descendants: must be vector-shape only
+    let allVectorShape = true;
+    (function check(n) {
+      if (!allVectorShape) return;
+      if (n.visible === false) return;
+      if (n === node) {
+        for (const c of n.children || []) check(c);
+        return;
+      }
+      if (n.type === "TEXT" || n.type === "FRAME" || n.type === "INSTANCE" || n.type === "COMPONENT") {
+        allVectorShape = false;
+        return;
+      }
+      for (const c of n.children || []) check(c);
+    })(node);
+    return allVectorShape;
+  }
+
+  return false;
+}
+
+/**
+ * Helper: check if any descendant (skipping the node itself) is a TEXT node.
+ * Used by atomic-unit detection to skip rasterizing instances that contain text.
+ */
+function hasTextDescendant(node) {
+  for (const c of node.children || []) {
+    if (c.visible === false) continue;
+    if (c.type === "TEXT") return true;
+    if (hasTextDescendant(c)) return true;
+  }
+  return false;
+}
+
+/**
+ * Helper: push an image element to out[] and register it in imageRefs
+ * for Phase B export. Used by both atomic-unit and image-fill paths.
+ */
+function pushImageElement(node, out, ctx, { source }) {
+  const w = Math.round(getNodeWidth(node));
+  const h = Math.round(getNodeHeight(node));
+  if (w <= 0 || h <= 0) return;
+
+  // For image-fill nodes, use the existing imageRef from the fill.
+  // For atomic units (instances/vectors/groups), there's no imageRef in
+  // the Figma data — we just record the nodeId and Phase B will call
+  // /v1/images to render whatever it is.
+  const imgFill = source === "fill" ? extractImageFill(node) : null;
+
+  ctx.imageRefs.push({
+    nodeId: node.id,
+    imageRef: imgFill?.imageRef ?? null, // null for atomic units; Phase B renders by nodeId
+    width: w,
+    height: h,
+    name: node.name,
+    source, // "fill" or "atomic" — for diagnostics
+  });
+
+  out.push({
+    el: "image",
+    src: "", // Phase B fills this with Dropbox URL after export
+    alt: node.name || "Image",
+    width: w,
+    height: h,
+    _figmaNodeId: node.id,
+  });
 }
 
 /**
@@ -912,6 +1048,28 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
       content,
       height: Math.round(bbox.height ?? 0), // used by inferSectionType, then deleted
     };
+
+    // v6.2.0: promote section-spanning image to bg_image. If the section's
+    // FIRST content element is an image that covers ~the full section width,
+    // it's a background image (hero pattern). The overlay text/CTA remain
+    // in content[]; Stage 2 renders <td background="..."> with content inside.
+    if (content.length > 0 && content[0].el === "image") {
+      const img = content[0];
+      const sectionWidth = bbox.width ?? 0;
+      // bg image: covers ≥85% of section width AND there's other content after it
+      if (img.width >= sectionWidth * 0.85 && content.length > 1) {
+        section.bg_image = {
+          _figmaNodeId: img._figmaNodeId,
+          src: "",                    // populated by Phase B
+          width: img.width,
+          height: img.height,
+          alt: img.alt,
+        };
+        // remove from inline content - it's now the section background
+        content.shift();
+      }
+    }
+
     section.type = inferSectionType(section, idx, sectionNodes.length, content);
     delete section.height;
     sections.push(section);
