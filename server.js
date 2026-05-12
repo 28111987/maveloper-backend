@@ -11,6 +11,7 @@ import path from "node:path";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { detectBands, buildColorPalette, samplePixelColor, cropBand, postProcessOcr } from "./band-detector.js";
 import { figmaToDesignSpec } from "./figma-parser.js";
+import { renderFigmaNodes, makeFilename, patchSpecImageSrcs } from "./figma-image-export.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 
@@ -3040,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.0.1",
+    version: "6.1.0",
   });
 });
 
@@ -4258,21 +4259,26 @@ ${specs.join("\n\n")}
 });
 
 // =====================================================================
-// POST /generate-from-figma — v6.0.0 Figma path
+// POST /generate-from-figma — v6.1.0 (Phase B: auto image export)
 // Accepts: { figmaUrl, emailWidth?, primaryFont?, secondaryFont?, espPlatform?, darkMode? }
-// Returns: { html, orderId, designSpec, pendingImageRefs, figmaSource, requestId }
+// Returns: { html, orderId, pageImages, imageUrlMap, designSpec, figmaSource, requestId }
 //
 // Pipeline:
 //   1. Parse Figma URL → fetch node tree from Figma REST API
 //   2. Convert node tree to designSpec JSON (skips Stage 1 vision entirely)
-//   3. Send designSpec to Stage 2 (existing prompt, unchanged)
-//   4. Run post-processors (most are no-ops on the Figma path; HTML hygiene
-//      helpers like font-stack and malformed-img fixes still apply)
-//   5. Return HTML + pendingImageRefs (Phase A: devs export images manually)
+//   3. Render every image node + the email frame via Figma /v1/images
+//   4. Upload images to Dropbox; patch designSpec src fields with real URLs
+//   5. Send populated designSpec to Stage 2 (existing prompt, unchanged)
+//   6. Run post-processors (HTML hygiene; band-related rules are no-ops)
+//   7. Return HTML + pageImages[0]=preview URL + imageUrlMap
 //
-// Phase A scope: image src fields are empty in the spec; HTML output will
-// have src="" on every image. Phase B will add automatic Figma /v1/images
-// export + Dropbox upload.
+// Phase B (v6.1.0) — image export is automatic:
+//   - Every <img> in the generated HTML has a real Dropbox URL.
+//   - The /approve endpoint's ZIP packaging picks up the images via
+//     imageUrlMap (same path the PDF flow uses).
+//   - Image export failures are NON-FATAL: if Figma /v1/images or
+//     Dropbox upload fails, we degrade to empty src (Phase A behavior)
+//     and surface the failure in imageExportReport.
 // =====================================================================
 app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res) => {
   const startTime = Date.now();
@@ -4367,19 +4373,120 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     if (darkMode === true) specs.push(`DARK_MODE: true (force dark mode CSS)`);
     if (darkMode === false) specs.push(`DARK_MODE: false (skip dark mode CSS)`);
 
-    // --- Image handling: Phase A is manual export ---
-    // imageUrlMap is empty; HTML will have src="" on each <img>. Devs export
-    // images from Figma and paste URLs themselves. pendingImageRefs is returned
-    // to the frontend so the dev sees a list of what to export.
-    const imageUrlMap = {};
-    const imageSection = `
+    // --- v6.1.0 Phase B: render & export images from Figma to Dropbox ---
+    // For every image node the parser found, render via Figma /v1/images,
+    // download the PNG, upload to Dropbox, and patch the designSpec's src
+    // fields so Stage 2 sees real URLs. Also render the parent email frame
+    // for the side-by-side preview pane.
+    let imageUrlMap = {};
+    let previewImageUrl = null;
+    let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0 };
+    const imageExportStartTime = Date.now();
+
+    try {
+      // Build the full list of nodeIds we want to render:
+      // - all image refs from the parser
+      // - the email frame itself (for the preview pane)
+      const imageNodeIds = imageRefs.map((r) => r.nodeId);
+      const previewNodeId = sourceFrame.id;
+      const allNodeIds = previewNodeId ? [...imageNodeIds, previewNodeId] : imageNodeIds;
+
+      if (allNodeIds.length > 0) {
+        log("info", "Phase B: requesting Figma render", {
+          requestId: req.id,
+          imageCount: imageNodeIds.length,
+          includesPreview: Boolean(previewNodeId),
+        });
+
+        const bufferMap = await renderFigmaNodes({
+          fileKey,
+          nodeIds: allNodeIds,
+          token: FIGMA_API_TOKEN,
+          logFn: (level, msg, meta) => log(level, msg, { requestId: req.id, ...meta }),
+        });
+        imageExportReport.rendered = bufferMap.size;
+
+        // Pull out the email frame preview separately (don't upload it to
+        // the per-order images folder — different lifecycle).
+        const previewBuffer = previewNodeId ? bufferMap.get(previewNodeId) : null;
+        if (previewNodeId) bufferMap.delete(previewNodeId);
+
+        if (dropboxConfigured) {
+          // Build clean filenames for each image, keyed by nodeId
+          const takenFilenames = new Set();
+          const nodeIdToFilename = new Map();
+          const dropboxImages = [];
+
+          for (const ref of imageRefs) {
+            const buf = bufferMap.get(ref.nodeId);
+            if (!buf) continue;  // Figma couldn't render this one — skip
+            const filename = makeFilename(ref.name, ref.width, ref.height, takenFilenames);
+            nodeIdToFilename.set(ref.nodeId, filename);
+            dropboxImages.push({ filename, buffer: buf });
+          }
+
+          if (dropboxImages.length > 0) {
+            imageUrlMap = await uploadImagesToDropbox(orderId, dropboxImages, log);
+            imageExportReport.uploaded = Object.keys(imageUrlMap).length;
+          }
+
+          // Patch the designSpec so Stage 2 sees real src URLs
+          const patchReport = patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap);
+          imageExportReport.patched = patchReport.patched;
+          imageExportReport.missing = patchReport.missing;
+
+          // Upload the preview frame separately (single image, predictable name)
+          if (previewBuffer) {
+            try {
+              const previewPath = `${getDropboxFolderPath(orderId)}/preview.png`;
+              const { directUrl } = await uploadToDropbox(previewPath, previewBuffer);
+              previewImageUrl = directUrl;
+            } catch (previewErr) {
+              log("warn", "Phase B: preview upload failed (non-fatal)", {
+                requestId: req.id,
+                error: previewErr.message,
+              });
+            }
+          }
+        } else {
+          // Dropbox not configured — strip _figmaNodeId markers but leave src empty
+          log("warn", "Phase B: Dropbox not configured; image src will be empty", { requestId: req.id });
+          for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+        }
+      } else {
+        // No images in this email — strip markers (none should exist anyway)
+        for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+      }
+
+      imageExportReport.durationMs = Date.now() - imageExportStartTime;
+      log("info", "Phase B: image export complete", { requestId: req.id, ...imageExportReport });
+    } catch (imgErr) {
+      // Image export failure is NON-FATAL — we degrade to Phase A behavior
+      // (empty src fields) rather than failing the whole request.
+      log("error", "Phase B: image export failed, degrading to empty src", {
+        requestId: req.id,
+        error: imgErr.message,
+      });
+      imageUrlMap = {};
+      for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+    }
+
+    // Build the image section for the Stage 2 prompt
+    const imageUrlList = Object.entries(imageUrlMap)
+      .map(([fn, url]) => `- ${fn} → ${url}`)
+      .join("\n");
+    const imageSection = imageUrlList
+      ? `
 
 === IMAGE ASSETS REFERENCE ===
-PHASE A NOTE: Image src fields in the spec are intentionally empty. Mavlers devs will replace placeholders manually after generation.
-- Leave src="" on each <img> tag in the HTML.
-- Preserve the alt text from the spec verbatim.
-- Preserve the width/height from the spec verbatim.
-- Do NOT fabricate filenames, image URLs, or guess based on alt text.
+The following images have been uploaded to Dropbox. Each image element in the spec already has a populated src field. Use those URLs verbatim — do NOT alter or invent image paths.
+
+${imageUrlList}
+=== END IMAGE ASSETS REFERENCE ===`
+      : `
+
+=== IMAGE ASSETS REFERENCE ===
+No images were exported for this email. Leave src="" on each <img> tag.
 === END IMAGE ASSETS REFERENCE ===`;
 
     // --- Stage 2 invocation (uses existing STAGE2_PROMPT, unchanged) ---
@@ -4459,11 +4566,11 @@ ${specs.join("\n\n")}
       html,
       orderId,
       pageCount: 1, // Figma has no pages concept — single frame in, single HTML out
-      pageImages: [], // Frontend renders Figma thumbnail directly via Figma's public CDN
+      pageImages: previewImageUrl ? [previewImageUrl] : [], // v6.1.0: side-by-side preview
       imageUrlMap,
       imageSource: "figma",
-      imageCount: 0,
-      pendingImageRefs: imageRefs, // Devs export these from Figma manually in Phase A
+      imageCount: Object.keys(imageUrlMap).length,
+      imageExportReport,                                    // v6.1.0: visibility into export status
       figmaSource: {
         fileKey,
         nodeId,
@@ -4624,7 +4731,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.0.1",
+    version: "6.1.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
