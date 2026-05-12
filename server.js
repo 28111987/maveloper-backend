@@ -3041,7 +3041,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "6.1.0",
+    version: "6.2.0",
   });
 });
 
@@ -4373,28 +4373,48 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     if (darkMode === true) specs.push(`DARK_MODE: true (force dark mode CSS)`);
     if (darkMode === false) specs.push(`DARK_MODE: false (skip dark mode CSS)`);
 
-    // --- v6.1.0 Phase B: render & export images from Figma to Dropbox ---
-    // For every image node the parser found, render via Figma /v1/images,
-    // download the PNG, upload to Dropbox, and patch the designSpec's src
-    // fields so Stage 2 sees real URLs. Also render the parent email frame
-    // for the side-by-side preview pane.
+    // --- v6.2.0 Phase B: render & export images from Figma to Dropbox ---
+    // For every image node the parser found (inline images, section bg_images,
+    // and atomic visual units like icons/logos/decorative graphics), render
+    // via Figma /v1/images, download the PNG, upload to Dropbox, and patch
+    // the designSpec's src fields so Stage 2 sees real URLs. Also render
+    // the parent email frame for the side-by-side preview pane.
     let imageUrlMap = {};
     let previewImageUrl = null;
-    let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0 };
+    let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0, bgImageCount: 0 };
     const imageExportStartTime = Date.now();
 
     try {
-      // Build the full list of nodeIds we want to render:
-      // - all image refs from the parser
-      // - the email frame itself (for the preview pane)
-      const imageNodeIds = imageRefs.map((r) => r.nodeId);
+      // Collect ALL nodeIds to render:
+      // 1. Inline images from imageRefs (parser-emitted image elements)
+      // 2. Section bg_images (v6.2.0 hero-with-overlay pattern)
+      // 3. The email frame itself (for the preview pane)
+      const inlineImageNodeIds = imageRefs.map((r) => r.nodeId);
+      const bgImageNodes = [];
+      for (const s of designSpec.sections || []) {
+        if (s.bg_image && s.bg_image._figmaNodeId) {
+          bgImageNodes.push({
+            nodeId: s.bg_image._figmaNodeId,
+            name: s.bg_image.alt || `section-${s.n}-bg`,
+            width: s.bg_image.width,
+            height: s.bg_image.height,
+          });
+        }
+      }
+      imageExportReport.bgImageCount = bgImageNodes.length;
+
       const previewNodeId = sourceFrame.id;
-      const allNodeIds = previewNodeId ? [...imageNodeIds, previewNodeId] : imageNodeIds;
+      const allNodeIds = [
+        ...inlineImageNodeIds,
+        ...bgImageNodes.map((b) => b.nodeId),
+        ...(previewNodeId ? [previewNodeId] : []),
+      ];
 
       if (allNodeIds.length > 0) {
         log("info", "Phase B: requesting Figma render", {
           requestId: req.id,
-          imageCount: imageNodeIds.length,
+          inlineImages: inlineImageNodeIds.length,
+          bgImages: bgImageNodes.length,
           includesPreview: Boolean(previewNodeId),
         });
 
@@ -4406,22 +4426,30 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
         });
         imageExportReport.rendered = bufferMap.size;
 
-        // Pull out the email frame preview separately (don't upload it to
-        // the per-order images folder — different lifecycle).
+        // Pull out the email frame preview separately
         const previewBuffer = previewNodeId ? bufferMap.get(previewNodeId) : null;
         if (previewNodeId) bufferMap.delete(previewNodeId);
 
         if (dropboxConfigured) {
-          // Build clean filenames for each image, keyed by nodeId
           const takenFilenames = new Set();
           const nodeIdToFilename = new Map();
           const dropboxImages = [];
 
+          // Inline images
           for (const ref of imageRefs) {
             const buf = bufferMap.get(ref.nodeId);
-            if (!buf) continue;  // Figma couldn't render this one — skip
+            if (!buf) continue;
             const filename = makeFilename(ref.name, ref.width, ref.height, takenFilenames);
             nodeIdToFilename.set(ref.nodeId, filename);
+            dropboxImages.push({ filename, buffer: buf });
+          }
+          // Background images
+          for (const bg of bgImageNodes) {
+            if (nodeIdToFilename.has(bg.nodeId)) continue; // already covered (rare)
+            const buf = bufferMap.get(bg.nodeId);
+            if (!buf) continue;
+            const filename = makeFilename(`bg-${bg.name}`, bg.width, bg.height, takenFilenames);
+            nodeIdToFilename.set(bg.nodeId, filename);
             dropboxImages.push({ filename, buffer: buf });
           }
 
@@ -4430,12 +4458,12 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
             imageExportReport.uploaded = Object.keys(imageUrlMap).length;
           }
 
-          // Patch the designSpec so Stage 2 sees real src URLs
+          // Patch designSpec — covers both content[].src and section.bg_image.src
           const patchReport = patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap);
           imageExportReport.patched = patchReport.patched;
           imageExportReport.missing = patchReport.missing;
 
-          // Upload the preview frame separately (single image, predictable name)
+          // Upload the preview frame
           if (previewBuffer) {
             try {
               const previewPath = `${getDropboxFolderPath(orderId)}/preview.png`;
@@ -4449,26 +4477,31 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
             }
           }
         } else {
-          // Dropbox not configured — strip _figmaNodeId markers but leave src empty
           log("warn", "Phase B: Dropbox not configured; image src will be empty", { requestId: req.id });
-          for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+          for (const s of designSpec.sections) {
+            for (const c of s.content) delete c._figmaNodeId;
+            if (s.bg_image) delete s.bg_image._figmaNodeId;
+          }
         }
       } else {
-        // No images in this email — strip markers (none should exist anyway)
-        for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+        for (const s of designSpec.sections) {
+          for (const c of s.content) delete c._figmaNodeId;
+          if (s.bg_image) delete s.bg_image._figmaNodeId;
+        }
       }
 
       imageExportReport.durationMs = Date.now() - imageExportStartTime;
       log("info", "Phase B: image export complete", { requestId: req.id, ...imageExportReport });
     } catch (imgErr) {
-      // Image export failure is NON-FATAL — we degrade to Phase A behavior
-      // (empty src fields) rather than failing the whole request.
       log("error", "Phase B: image export failed, degrading to empty src", {
         requestId: req.id,
         error: imgErr.message,
       });
       imageUrlMap = {};
-      for (const s of designSpec.sections) for (const c of s.content) delete c._figmaNodeId;
+      for (const s of designSpec.sections) {
+        for (const c of s.content) delete c._figmaNodeId;
+        if (s.bg_image) delete s.bg_image._figmaNodeId;
+      }
     }
 
     // Build the image section for the Stage 2 prompt
@@ -4479,7 +4512,9 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       ? `
 
 === IMAGE ASSETS REFERENCE ===
-The following images have been uploaded to Dropbox. Each image element in the spec already has a populated src field. Use those URLs verbatim — do NOT alter or invent image paths.
+The following images have been uploaded to Dropbox. Each image element in the spec already has a populated src field; sections with image backgrounds have a populated bg_image.src field. Use those URLs verbatim — do NOT alter or invent image paths.
+
+When a section has a "bg_image" object, render it as the section's background using table[background="URL"] + VML <v:image> for Outlook compatibility. Place the section's text/CTA content on top of the background. Do NOT emit an inline <img> for bg_image — it IS the section background.
 
 ${imageUrlList}
 === END IMAGE ASSETS REFERENCE ===`
@@ -4731,7 +4766,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "6.1.0",
+    version: "6.2.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
