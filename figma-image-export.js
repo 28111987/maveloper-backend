@@ -98,6 +98,21 @@ export function patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap) {
   let missing = 0;
 
   for (const section of designSpec.sections || []) {
+    // v6.2.0: patch section-level bg_image first (set by parser when a
+    // section's primary content is a background image with text overlay).
+    if (section.bg_image && section.bg_image._figmaNodeId) {
+      const nodeId = section.bg_image._figmaNodeId;
+      const filename = nodeIdToFilename.get(nodeId);
+      const url = filename ? imageUrlMap[filename] : null;
+      if (url) {
+        section.bg_image.src = url;
+        patched++;
+      } else {
+        missing++;
+      }
+      delete section.bg_image._figmaNodeId;
+    }
+
     for (const el of section.content || []) {
       if (el.el !== "image") continue;
       const nodeId = el._figmaNodeId;
