@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "8.0.0",
-  "description": "Maveloper backend — Stage 2 with human-coded reference library (Opus + multimodal + few-shot reference HTML for Mavlers pattern matching)",
+  "version": "8.1.0",
+  "description": "Maveloper backend — v8.1.0 = MAVLERS PATTERN LIBRARY (16 verified patterns from production reference) + max_tokens 32k→64k truncation fix. Generic patterns apply to ANY Mavlers email.",
   "private": true,
   "type": "module",
   "main": "server.js",
