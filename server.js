@@ -2991,6 +2991,639 @@ Some designs show the SAME section twice — once styled for dark mode preview, 
 18. **INLINE SVG OR DATA-URL IN STYLE ATTRIBUTES** — NEVER output any inline SVG, any "background: url('data:image/svg...')" declaration, any "background-image: url('data:...')" declaration, or any data URI inside an inline style attribute. The inner quote characters inside the data URI break HTML parsing and cause raw CSS to appear as visible text on the page. For bullets, use <ul>/<li> with list-style-type: disc OR render an icon as an <img> tag inside a 4-column table. NEVER embed SVG markup anywhere in the output.
 19. **Background-image declarations on list items** — a <li> with style="background: url(...)" is always wrong. If an icon bullet is required, render it as a table with 4 columns: one cell for the icon img, one spacer cell, one text cell.
 
+## MAVLERS PATTERN LIBRARY (v8.1.0 — generic patterns from production references)
+
+These patterns are extracted from human-coded Mavlers production emails. They apply to ANY Mavlers email design, not just one specific file. Use them whenever the spec exhibits the matching characteristics. These patterns take PRECEDENCE over generic "stacked vertical" defaults.
+
+### PATTERN 1: HEADER BAR WITH LOGO + RIGHT-ALIGNED DATE/ID PILLS
+Trigger: spec has a header section with a logo on left AND short labels (issue number, date, version, ID) that should appear on the right.
+
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_DARK_BG" style="background-color:#SPEC_DARK_BG;">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="padding:16px 26px 15px 26px; border-top:1px solid #SPEC_BORDER; border-bottom:1px solid #SPEC_BORDER;">
+        <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <th align="left" valign="top" class="em_clear">
+              <a href="#"><img src="LOGO_URL" width="203" alt="BRAND NAME" style="display:block;" border="0"/></a>
+            </th>
+            <th align="right" valign="top" class="em_clear em_ptop">
+              <!-- pills: each pill in its own cell, spacer cells between -->
+              <table align="right" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td align="center" valign="middle" height="22" style="font-family:'FONT_STACK'; font-size:10px; color:#SPEC_TEXT; font-weight:600; border:1px solid #SPEC_BORDER; padding:0 10px; background-color:#SPEC_PILL_BG; text-transform:uppercase; border-radius:11px; letter-spacing:1.4px;">PILL TEXT</td>
+                  <td width="10">&nbsp;</td>
+                  <td align="center" valign="middle" height="22" style="[same as above]">PILL TEXT 2</td>
+                </tr>
+              </table>
+            </th>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+### PATTERN 2: HERO WITH BG IMAGE + MIXED-WEIGHT HEADING + STATUS PILL
+Trigger: spec section has bg_image + overlay text + a small badge/status indicator. Hero title typically uses font weight mixing for emphasis.
+
+For font weight mixing in headings: when the spec's text content has DIFFERENT WORDS that look visually heavier in the rendered design (you can see this in the visual reference image), wrap those words in inline spans with higher font-weight:
+\`\`\`html
+<td style="font-family:'FONT_STACK'; color:#SPEC_HEADING_COLOR; font-size:90px; line-height:92px; font-weight:400;">
+  <span style="font-weight:600;">The</span> Outliers Waiting <span style="font-weight:600;">For You</span>
+</td>
+\`\`\`
+The default weight is the lighter one (400). The heavier weight (600) is applied selectively to specific words via inline span. Determine which words are heavy by examining the visual reference.
+
+Status pill (e.g. "Issue 012 · Live") with red bullet indicator:
+\`\`\`html
+<td align="center" valign="middle" height="27" style="font-family:'FONT_STACK'; font-size:12px; color:#SPEC_TEXT; font-weight:500; border:1px solid #SPEC_BORDER; padding:0 10px; background-color:#SPEC_BG; border-radius:14px; letter-spacing:1.4px;">
+  <span style="color:#FF2323; font-size:14px; font-weight:700;">&bull;</span>&nbsp; STATUS TEXT
+</td>
+\`\`\`
+The red bullet (•) is achieved via a colored inline span at the start. Use this pattern for any "Live", "Active", "Now", or status-indicator pill.
+
+### PATTERN 3: TICKER / CATEGORY BAR (horizontal items with hairline dividers)
+Trigger: spec has 3-8 short uppercase labels arranged horizontally in a single row (e.g. industry sectors, categories, filters, tags).
+
+CRITICAL: separator between items is NOT a bullet dot (•) and NOT a pipe (|). Use a 1-2px wide TD with bgcolor:
+
+\`\`\`html
+<td align="center" bgcolor="#SPEC_BAR_BG" style="background-color:#SPEC_BAR_BG;">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="border-top:1px solid #SPEC_BORDER; padding-top:11px; padding-bottom:11px;">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <!-- Item 1 -->
+            <th width="124" align="center" valign="middle" style="width:124px;">
+              <td style="font-family:'FONT_STACK'; color:#CDCDCD; font-size:12px; line-height:15px; font-weight:700; letter-spacing:1.76px; text-transform:uppercase;">ITEM 1</td>
+            </th>
+            <!-- HAIRLINE DIVIDER: 2px-wide cell with bgcolor -->
+            <th width="2" style="width:2px; font-size:0px; line-height:0px;" bgcolor="#SPEC_DIVIDER_COLOR">&nbsp;</th>
+            <!-- Item 2 -->
+            <th width="124" align="center" valign="middle">[ITEM 2]</th>
+            <!-- Hairline divider -->
+            <th width="2" bgcolor="#SPEC_DIVIDER_COLOR">&nbsp;</th>
+            <!-- ...repeat for each item... -->
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+Force single-row layout. NEVER use bullet dots or pipe characters between items.
+
+### PATTERN 4: STATS ROW (4-column metric strip with vertical dividers)
+Trigger: spec has 3-6 short data points each with a number and a small label (e.g. "6 / Profiles This Issue", "100% / Mission-Vetted").
+
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_BG" style="background-color:#SPEC_BG;">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="border-top:1px solid #SPEC_BORDER; border-bottom:1px solid #SPEC_BORDER;">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <!-- Stat 1 -->
+            <th align="center" valign="top" width="149" style="width:149px;">
+              <td align="center" style="padding:20px 10px;">
+                <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                  <tr><td align="center" style="font-family:'FONT_STACK'; color:#FFFFFF; font-size:30px; line-height:34px; font-weight:700;">[BIG NUMBER]</td></tr>
+                  <tr><td align="center" style="font-family:'FONT_STACK'; color:#878787; font-size:12px; line-height:15px; font-weight:700; letter-spacing:1.3px; text-transform:uppercase; padding-top:6px;">[SMALL LABEL]</td></tr>
+                </table>
+              </td>
+            </th>
+            <!-- VERTICAL DIVIDER: 1px-wide cell with bgcolor -->
+            <th width="1" style="width:1px; font-size:0px;" bgcolor="#SPEC_DIVIDER_COLOR">&nbsp;</th>
+            <!-- Stat 2, divider, Stat 3, divider, Stat 4 -->
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+NEVER render stats as floating inline numbers — always inside the bordered strip with vertical dividers between cells.
+
+### PATTERN 5: SECTION LABEL (numbered section heading with horizontal line)
+Trigger: spec has a section labeled "01", "02", "03" (or similar numbering) followed by an uppercase section title. Common in editorial / report-style emails.
+
+This pattern has TWO VARIANTS depending on visual treatment:
+
+**VARIANT A — Muted/secondary section labels (typically used for "01", "02"):**
+3-cell horizontal layout — muted number left + hairline horizontal line middle + muted label right. Used when the section label is secondary navigation:
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_BG">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="padding:37px 16px 16px 24px;">
+        <table align="left" border="0" cellspacing="0" cellpadding="0" width="100%">
+          <tr>
+            <td width="29" align="left" valign="middle" style="font-family:'FONT_STACK'; font-size:14px; font-weight:700; line-height:17px; letter-spacing:2.20px; color:#4B4B4B; width:29px;">01</td>
+            <td align="center" valign="middle" class="em_hide">
+              <table align="center" width="300" border="0" cellspacing="0" cellpadding="0">
+                <tr><td height="1" style="height:1px; line-height:0; font-size:0;" bgcolor="#181817"></td></tr>
+              </table>
+            </td>
+            <td align="left" valign="middle" style="font-family:'FONT_STACK'; font-size:14px; font-weight:700; letter-spacing:2.20px; color:#4B4B4B; padding-left:7px;">SECTION TITLE</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+**VARIANT B — Emphasized section labels (typically used for the FINAL numbered section like "03"):**
+Number sits inside a SMALL BORDERED ROUNDED BOX, label is WHITE and visually heavier. Used when the section deserves more attention:
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_BG">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="padding:20px 24px 0px 24px;">
+        <table align="left" border="0" cellspacing="0" cellpadding="0" width="100%">
+          <tr>
+            <!-- Number in bordered rounded box -->
+            <td align="center" valign="middle" width="38" style="width:38px;">
+              <table width="38" align="left" border="0" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td align="center" valign="middle" style="font-family:'FONT_STACK'; font-size:14px; font-weight:700; line-height:17px; letter-spacing:2.20px; color:#878787; padding:2px; border:1px solid #1A1A19; border-radius:4px;">03</td>
+                </tr>
+              </table>
+            </td>
+            <!-- White uppercase label, weight 600 -->
+            <td align="left" valign="middle" style="font-family:'FONT_STACK'; font-size:16px; font-weight:600; line-height:25px; letter-spacing:2.2px; text-transform:uppercase; color:#ffffff; padding-left:16px; padding-right:10px;">SECTION TITLE</td>
+            <!-- Horizontal line on RIGHT, hides on mobile -->
+            <td align="center" valign="middle" class="em_hide">
+              <table align="center" width="210" border="0" cellspacing="0" cellpadding="0">
+                <tr><td height="1" style="height:1px; line-height:0; font-size:0;" bgcolor="#181817"></td></tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+Choose variant based on the visual reference. NEVER collapse the number and the title into a single text run. Always use the cellular layout with explicit divider.
+
+### PATTERN 6: CARD GRID (3x2, 3x3, 2x2 grids of similar items)
+Trigger: spec has 4+ similar items (cards) that should be arranged in a grid, not stacked vertically. Look at the visual reference to determine column count:
+- 6+ items → typically 3 columns (3x2, 3x3)
+- 4 items → typically 2 columns (2x2)
+- 2-3 items → side-by-side single row
+
+Use \`<th>\` for column cells with \`class="em_clear"\` so they stack on mobile:
+\`\`\`html
+<td align="center" valign="top" style="padding:16px;">
+  <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+    <!-- Row 1: 3 cards -->
+    <tr>
+      <th width="182" align="left" valign="top" class="em_clear">[CARD 1]</th>
+      <th width="11" class="em_hide">&nbsp;</th>
+      <th width="182" align="left" valign="top" class="em_clear">[CARD 2]</th>
+      <th width="11" class="em_hide">&nbsp;</th>
+      <th width="182" align="left" valign="top" class="em_clear">[CARD 3]</th>
+    </tr>
+    <tr><td height="19">&nbsp;</td></tr>
+    <!-- Row 2: 3 more cards -->
+    <tr>
+      <th width="182" valign="top" class="em_clear">[CARD 4]</th>
+      <th width="11" class="em_hide">&nbsp;</th>
+      <th width="182" valign="top" class="em_clear">[CARD 5]</th>
+      <th width="11" class="em_hide">&nbsp;</th>
+      <th width="182" valign="top" class="em_clear">[CARD 6]</th>
+    </tr>
+  </table>
+</td>
+\`\`\`
+NEVER stack vertically when the visual reference shows a grid. Use the image to determine column count.
+
+### PATTERN 7: CARD WITH BORDER FRAME (using bgcolor padding trick)
+Trigger: spec card has a colored border visible in design.
+
+Rather than \`border:1px solid #X\`, use the outer-bgcolor padding trick for better email-client support:
+\`\`\`html
+<!-- OUTER cell = the "border" color, padding:1px is the border thickness -->
+<td align="center" valign="top" bgcolor="#BORDER_HEX" style="padding:1px;">
+  <!-- INNER table = the actual card content with its own bgcolor -->
+  <table align="left" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#CARD_BG_HEX">
+    <tr>
+      <td style="padding:6px;">[CARD CONTENT]</td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+If the border in the design is RED, use red here. If GREY, grey. NEVER add red borders that aren't in the design.
+
+### PATTERN 8: CARD INTERNAL ELEMENTS (sector tag, status, view profile, etc.)
+Card content patterns when the card represents a "candidate", "product", "item" with structured data:
+
+Sector/category tag (top-right of card): small bordered rectangle, NOT a fully rounded pill:
+\`\`\`html
+<td align="right">
+  <table align="right"><tr>
+    <td align="center" valign="middle" height="15" style="font-family:'FONT_STACK'; font-size:7px; color:#SPEC_TAG_TEXT; font-weight:700; border:1px solid #SPEC_TAG_BORDER; padding:0 6px; background-color:#SPEC_TAG_BG; letter-spacing:0.84px; text-transform:uppercase;">[TAG TEXT]</td>
+  </tr></table>
+</td>
+\`\`\`
+
+Item ID label (e.g. "CANDIDATE #001", "ITEM #042"): muted color, uppercase, letter-spaced:
+\`\`\`html
+<td align="left" style="font-family:'FONT_STACK'; font-size:10px; font-weight:700; line-height:13px; letter-spacing:1.50px; color:#575755; text-transform:uppercase; padding-top:10px;">[ID LABEL]</td>
+\`\`\`
+
+Status label (e.g. "CANDIDATE STATUS", "AVAILABILITY"): uses RED color #FF2323 (or red from spec), uppercase:
+\`\`\`html
+<td align="left" style="font-family:'FONT_STACK'; font-size:12px; font-weight:500; line-height:15px; letter-spacing:2.00px; color:#FF2323; text-transform:uppercase; padding-top:12px;">CANDIDATE STATUS</td>
+\`\`\`
+NEVER render status labels in grey. They are red (or whatever brand red the spec uses) by design convention.
+
+Red bullet item (e.g. "• Actively Interviewing", "• open to relocate"):
+\`\`\`html
+<table width="100%" align="left" border="0" cellspacing="0" cellpadding="0">
+  <tr>
+    <td width="4" align="right" valign="top" style="font-family:'FONT_STACK'; font-size:14px; line-height:18px; color:#FF2323; width:4px;">&bull;</td>
+    <td width="4" style="width:4px;">&nbsp;</td>
+    <td align="left" valign="top" style="font-family:'FONT_STACK'; font-size:14px; font-weight:400; line-height:18px; color:#C8C8C8;">[BULLET TEXT]</td>
+  </tr>
+</table>
+\`\`\`
+The bullet character is colored red via inline style, item text is light grey.
+
+Action link with arrow icon (e.g. "VIEW FULL PROFILE →"):
+\`\`\`html
+<td style="border-top:1px solid #SPEC_DIVIDER; padding-top:6px;">
+  <table align="left" border="0" cellpadding="0" cellspacing="0" width="100%">
+    <tr>
+      <td align="left" style="font-family:'FONT_STACK'; font-size:12px; font-weight:700; line-height:15px; letter-spacing:1.08px; text-transform:uppercase; color:#FF2323;">
+        <a href="#" style="color:#FF2323; text-decoration:none;">[ACTION TEXT]</a>
+      </td>
+      <td style="width:15px;">&nbsp;</td>
+      <td align="right" valign="middle"><a href="#"><img src="ARROW_URL" width="10" alt="" border="0" style="display:block; max-width:10px;"/></a></td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+If no arrow image URL is available, fallback to \`&rarr;\` or \`→\` Unicode character in a colored span.
+
+### PATTERN 9: FEATURED PROFILE CAPSULE TAGS (bordered rectangles in a row)
+Trigger: spec has 4-8 short attribute labels arranged in 1-2 rows (location, role type, salary, requirements, etc.). These look like "pills" but are BORDERED RECTANGLES WITHOUT border-radius — flat-sided.
+
+\`\`\`html
+<table align="left" border="0" cellpadding="0" cellspacing="0">
+  <tr>
+    <th align="left" valign="top" class="em_clear">
+      <table border="0" cellspacing="0" cellpadding="0">
+        <tr>
+          <td align="center" valign="middle" height="34" style="font-family:'FONT_STACK'; font-size:14px; color:#SPEC_TEXT; font-weight:400; border:1px solid #SPEC_BORDER; padding:0 15px; background-color:#SPEC_PILL_BG; letter-spacing:1px; text-transform:uppercase;">[TAG TEXT]</td>
+        </tr>
+      </table>
+    </th>
+    <th width="8" class="em_hide">&nbsp;</th>
+    <th align="left" valign="top" class="em_clear em_ptop">[TAG 2]</th>
+    <!-- ...more tags... -->
+  </tr>
+</table>
+\`\`\`
+NEVER add \`border-radius:50px\` to these. They are flat rectangles with hairline borders. Use border-radius ONLY on pill-shaped elements like CTAs and the small status indicators (Pattern 2 and Pattern 12).
+
+### PATTERN 10: ACTIVELY EXPLORING-STYLE PILL (with red dot indicator)
+Trigger: spec has a small badge/pill containing a status word (e.g. "ACTIVELY EXPLORING", "AVAILABLE NOW", "LIVE", "OPEN"). 
+
+\`\`\`html
+<td align="center" valign="middle" height="22" style="font-family:'FONT_STACK'; font-size:12px; color:#EBEBEB; font-weight:500; border:1px solid #3C3C3B; padding:0 10px; background-color:#1A1A19; border-radius:20px; letter-spacing:1.4px; text-transform:uppercase;">
+  <span style="color:#FF2323; font-size:14px; font-weight:700;">&bull;</span>&nbsp; [STATUS TEXT]
+</td>
+\`\`\`
+The red dot is mandatory for active-status pills. border-radius:20px makes it a true pill shape.
+
+### PATTERN 11: TWO-COLUMN CARD WITH VERTICAL DIVIDER
+Trigger: spec has two adjacent content blocks that should display side-by-side inside a single card frame (e.g. Profile Overview + Operating Impact, Pros + Cons, Features + Benefits).
+
+Specific structural rules (verified against production reference):
+
+\`\`\`html
+<!-- Outer section wrapper: padding 20px 25px 0px 25px (top/sides only, no bottom) -->
+<td align="center" valign="top" bgcolor="#SPEC_BG" style="border-top:1px solid #SPEC_BORDER;">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td style="padding:20px 25px 0px 25px;">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <!-- BORDERED CARD CONTAINER -->
+            <td align="center" valign="top" style="border:1px solid #5F5F5F; border-radius:14px; padding-top:19px; padding-bottom:19px;" bgcolor="#1A1A19">
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <!-- LEFT COLUMN (273px) -->
+                  <th align="center" valign="top" class="em_clear">
+                    <table align="center" width="273" border="0" cellspacing="0" cellpadding="0" style="width:273px;" class="em_wrapper">
+                      <tr>
+                        <td align="center" valign="top" style="padding:2px 12px 12px 19px;" class="em_pad2">
+                          <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                            <!-- Column heading: 26px-wide number cell + 18px spacer + label -->
+                            <tr>
+                              <td align="left" valign="top">
+                                <table align="left" border="0" cellspacing="0" cellpadding="0">
+                                  <tr>
+                                    <td align="right" valign="middle" width="26" style="width:26px;">
+                                      <table width="26" align="right" border="0" cellpadding="0" cellspacing="0">
+                                        <tr><td align="right" valign="middle" style="font-family:'FONT_STACK'; font-size:16px; font-weight:700; line-height:19px; color:#878787;">01</td></tr>
+                                      </table>
+                                    </td>
+                                    <td width="18" style="width:18px;">&nbsp;</td>
+                                    <td align="left" valign="middle" style="font-family:'FONT_STACK'; font-size:16px; font-weight:600; line-height:19px; letter-spacing:2.20px; color:#FFFFFF; text-transform:uppercase;">COLUMN 1 LABEL</td>
+                                  </tr>
+                                </table>
+                              </td>
+                            </tr>
+                            <!-- Bullet items below with red square markers -->
+                            <tr><td style="padding-top:24px;"><!-- First bullet at 24px padding-top --></td></tr>
+                            <tr><td style="padding-top:13px;"><!-- Subsequent bullets at 13px padding-top --></td></tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </th>
+                  <!-- VERTICAL DIVIDER: 1px wide TH with bgcolor -->
+                  <th width="1" style="width:1px; font-size:0px; line-height:0px;" bgcolor="#878787" class="em_clear">&nbsp;</th>
+                  <!-- RIGHT COLUMN (274px) -->
+                  <th align="center" valign="top" class="em_clear">
+                    <table align="center" width="274" border="0" cellspacing="0" cellpadding="0" style="width:274px;" class="em_wrapper">
+                      <tr>
+                        <td align="center" valign="top" style="padding:2px 12px 0px 12px;" class="em_pad1">
+                          <!-- Same heading + bullet structure as left, with "02" + bullets at 14px padding-top from heading, 9px between -->
+                        </td>
+                      </tr>
+                    </table>
+                  </th>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+Critical specifics:
+- Container bgcolor is dark `#1A1A19`, border is muted grey `#5F5F5F`, border-radius is 14px
+- Top/bottom padding inside container is 19px
+- LEFT column width is 273px, RIGHT column width is 274px (these are FIXED, not percentages)
+- Vertical divider is 1px wide TH with bgcolor `#878787` (NOT dark grey — it's a visible mid-grey line)
+- Column heading: number in `#878787` weight 700 + 18px spacer + label in `#FFFFFF` font-weight **600** (NOT 700)
+- Bullets use the red square pattern (Pattern 12) with sqr.png or CSS fallback
+
+NEVER render this as two separate floating columns without the wrapper card. NEVER use border-radius:0 on the wrapper.
+
+### PATTERN 11B: FULL-WIDTH BULLETED LIST CARD
+Trigger: spec has a section with 3-8 bullet points displayed in a single bordered card spanning the full content width (e.g. "What They're Exploring", "Key Features", "What's Included", "Things to Note"). Used for emphasized lists separate from 2-column patterns.
+
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_BG">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td valign="top" align="center" style="padding:20px 25px 0px 25px;" class="em_pad1">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" align="center">
+          <tr>
+            <!-- BORDERED CARD: full inner width -->
+            <td align="center" valign="top" style="padding:18px 20px 18px 19px; border:1px solid #5F5F5F; border-radius:14px;" bgcolor="#1A1A19" class="em_pad">
+              <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                <!-- First bullet — no padding-top -->
+                <tr>
+                  <td valign="top" align="left">
+                    <table width="100%" align="left" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td align="left" valign="top" width="5" style="width:5px; font-size:0; line-height:0;"><img src="SQR_URL" width="5" alt="" style="display:block; max-width:5px;" border="0"/></td>
+                        <td width="10" style="width:10px;">&nbsp;</td>
+                        <td align="left" valign="top" style="font-family:'FONT_STACK'; font-size:14px; font-weight:400; line-height:19px; color:#EBEBEB;">[FIRST BULLET TEXT]</td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <!-- Subsequent bullets — padding-top:9px -->
+                <tr>
+                  <td valign="top" align="left" style="padding-top:9px;">
+                    <!-- same bullet structure -->
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+Specifics:
+- Outer wrapper padding: `20px 25px 0px 25px` (top/sides, no bottom)
+- Card padding: `18px 20px 18px 19px` (note slight asymmetry — left is 19px, right is 20px)
+- Card border: 1px solid `#5F5F5F`, border-radius 14px, bgcolor `#1A1A19`
+- Bullets: 5px sqr.png + 10px spacer + text in `#EBEBEB` 14px weight 400
+- First bullet has no padding-top; subsequent bullets have `padding-top:9px`
+
+### PATTERN 12: RED SQUARE BULLET (for value/feature bullets)
+Trigger: spec bullet items where the marker is a small filled square (not a circle/disc).
+
+If a square bullet image is available in spec:
+\`\`\`html
+<table width="100%" border="0" cellspacing="0" cellpadding="0">
+  <tr>
+    <td width="5" align="left" valign="top" style="width:5px; font-size:0px;"><img src="SQR_URL" width="5" alt="" style="display:block; max-width:5px;" border="0"/></td>
+    <td width="11" style="width:11px;">&nbsp;</td>
+    <td align="left" valign="top" style="font-family:'FONT_STACK'; font-size:14px; font-weight:400; line-height:19px; color:#EBEBEB;"><span style="font-weight:500; color:#ffffff;">Label:</span>&nbsp;&nbsp; [VALUE]</td>
+  </tr>
+</table>
+\`\`\`
+
+If no image available, CSS fallback for the square bullet:
+\`\`\`html
+<td width="5" align="left" valign="top" style="font-size:0; line-height:0;">
+  <table border="0" cellpadding="0" cellspacing="0"><tr><td height="5" width="5" bgcolor="#FF2323" style="height:5px; width:5px; font-size:0; line-height:0;">&nbsp;</td></tr></table>
+</td>
+\`\`\`
+The CSS version uses a 5x5 colored TD as the visible square.
+
+### PATTERN 13: SIDE-BY-SIDE CARD CTA (text card LEFT + CTA card RIGHT)
+Trigger: spec has a multi-line text block (typically a heading + checklist) adjacent to a prominent CTA button inside its own framed card. Common closing-CTA pattern.
+
+Specific structural rules (verified against production reference):
+
+\`\`\`html
+<td align="center" valign="top" bgcolor="#SPEC_BG">
+  <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td valign="top" align="center" style="padding-top:32px; padding-bottom:0px;" class="em_ptop">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" align="center">
+          <tr>
+            <td width="25" class="em_side15">&nbsp;</td>
+            <td align="center" valign="top">
+              <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <!-- LEFT: 386px text card -->
+                  <th align="center" valign="top" class="em_clear">
+                    <table align="center" width="386" border="0" cellspacing="0" cellpadding="0" style="width:386px;" class="em_wrapper">
+                      <tr>
+                        <td align="center" valign="top" style="padding:20px 20px 19px 19px; border:1px solid #5F5F5F; border-radius:14px;" bgcolor="#131312" class="em_pad">
+                          <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                            <!-- Heading -->
+                            <tr><td align="left" style="font-family:'FONT_STACK'; font-size:18px; font-weight:500; line-height:22px; color:#FFFFFF;">[HEADING TEXT]</td></tr>
+                            <!-- Subtitle -->
+                            <tr><td align="left" style="font-family:'FONT_STACK'; font-size:12px; font-weight:400; line-height:15px; color:#878787; padding-top:7px;">[SUBTITLE]</td></tr>
+                            <!-- Bullets WITH bottom borders between them -->
+                            <tr>
+                              <td valign="top" align="left" style="padding-top:23px; padding-bottom:5px; border-bottom:1px solid #2A2A29;">
+                                <table width="100%" align="left" border="0" cellspacing="0" cellpadding="0">
+                                  <tr>
+                                    <td align="left" valign="top" width="4" style="width:4px; font-size:0;"><img src="SQR_URL" width="4" alt="" style="display:block; max-width:4px;" border="0"/></td>
+                                    <td width="9" style="width:9px;">&nbsp;</td>
+                                    <td align="left" valign="top" style="font-family:'FONT_STACK'; font-size:14px; font-weight:400; line-height:19px; color:#EBEBEB;">[BULLET 1]</td>
+                                  </tr>
+                                </table>
+                              </td>
+                            </tr>
+                            <!-- More bullets — padding-top:9px each, same border-bottom -->
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </th>
+                  <!-- 12px gap between cards, hides on mobile -->
+                  <th width="12" class="em_hide">&nbsp;</th>
+                  <!-- RIGHT: 152px CTA card -->
+                  <th align="center" valign="top" class="em_clear em_ptop">
+                    <table align="center" width="152" border="0" cellspacing="0" cellpadding="0" style="width:152px;" class="em_wrapper">
+                      <tr>
+                        <td align="center" valign="top" style="padding:18px 7px 18px 7px; border:1px solid #5F5F5F; border-radius:14px;" bgcolor="#000000" class="em_pad">
+                          <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+                            <!-- Image / icon at top -->
+                            <tr><td align="center"><img src="ICON_URL" width="100" height="109" alt="" style="display:block; max-width:100px;" border="0"/></td></tr>
+                            <!-- Red pill button below image -->
+                            <tr>
+                              <td align="center" valign="top" style="padding-top:6px;">
+                                <table align="center" border="0" cellspacing="0" style="border-radius:24px;" bgcolor="#FF2323" cellpadding="0">
+                                  <tr><td height="10" style="height:10px; font-size:0;">&nbsp;</td></tr>
+                                  <tr>
+                                    <td align="center">
+                                      <table align="center" border="0" cellspacing="0" cellpadding="0">
+                                        <tr>
+                                          <td width="13">&nbsp;</td>
+                                          <td style="font-family:'FONT_STACK'; font-size:11px; color:#FFFFFF; font-weight:700; text-transform:uppercase; letter-spacing:1.1px;"><a href="#" style="color:#fff; text-decoration:none;">[CTA TEXT]&nbsp;</a></td>
+                                          <td width="20">&nbsp;</td>
+                                          <td align="center" valign="middle"><a href="#"><img src="ARROW_URL" width="17" alt="&rarr;" border="0" style="display:inline-block; max-width:17px;"/></a></td>
+                                          <td width="13">&nbsp;</td>
+                                        </tr>
+                                      </table>
+                                    </td>
+                                  </tr>
+                                  <tr><td height="10" style="height:10px; font-size:0;">&nbsp;</td></tr>
+                                </table>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </th>
+                </tr>
+              </table>
+            </td>
+            <td width="25" class="em_side15">&nbsp;</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</td>
+\`\`\`
+
+Critical specifics:
+- LEFT card: width 386px, bgcolor `#131312` (very dark with warm tint), border 1px solid `#5F5F5F`, radius 14px, padding 20px 20px 19px 19px
+- RIGHT card: width 152px, bgcolor `#000000` (pure black), same border/radius, padding 18px 7px 18px 7px
+- Bullets in LEFT card have `border-bottom:1px solid #2A2A29` between each (creates a horizontal divider line under each item)
+- Bullet sqr.png is 4px wide (not 5px), with 9px spacer (not 10px)
+- First bullet has `padding-top:23px` (large gap from subtitle), subsequent bullets `padding-top:9px`
+- Red pill button has border-radius:24px (NOT 22px — that's different from Pattern 14)
+- 12px gap between LEFT and RIGHT cards, hides on mobile
+
+NEVER render this as two stacked rows. NEVER omit the right CTA card frame — the red button SITS INSIDE a bordered card, not floating alone.
+
+### PATTERN 14: GRADIENT BANNER CTA (Ready-to-Meet style)
+Trigger: spec has a horizontal closing CTA banner where the left side has text and the right side has a CTA button.
+
+\`\`\`html
+<td align="center" valign="top" style="padding:22px 26px 21px 25px; border-top:2px solid #FF2323; border-left:1px solid #FF2323; border-bottom:1px solid #FF2323; border-right:1px solid #FF2323; border-radius:14px; background:linear-gradient(to right, rgba(120,40,10,0.35) 0%, rgba(40,40,40,0.9) 25%, #1A1A19 60%, #1A1A19 100%);" bgcolor="#1A1A19">
+  <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <th align="left" valign="top" class="em_clear">
+        <td style="font-family:'FONT_STACK'; font-size:20px; font-weight:400; line-height:25px; color:#SPEC_ACCENT;">
+          <span style="color:#ffffff; font-weight:600;">[HEADING LINE 1]</span><br/>[HEADING LINE 2]
+        </td>
+      </th>
+      <th align="right" valign="top" class="em_clear">
+        <!-- Red CTA pill with arrow (same pattern as Pattern 13's red button) -->
+        <table align="center" bgcolor="#FF2323" style="border-radius:22px;" border="0" cellspacing="0" cellpadding="0">
+          <tr><td height="13">&nbsp;</td></tr>
+          <tr><td><a href="#" style="color:#fff; text-decoration:none;">[CTA TEXT]&nbsp;&rarr;</a></td></tr>
+          <tr><td height="13">&nbsp;</td></tr>
+        </table>
+      </th>
+    </tr>
+  </table>
+</td>
+\`\`\`
+The red top-border (2px) plus thinner side borders is a signature treatment. Use a gradient bg for additional visual depth.
+
+### PATTERN 15: FOOTER WITH MAIL/WEB ICONS + WORDMARK
+Trigger: spec footer has contact methods (email, website) with small icons + a brand wordmark.
+
+\`\`\`html
+<td align="center" bgcolor="#040404" style="padding:25px 0;">
+  <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0" dir="rtl">
+    <tr>
+      <th align="right" dir="ltr" class="em_clear"><!-- WORDMARK on right --></th>
+      <th width="49" class="em_hide">&nbsp;</th>
+      <th align="center" dir="ltr" class="em_clear em_ptop">
+        <!-- Email row with mail icon -->
+        <table align="left" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <td align="center" valign="middle" width="12">
+              <a href="mailto:[EMAIL]"><img src="MAIL_ICON_URL" width="12" height="18" alt="mail" border="0" style="display:block; max-width:13px;"/></a>
+            </td>
+            <td width="6">&nbsp;</td>
+            <td style="font-family:'FONT_STACK'; font-size:14px; color:#878787;"><a href="mailto:[EMAIL]" style="color:#878787; text-decoration:none;">[EMAIL]</a></td>
+          </tr>
+        </table>
+        <!-- Web row with web icon (same pattern) -->
+      </th>
+    </tr>
+  </table>
+</td>
+\`\`\`
+If mail/web icon URLs aren't in the spec, fallback to Unicode (✉ for mail, 🌐 for web) wrapped in a colored span, or use simple text "Email:" / "Web:" prefixes. Avoid emoji.
+
+## PATTERN-MATCHING GUIDANCE
+
+When generating an email:
+1. First, scan the visual reference image (if available) for these patterns
+2. For each section in the spec, determine which pattern (if any) it matches
+3. Use the matching pattern's HTML template, substituting spec values for placeholders
+4. If no pattern matches, fall back to the GOLD STANDARD section templates above
+5. NEVER add visual elements (red borders, capsule rounding, color treatments) that aren't visible in the design reference
+6. NEVER stack vertically when the reference shows horizontal arrangement
+7. NEVER use bullet dots (•) or pipes (|) as ticker separators — always 1-2px bgcolor cells
+
+The patterns above are the BASELINE for Mavlers-grade output. Match them precisely when the spec exhibits the trigger characteristics.
+
 ## FINAL CHECKLIST
 Before outputting, verify:
 - Output begins with <!DOCTYPE
@@ -3086,7 +3719,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "8.0.0",
+    version: "8.1.0",
   });
 });
 
@@ -3655,7 +4288,7 @@ Now analyze the attached design image and produce the JSON specification per the
       try {
         stage1Message = await anthropic.messages.create({
           model: CLAUDE_MODEL,
-          max_tokens: 32000,
+          max_tokens: 64000,
           system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
           messages: [{ role: "user", content: stage1UserContent }],
         });
@@ -3808,7 +4441,7 @@ Now analyze the attached design image and produce the JSON specification per the
           retryMessage = await anthropic.messages.create(
             {
               model: CLAUDE_MODEL,
-              max_tokens: 32000,
+              max_tokens: 64000,
               temperature: 0,
               system: [{ type: "text", text: STAGE1_PROMPT, cache_control: { type: "ephemeral" } }],
               messages: [{ role: "user", content: retryUserContent }],
@@ -4059,7 +4692,7 @@ ${specs.join("\n\n")}
     // v5.5.0: prompt-caching on the large stable Stage 2 system prompt
     const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 32000,
+      max_tokens: 64000,
       system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: stage2Content }],
     });
@@ -4770,7 +5403,7 @@ ${specs.join("\n\n")}
 
     const stage2Response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 32000,
+      max_tokens: 64000,
       system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: userContent }],
     });
@@ -4988,7 +5621,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "8.0.0",
+    version: "8.1.0",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
