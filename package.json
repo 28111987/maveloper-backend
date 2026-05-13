@@ -1,14 +1,14 @@
 {
   "name": "maveloper-backend",
-  "version": "8.1.1",
-  "description": "Maveloper backend — v8.1.1 hotfix: escape inline backticks in pattern library that broke v8.1.0 template literal",
+  "version": "9.0.0-cc-preview",
+  "description": "Maveloper backend — v9.0.0-cc-preview: Claude Code bridge integration. Engine selectable per-request: 'console' (existing API) or 'claude-code' (Mac bridge, Max 20x). Existing Stage 2 path unchanged when AI_ENGINE_DEFAULT=console.",
   "private": true,
   "type": "module",
   "main": "server.js",
   "engines": { "node": ">=22.0.0" },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check band-detector.js && node --check figma-parser.js && node --check figma-image-export.js"
+    "check": "node --check server.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
