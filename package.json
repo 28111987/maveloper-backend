@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "8.1.0",
-  "description": "Maveloper backend — v8.1.0 = MAVLERS PATTERN LIBRARY (16 verified patterns from production reference) + max_tokens 32k→64k truncation fix. Generic patterns apply to ANY Mavlers email.",
+  "version": "8.1.1",
+  "description": "Maveloper backend — v8.1.1 hotfix: escape inline backticks in pattern library that broke v8.1.0 template literal",
   "private": true,
   "type": "module",
   "main": "server.js",
