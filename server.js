@@ -3707,6 +3707,10 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     headers: {
       "Content-Type": "application/json",
       "X-Bridge-Secret": MAC_BRIDGE_SECRET,
+      // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
+      // ngrok returns an HTML warning page instead of forwarding to the
+      // bridge, causing JSON parse failures on the Railway side.
+      "ngrok-skip-browser-warning": "true",
     },
     body: JSON.stringify(payload),
   });
@@ -3806,7 +3810,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "9.0.0-cc-preview",
+    version: "9.0.1-cc-preview",
     // v9.0.0: Claude Code engine status
     aiEngine: {
       default: AI_ENGINE_DEFAULT,
@@ -5760,7 +5764,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "9.0.0-cc-preview",
+    version: "9.0.1-cc-preview",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
