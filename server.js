@@ -3374,11 +3374,11 @@ Specific structural rules (verified against production reference):
 \`\`\`
 
 Critical specifics:
-- Container bgcolor is dark `#1A1A19`, border is muted grey `#5F5F5F`, border-radius is 14px
+- Container bgcolor is dark \`#1A1A19\`, border is muted grey \`#5F5F5F\`, border-radius is 14px
 - Top/bottom padding inside container is 19px
 - LEFT column width is 273px, RIGHT column width is 274px (these are FIXED, not percentages)
-- Vertical divider is 1px wide TH with bgcolor `#878787` (NOT dark grey — it's a visible mid-grey line)
-- Column heading: number in `#878787` weight 700 + 18px spacer + label in `#FFFFFF` font-weight **600** (NOT 700)
+- Vertical divider is 1px wide TH with bgcolor \`#878787\` (NOT dark grey — it's a visible mid-grey line)
+- Column heading: number in \`#878787\` weight 700 + 18px spacer + label in \`#FFFFFF\` font-weight **600** (NOT 700)
 - Bullets use the red square pattern (Pattern 12) with sqr.png or CSS fallback
 
 NEVER render this as two separate floating columns without the wrapper card. NEVER use border-radius:0 on the wrapper.
@@ -3425,11 +3425,11 @@ Trigger: spec has a section with 3-8 bullet points displayed in a single bordere
 \`\`\`
 
 Specifics:
-- Outer wrapper padding: `20px 25px 0px 25px` (top/sides, no bottom)
-- Card padding: `18px 20px 18px 19px` (note slight asymmetry — left is 19px, right is 20px)
-- Card border: 1px solid `#5F5F5F`, border-radius 14px, bgcolor `#1A1A19`
-- Bullets: 5px sqr.png + 10px spacer + text in `#EBEBEB` 14px weight 400
-- First bullet has no padding-top; subsequent bullets have `padding-top:9px`
+- Outer wrapper padding: \`20px 25px 0px 25px\` (top/sides, no bottom)
+- Card padding: \`18px 20px 18px 19px\` (note slight asymmetry — left is 19px, right is 20px)
+- Card border: 1px solid \`#5F5F5F\`, border-radius 14px, bgcolor \`#1A1A19\`
+- Bullets: 5px sqr.png + 10px spacer + text in \`#EBEBEB\` 14px weight 400
+- First bullet has no padding-top; subsequent bullets have \`padding-top:9px\`
 
 ### PATTERN 12: RED SQUARE BULLET (for value/feature bullets)
 Trigger: spec bullet items where the marker is a small filled square (not a circle/disc).
@@ -3547,11 +3547,11 @@ Specific structural rules (verified against production reference):
 \`\`\`
 
 Critical specifics:
-- LEFT card: width 386px, bgcolor `#131312` (very dark with warm tint), border 1px solid `#5F5F5F`, radius 14px, padding 20px 20px 19px 19px
-- RIGHT card: width 152px, bgcolor `#000000` (pure black), same border/radius, padding 18px 7px 18px 7px
-- Bullets in LEFT card have `border-bottom:1px solid #2A2A29` between each (creates a horizontal divider line under each item)
+- LEFT card: width 386px, bgcolor \`#131312\` (very dark with warm tint), border 1px solid \`#5F5F5F\`, radius 14px, padding 20px 20px 19px 19px
+- RIGHT card: width 152px, bgcolor \`#000000\` (pure black), same border/radius, padding 18px 7px 18px 7px
+- Bullets in LEFT card have \`border-bottom:1px solid #2A2A29\` between each (creates a horizontal divider line under each item)
 - Bullet sqr.png is 4px wide (not 5px), with 9px spacer (not 10px)
-- First bullet has `padding-top:23px` (large gap from subtitle), subsequent bullets `padding-top:9px`
+- First bullet has \`padding-top:23px\` (large gap from subtitle), subsequent bullets \`padding-top:9px\`
 - Red pill button has border-radius:24px (NOT 22px — that's different from Pattern 14)
 - 12px gap between LEFT and RIGHT cards, hides on mobile
 
@@ -3719,7 +3719,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "8.1.0",
+    version: "8.1.1",
   });
 });
 
@@ -5621,7 +5621,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "8.1.0",
+    version: "8.1.1",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
