@@ -3651,6 +3651,93 @@ Generate the most accurate, production-ready, Mavlers-grade HTML email code poss
 
 // =====================================================================
 // EXPRESS APP SETUP
+
+// =====================================================================
+// v9.0.0 — CLAUDE CODE BRIDGE (parallel to Anthropic API for Stage 2)
+// =====================================================================
+//
+// Toggle: header X-AI-Engine OR body.aiEngine = "claude-code" | "console" (default)
+// Or env: AI_ENGINE_DEFAULT=claude-code
+//
+// When "claude-code" is selected, Stage 2 hits the Mac bridge instead of Anthropic API.
+// Mac bridge URL: MAC_BRIDGE_URL env var (e.g. https://xxx.ngrok.io)
+// Auth: MAC_BRIDGE_SECRET shared between Railway and Mac bridge
+
+const MAC_BRIDGE_URL = process.env.MAC_BRIDGE_URL || null;
+const MAC_BRIDGE_SECRET = process.env.MAC_BRIDGE_SECRET || "change-me-in-env";
+const AI_ENGINE_DEFAULT = process.env.AI_ENGINE_DEFAULT || "console"; // "console" | "claude-code"
+
+function getRequestedEngine(req) {
+  // Per-request override via header or body
+  const headerEngine = req.headers["x-ai-engine"];
+  const bodyEngine = req.body?.aiEngine;
+  return headerEngine || bodyEngine || AI_ENGINE_DEFAULT;
+}
+
+async function loadReferenceForFigmaFile(figmaFileKey) {
+  // Use the existing REFERENCE_CACHE populated at boot from /references/
+  if (!figmaFileKey) return null;
+  return REFERENCE_CACHE.get(figmaFileKey) || null;
+}
+
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, log }) {
+  if (!MAC_BRIDGE_URL) {
+    throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
+  }
+
+  const payload = {
+    spec: designSpec,
+    referenceHtml: referenceHtml || null,
+    imageBase64: designImageBase64 || null,
+    model: model || "sonnet",
+    requestId,
+  };
+
+  log("info", "Claude Code: dispatching to Mac bridge", {
+    requestId,
+    bridgeUrl: MAC_BRIDGE_URL,
+    specSections: designSpec?.sections?.length || 0,
+    hasReference: !!referenceHtml,
+    hasImage: !!designImageBase64,
+  });
+
+  const startTime = Date.now();
+  const response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Secret": MAC_BRIDGE_SECRET,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Mac bridge returned ${response.status}: ${errBody.substring(0, 500)}`);
+  }
+
+  const result = await response.json();
+  if (!result.html) {
+    throw new Error(`Mac bridge returned no HTML: ${JSON.stringify(result).substring(0, 500)}`);
+  }
+
+  log("info", "Claude Code: bridge returned HTML", {
+    requestId,
+    jobId: result.jobId,
+    bytesGenerated: result.bytesGenerated,
+    elapsedSeconds: parseFloat(elapsedSeconds),
+  });
+
+  return result.html;
+}
+
+// =====================================================================
+// END CLAUDE CODE BRIDGE
+// =====================================================================
+
+
 // =====================================================================
 const app = express();
 
@@ -3719,7 +3806,13 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "8.1.1",
+    version: "9.0.0-cc-preview",
+    // v9.0.0: Claude Code engine status
+    aiEngine: {
+      default: AI_ENGINE_DEFAULT,
+      claudeCodeBridgeConfigured: Boolean(MAC_BRIDGE_URL),
+      bridgeUrl: MAC_BRIDGE_URL ? `${MAC_BRIDGE_URL.substring(0, 30)}...` : null,
+    },
   });
 });
 
@@ -4689,28 +4782,74 @@ ${specs.join("\n\n")}
 
     const stage2StartTime = Date.now();
 
-    // v5.5.0: prompt-caching on the large stable Stage 2 system prompt
-    const stage2Response = await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 64000,
-      system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: stage2Content }],
-    });
+    // v9.0.0: Engine routing — Claude Code bridge OR existing Anthropic API
+    const requestedEngine = getRequestedEngine(req);
+    log("info", "Stage 2: engine selection", { requestId: req.id, engine: requestedEngine });
 
-    const stage2TextBlock = stage2Response.content?.find((block) => block.type === "text");
-    if (!stage2TextBlock || !stage2TextBlock.text) {
-      log("error", "Stage 2: Claude returned no text", {
-        requestId: req.id,
-        contentBlocks: stage2Response.content?.length || 0,
+    let html_raw;
+    if (requestedEngine === "claude-code") {
+      // ─── Claude Code path (uses Mac bridge, Max 20× subscription, $0/gen) ───
+      try {
+        // Best-effort: load reference HTML if available for this Figma file
+        let referenceHtmlForCC = null;
+        try {
+          referenceHtmlForCC = await loadReferenceForFigmaFile(figmaFileKey);
+        } catch { /* ignore */ }
+
+        html_raw = await callClaudeCodeBridge({
+          designSpec,
+          referenceHtml: referenceHtmlForCC,
+          designImageBase64: null, // TODO: pass Phase B render image
+          model: req.body?.model || "sonnet",
+          requestId: req.id,
+          log,
+        });
+      } catch (err) {
+        log("error", "Claude Code bridge failed; falling back to Anthropic API", {
+          requestId: req.id,
+          error: err.message,
+        });
+        // Automatic fallback to Anthropic API so the user still gets output
+        const stage2Response = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 64000,
+          system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
+          messages: [{ role: "user", content: stage2Content }],
+        });
+        const stage2TextBlock = stage2Response.content?.find((block) => block.type === "text");
+        if (!stage2TextBlock?.text) {
+          return res.status(502).json({
+            error: "HTML generation failed (Claude Code AND Anthropic API both failed)",
+            details: err.message,
+            requestId: req.id,
+          });
+        }
+        html_raw = stage2TextBlock.text;
+      }
+    } else {
+      // ─── Original Anthropic API path (UNCHANGED from v8.1.1) ───
+      const stage2Response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 64000,
+        system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: stage2Content }],
       });
-      return res.status(502).json({
-        error: "HTML generation failed",
-        details: "Claude could not generate HTML from the design spec. Please try again.",
-        requestId: req.id,
-      });
+
+      const stage2TextBlock = stage2Response.content?.find((block) => block.type === "text");
+      if (!stage2TextBlock || !stage2TextBlock.text) {
+        log("error", "Stage 2: Claude returned no text", {
+          requestId: req.id,
+          contentBlocks: stage2Response.content?.length || 0,
+        });
+        return res.status(502).json({
+          error: "HTML generation failed",
+          details: "Claude could not generate HTML from the design spec. Please try again.",
+          requestId: req.id,
+        });
+      }
+
+      html_raw = stage2TextBlock.text;
     }
-
-    const html_raw = stage2TextBlock.text;
 
     // --- Post-processing (v5.2.0): deterministic fix-ups ---
     // Log imageUrlMap state BEFORE post-process so we can see what's actually available
@@ -5621,7 +5760,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "8.1.1",
+    version: "9.0.0-cc-preview",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
