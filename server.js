@@ -3810,7 +3810,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "9.0.1-cc-preview",
+    version: "9.0.2-cc-preview",
     // v9.0.0: Claude Code engine status
     aiEngine: {
       default: AI_ENGINE_DEFAULT,
@@ -5529,8 +5529,15 @@ ${specs.join("\n\n")}
     }
     userContent.push({ type: "text", text: stage2UserPrompt });
 
+    // v9.0.2: Engine routing — Claude Code bridge OR existing Anthropic API.
+    // This branch was previously only wired into the PDF /generate endpoint;
+    // the Figma path always hit Anthropic directly. Now both endpoints honor
+    // X-AI-Engine header / aiEngine body field / AI_ENGINE_DEFAULT env var.
+    const requestedEngine = getRequestedEngine(req);
+
     log("info", "Stage 2: Sending Figma spec to Claude", {
       requestId: req.id,
+      engine: requestedEngine,
       specSections: designSpec.sections.length,
       imageRefs: imageRefs.length,
       devSpecs: specs.length,
@@ -5544,27 +5551,71 @@ ${specs.join("\n\n")}
       referenceHtmlKB: referenceHtml ? Math.round(referenceHtml.length / 1024) : 0,
     });
 
-    const stage2Response = await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 64000,
-      system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: userContent }],
-    });
+    let html_raw;
+    let engineUsed = requestedEngine;
 
-    const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
-    if (!stage2TextBlock || !stage2TextBlock.text) {
-      log("error", "Stage 2 (Figma): Claude returned no text", {
-        requestId: req.id,
-        contentBlocks: stage2Response.content?.length || 0,
+    if (requestedEngine === "claude-code") {
+      // ─── Claude Code path (Mac bridge, Max 20× subscription) ───
+      try {
+        const designImageBase64ForCC = previewBufferForStage2
+          ? previewBufferForStage2.toString("base64")
+          : null;
+
+        html_raw = await callClaudeCodeBridge({
+          designSpec,
+          referenceHtml: referenceHtml || null,
+          designImageBase64: designImageBase64ForCC,
+          model: req.body?.model || "sonnet",
+          requestId: req.id,
+          log,
+        });
+      } catch (err) {
+        log("error", "Claude Code bridge failed; falling back to Anthropic API", {
+          requestId: req.id,
+          error: err.message,
+        });
+        engineUsed = "console-fallback";
+        // Automatic fallback to Anthropic API so the user still gets output.
+        const stage2Response = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 64000,
+          system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
+          messages: [{ role: "user", content: userContent }],
+        });
+        const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
+        if (!stage2TextBlock?.text) {
+          return res.status(502).json({
+            error: "HTML generation failed (Claude Code AND Anthropic API both failed)",
+            details: err.message,
+            requestId: req.id,
+          });
+        }
+        html_raw = stage2TextBlock.text;
+      }
+    } else {
+      // ─── Original Anthropic API path (UNCHANGED from v8.1.1) ───
+      const stage2Response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 64000,
+        system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: userContent }],
       });
-      return res.status(502).json({
-        error: "HTML generation failed",
-        details: "Claude could not generate HTML from the Figma spec. Please try again.",
-        requestId: req.id,
-      });
+
+      const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
+      if (!stage2TextBlock || !stage2TextBlock.text) {
+        log("error", "Stage 2 (Figma): Claude returned no text", {
+          requestId: req.id,
+          contentBlocks: stage2Response.content?.length || 0,
+        });
+        return res.status(502).json({
+          error: "HTML generation failed",
+          details: "Claude could not generate HTML from the Figma spec. Please try again.",
+          requestId: req.id,
+        });
+      }
+
+      html_raw = stage2TextBlock.text;
     }
-
-    const html_raw = stage2TextBlock.text;
 
     // --- Post-processing: most rules are no-ops on Figma path, but HTML
     //     hygiene rules (font stacks, malformed self-closing img, Google
@@ -5582,6 +5633,7 @@ ${specs.join("\n\n")}
     log("info", "Figma generation complete", {
       requestId: req.id,
       orderId,
+      engineUsed,                                              // v9.0.2: definitive engine record
       stage2DurationMs: Date.now() - stage2StartTime,
       totalPipelineDurationMs: Date.now() - startTime,
       htmlLength: html.length,
@@ -5603,6 +5655,7 @@ ${specs.join("\n\n")}
       imageCount: Object.keys(imageUrlMap).length,
       imageExportReport,                                    // v6.1.0: visibility into export status
       model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic — which Claude model produced this
+      engineUsed,                                           // v9.0.2: "claude-code" | "console" | "console-fallback"
       referenceHtmlUsed: Boolean(REFERENCE_CACHE.get(fileKey)), // v8.0.0: was a human-coded reference injected
       figmaSource: {
         fileKey,
@@ -5764,7 +5817,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "9.0.1-cc-preview",
+    version: "9.0.2-cc-preview",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
