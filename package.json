@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.0.3-cc-preview",
-  "description": "Maveloper backend — v9.0.3-cc-preview: Claude Code bridge integration. Engine selectable per-request: 'console' (existing API) or 'claude-code' (Mac bridge, Max 20x). Existing Stage 2 path unchanged when AI_ENGINE_DEFAULT=console.",
+  "version": "9.1.0-async-preview",
+  "description": "Maveloper backend — v9.1.0-async-preview: Claude Code bridge integration. Engine selectable per-request: 'console' (existing API) or 'claude-code' (Mac bridge, Max 20x). Existing Stage 2 path unchanged when AI_ENGINE_DEFAULT=console.",
   "private": true,
   "type": "module",
   "main": "server.js",
