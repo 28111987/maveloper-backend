@@ -3810,7 +3810,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "9.0.3-cc-preview",
+    version: "9.1.0-async-preview",
     // v9.0.0: Claude Code engine status
     aiEngine: {
       default: AI_ENGINE_DEFAULT,
@@ -5101,6 +5101,84 @@ ${specs.join("\n\n")}
 //     Dropbox upload fails, we degrade to empty src (Phase A behavior)
 //     and surface the failure in imageExportReport.
 // =====================================================================
+
+// =====================================================================
+// v9.1.0 — ASYNC JOB PATTERN
+//
+// PROBLEM:
+//   Railway's HTTP request handler has a ~30s timeout. Claude Code
+//   generations take 10-30 min. Lovable always sees "Generation failed"
+//   even on success.
+//
+// SOLUTION:
+//   /generate-from-figma-async — returns a jobId in <1s, runs generation
+//     in background, writes result to Supabase maveloper_jobs table.
+//   /job-status/:jobId — polls Supabase for status/result/error.
+//
+// IMPLEMENTATION:
+//   The async endpoint reuses the existing synchronous /generate-from-figma
+//   handler by passing it a "fake response object" that captures the
+//   response body instead of writing it to a socket. The captured body is
+//   then persisted to Supabase. This keeps the existing endpoint 100%
+//   unchanged and reduces risk of regressions.
+// =====================================================================
+
+/**
+ * Creates a fake Express response object that captures status code and JSON
+ * body in memory instead of writing to a socket. Used internally to invoke
+ * a synchronous Express handler from an async background worker.
+ *
+ * Returns an object with the same shape Express handlers expect:
+ *   res.status(code).json(body)
+ *   res.json(body)
+ * After the handler completes, read result.statusCode and result.body.
+ */
+function createFakeResponse() {
+  const result = { statusCode: 200, body: null, headersSent: false };
+  const fakeRes = {
+    status(code) {
+      result.statusCode = code;
+      return fakeRes;
+    },
+    json(body) {
+      if (result.headersSent) return fakeRes;
+      result.body = body;
+      result.headersSent = true;
+      return fakeRes;
+    },
+    send(body) {
+      if (result.headersSent) return fakeRes;
+      result.body = body;
+      result.headersSent = true;
+      return fakeRes;
+    },
+    set() { return fakeRes; },
+    setHeader() { return fakeRes; },
+    get headersSent() { return result.headersSent; },
+  };
+  return { res: fakeRes, result };
+}
+
+/**
+ * Updates a maveloper_jobs row. Non-fatal: errors are logged but don't throw.
+ * Reason: we never want a Supabase blip to crash the in-flight generation.
+ */
+async function updateJobStatus(jobId, fields, requestId) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin
+      .from("maveloper_jobs")
+      .update({ ...fields, updated_at: new Date().toISOString() })
+      .eq("id", jobId);
+  } catch (e) {
+    log("warn", "Failed to update job status (non-fatal)", {
+      requestId,
+      jobId,
+      error: e.message,
+    });
+  }
+}
+
 app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res) => {
   const startTime = Date.now();
   try {
@@ -5724,6 +5802,280 @@ ${specs.join("\n\n")}
   }
 });
 
+// =====================================================================
+// v9.1.0 — POST /generate-from-figma-async
+//
+// Async wrapper around /generate-from-figma. Returns a jobId immediately
+// (<1s). Generation runs in background; result is stored in Supabase
+// maveloper_jobs table for Lovable to poll via /job-status/:jobId.
+//
+// Request body: same shape as /generate-from-figma plus optional fields.
+//   { figmaUrl, emailWidth?, primaryFont?, secondaryFont?, espPlatform?, darkMode? }
+//
+// Response (immediate, ~1s):
+//   { jobId, status: "pending", requestId }
+//
+// Background worker writes one of these final states to Supabase:
+//   status="completed", result_html=<string>, engine_used=<string>
+//   status="failed", error_message=<string>
+// =====================================================================
+app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req, res) => {
+  try {
+    const { figmaUrl } = req.body;
+
+    if (!figmaUrl || typeof figmaUrl !== "string") {
+      return res.status(400).json({
+        error: "Missing figmaUrl",
+        details: "Request body must include a figmaUrl field with a Figma share link.",
+        requestId: req.id,
+      });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        error: "Async generation unavailable",
+        details: "Supabase is not configured on the backend. The async job table is required.",
+        requestId: req.id,
+      });
+    }
+
+    // Create the job row immediately. We need the jobId before returning to Lovable.
+    const { data: job, error: insertErr } = await supabaseAdmin
+      .from("maveloper_jobs")
+      .insert({
+        status: "pending",
+        figma_url: figmaUrl,
+        progress_message: "Job created; waiting to start",
+      })
+      .select("id")
+      .single();
+
+    if (insertErr || !job) {
+      log("error", "Failed to create maveloper_jobs row", {
+        requestId: req.id,
+        error: insertErr?.message,
+      });
+      return res.status(500).json({
+        error: "Failed to create job",
+        details: "Could not initialize the async generation job in Supabase.",
+        requestId: req.id,
+      });
+    }
+
+    const jobId = job.id;
+
+    log("info", "Async Figma generation started", {
+      requestId: req.id,
+      jobId,
+      figmaUrl: figmaUrl.split("?")[0],
+      userId: req.user?.id ?? "anonymous",
+    });
+
+    // Return jobId immediately. Lovable starts polling /job-status/:jobId.
+    res.status(202).json({
+      jobId,
+      status: "pending",
+      requestId: req.id,
+    });
+
+    // ──────────────────────────────────────────────────────────────
+    // Background work — runs after res.json() returns to the client.
+    // setImmediate ensures Node finishes flushing the response before
+    // we start the long-running task.
+    // ──────────────────────────────────────────────────────────────
+    setImmediate(async () => {
+      const bgStartTime = Date.now();
+      try {
+        await updateJobStatus(jobId, {
+          status: "running",
+          progress_message: "Generation started; calling /generate-from-figma handler internally",
+        }, req.id);
+
+        // Build a fake request mirroring the real one. The existing
+        // /generate-from-figma handler will read req.body and req.id from it.
+        const fakeReq = {
+          body: req.body,
+          id: req.id,
+          user: req.user,
+          headers: req.headers || {},
+          get: (h) => (req.headers ? req.headers[h.toLowerCase()] : undefined),
+        };
+
+        // Build a fake response object that captures status + body in memory.
+        const { res: fakeRes, result } = createFakeResponse();
+
+        // Invoke the synchronous handler. It will populate `result.body`
+        // when it finishes (success or error). This call can take 10-30 min.
+        // We DELIBERATELY do not await any Railway HTTP timeout here — the
+        // outer endpoint has already returned to the client.
+        const handlerEntry = app._router?.stack?.find((layer) =>
+          layer.route?.path === "/generate-from-figma" && layer.route?.methods?.post
+        );
+
+        if (!handlerEntry || !handlerEntry.route) {
+          throw new Error("/generate-from-figma route not found in Express router");
+        }
+
+        // The route's handler stack includes generateLimiter and optionalAuth
+        // before the actual handler. For the internal call we skip those —
+        // the user has already passed them on the async endpoint. Find the
+        // last handler in the route's stack (the actual generation handler).
+        const handlerStack = handlerEntry.route.stack;
+        const actualHandler = handlerStack[handlerStack.length - 1].handle;
+
+        await actualHandler(fakeReq, fakeRes, (err) => {
+          // Express "next" — only called on error inside the handler.
+          if (err) throw err;
+        });
+
+        // Handler completed. Inspect result.
+        const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
+
+        if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
+          // SUCCESS
+          await updateJobStatus(jobId, {
+            status: "completed",
+            result_html: result.body.html,
+            engine_used: result.body.engineUsed ?? null,
+            progress_message: `Generation complete in ${durationSec}s`,
+            completed_at: new Date().toISOString(),
+          }, req.id);
+          log("info", "Async job completed", { requestId: req.id, jobId, durationSec });
+        } else {
+          // FAILURE — handler set non-2xx status or no html
+          const errMsg = result.body?.error
+            ? `${result.body.error}: ${result.body.details ?? ""}`.trim()
+            : `Handler returned status ${result.statusCode} with no html`;
+          await updateJobStatus(jobId, {
+            status: "failed",
+            error_message: errMsg.substring(0, 2000),
+            completed_at: new Date().toISOString(),
+          }, req.id);
+          log("warn", "Async job failed", {
+            requestId: req.id,
+            jobId,
+            statusCode: result.statusCode,
+            error: errMsg,
+            durationSec,
+          });
+        }
+      } catch (bgErr) {
+        const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
+        log("error", "Async job crashed", {
+          requestId: req.id,
+          jobId,
+          error: bgErr.message,
+          stack: bgErr.stack?.substring(0, 1000),
+          durationSec,
+        });
+        await updateJobStatus(jobId, {
+          status: "failed",
+          error_message: `Internal error: ${bgErr.message}`.substring(0, 2000),
+          completed_at: new Date().toISOString(),
+        }, req.id);
+      }
+    });
+  } catch (err) {
+    log("error", "Async endpoint setup error", {
+      requestId: req.id,
+      error: err.message,
+    });
+    res.status(500).json({
+      error: "Failed to start async generation",
+      details: err.message,
+      requestId: req.id,
+    });
+  }
+});
+
+// =====================================================================
+// v9.1.0 — GET /job-status/:jobId
+//
+// Returns the current status of an async generation job.
+//
+// Response shapes by status:
+//   pending:   { status: "pending", progress_message }
+//   running:   { status: "running", progress_message }
+//   completed: { status: "completed", html, engineUsed, completedAt }
+//   failed:    { status: "failed", error, completedAt }
+// =====================================================================
+app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(jobId)) {
+      return res.status(400).json({
+        error: "Invalid jobId format",
+        details: "jobId must be a UUID.",
+        requestId: req.id,
+      });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        error: "Async generation unavailable",
+        details: "Supabase is not configured on the backend.",
+        requestId: req.id,
+      });
+    }
+
+    const { data: job, error } = await supabaseAdmin
+      .from("maveloper_jobs")
+      .select("id, status, progress_message, result_html, error_message, engine_used, created_at, updated_at, completed_at")
+      .eq("id", jobId)
+      .single();
+
+    if (error || !job) {
+      return res.status(404).json({
+        error: "Job not found",
+        details: `No job found with id ${jobId}.`,
+        requestId: req.id,
+      });
+    }
+
+    const baseResponse = {
+      jobId: job.id,
+      status: job.status,
+      createdAt: job.created_at,
+      updatedAt: job.updated_at,
+      requestId: req.id,
+    };
+
+    if (job.status === "completed") {
+      return res.json({
+        ...baseResponse,
+        html: job.result_html,
+        engineUsed: job.engine_used,
+        completedAt: job.completed_at,
+      });
+    }
+
+    if (job.status === "failed") {
+      return res.json({
+        ...baseResponse,
+        error: job.error_message,
+        completedAt: job.completed_at,
+      });
+    }
+
+    // pending or running
+    return res.json({
+      ...baseResponse,
+      progressMessage: job.progress_message,
+    });
+  } catch (err) {
+    log("error", "Job-status endpoint error", {
+      requestId: req.id,
+      error: err.message,
+    });
+    res.status(500).json({
+      error: "Failed to fetch job status",
+      details: err.message,
+      requestId: req.id,
+    });
+  }
+});
+
 // -----------------------------------------------------------------
 // POST /approve — Package ZIP and upload to Dropbox
 // Called after dev reviews preview and clicks "Approve & Upload"
@@ -5838,7 +6190,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "9.0.3-cc-preview",
+    version: "9.1.0-async-preview",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
