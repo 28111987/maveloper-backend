@@ -3810,7 +3810,7 @@ app.get("/health", (req, res) => {
     supabaseConfigured,
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
-    version: "9.0.2-cc-preview",
+    version: "9.0.3-cc-preview",
     // v9.0.0: Claude Code engine status
     aiEngine: {
       default: AI_ENGINE_DEFAULT,
@@ -5570,6 +5570,27 @@ ${specs.join("\n\n")}
           log,
         });
       } catch (err) {
+        // v9.0.3: AI_ENGINE_NO_FALLBACK protects against silent Anthropic billing
+        // when the bridge is misconfigured or under repair. Set this env var to
+        // "true" on Railway during Claude Code testing so failures surface to the
+        // client as 502s instead of triggering an expensive Anthropic fallback
+        // (a single Stage 2 Sonnet 4-6 call costs ~$2 in tokens).
+        const noFallback = process.env.AI_ENGINE_NO_FALLBACK === "true";
+
+        if (noFallback) {
+          log("error", "Claude Code bridge failed; fallback DISABLED (AI_ENGINE_NO_FALLBACK=true)", {
+            requestId: req.id,
+            error: err.message,
+          });
+          return res.status(502).json({
+            error: "Claude Code bridge failed and automatic fallback is disabled.",
+            details: err.message,
+            requestId: req.id,
+            engineUsed: "claude-code-failed-no-fallback",
+            hint: "Either fix the bridge (check ngrok + cc-runner.mjs) or unset AI_ENGINE_NO_FALLBACK on Railway to re-enable Anthropic fallback.",
+          });
+        }
+
         log("error", "Claude Code bridge failed; falling back to Anthropic API", {
           requestId: req.id,
           error: err.message,
@@ -5817,7 +5838,7 @@ const server = app.listen(PORT, () => {
   log("info", `Maveloper backend running on port ${PORT}`, {
     model: CLAUDE_MODEL,
     framework: "master-v2",
-    version: "9.0.2-cc-preview",
+    version: "9.0.3-cc-preview",
     dropboxConfigured,
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
