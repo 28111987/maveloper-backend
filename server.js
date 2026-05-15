@@ -3717,13 +3717,18 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     hasImage: !!designImageBase64,
   });
 
-  // v9.1.3 telemetry — capture exact stage each timing event happens at,
-  // plus deep error.cause when fetch fails. This is the diagnostic build:
-  // we are not trying to fix anything new here, only to see the truth.
+  // v9.1.4 — NDJSON streaming protocol.
+  //
+  // Previously we awaited a single JSON response. Bridge takes ~20 min to
+  // produce HTML and was silent the entire time, causing the path
+  // (ngrok / proxy / undici) to declare the connection idle and abort at ~5 min.
+  // The bridge (v1.0.4+) now streams newline-delimited JSON with a 20-second
+  // heartbeat. We read line-by-line, ignore heartbeats, and extract the html
+  // from the final {"type":"result", ...} line.
   const startTime = Date.now();
   const t = () => `${((Date.now() - startTime) / 1000).toFixed(1)}s`;
 
-  log("info", "[telemetry] T+0s: about to call fetch()", { requestId });
+  log("info", "[telemetry] T+0s: about to call fetch() (NDJSON stream)", { requestId });
 
   let response;
   try {
@@ -3731,10 +3736,8 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "application/x-ndjson",
         "X-Bridge-Secret": MAC_BRIDGE_SECRET,
-        // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
-        // ngrok returns an HTML warning page instead of forwarding to the
-        // bridge, causing JSON parse failures on the Railway side.
         "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify(payload),
@@ -3744,26 +3747,19 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       status: response.status,
       statusText: response.statusText,
       contentType: response.headers.get("content-type"),
-      contentLength: response.headers.get("content-length"),
     });
   } catch (fetchErr) {
-    // Deep dump — we want to see EVERY layer of the error, especially .cause
     const causeChain = [];
     let current = fetchErr;
     while (current) {
       causeChain.push({
-        name: current.name,
-        message: current.message,
-        code: current.code,
-        errno: current.errno,
-        syscall: current.syscall,
+        name: current.name, message: current.message,
+        code: current.code, errno: current.errno, syscall: current.syscall,
       });
       current = current.cause;
     }
     log("error", `[telemetry] T+${t()}: fetch() threw — full cause chain`, {
-      requestId,
-      causeChain,
-      stack: fetchErr.stack?.substring(0, 2000),
+      requestId, causeChain, stack: fetchErr.stack?.substring(0, 2000),
     });
     throw new Error(`Bridge fetch failed at ${t()}: ${fetchErr.message} (${fetchErr.cause?.code || fetchErr.code || "no-code"})`);
   }
@@ -3772,55 +3768,116 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     let errBody = "";
     try { errBody = await response.text(); } catch { errBody = "(could not read error body)"; }
     log("error", `[telemetry] T+${t()}: bridge returned non-2xx`, {
-      requestId,
-      status: response.status,
-      bodyPreview: errBody.substring(0, 500),
+      requestId, status: response.status, bodyPreview: errBody.substring(0, 500),
     });
     throw new Error(`Mac bridge returned ${response.status}: ${errBody.substring(0, 500)}`);
   }
 
-  log("info", `[telemetry] T+${t()}: response.ok=true, starting body read`, { requestId });
-
-  let result;
-  try {
-    result = await response.json();
-    log("info", `[telemetry] T+${t()}: response.json() completed`, {
-      requestId,
-      hasHtml: !!result.html,
-      htmlBytes: result.html?.length || 0,
-      jobId: result.jobId,
-    });
-  } catch (bodyErr) {
-    const causeChain = [];
-    let current = bodyErr;
-    while (current) {
-      causeChain.push({
-        name: current.name,
-        message: current.message,
-        code: current.code,
-      });
-      current = current.cause;
-    }
-    log("error", `[telemetry] T+${t()}: response.json() threw`, {
-      requestId,
-      causeChain,
-      stack: bodyErr.stack?.substring(0, 2000),
-    });
-    throw new Error(`Bridge body read failed at ${t()}: ${bodyErr.message} (${bodyErr.cause?.code || bodyErr.code || "no-code"})`);
+  if (!response.body) {
+    throw new Error("Bridge response has no body stream");
   }
 
-  if (!result.html) {
-    throw new Error(`Mac bridge returned no HTML: ${JSON.stringify(result).substring(0, 500)}`);
+  // Stream-parse NDJSON. Use TextDecoder for incremental UTF-8 decoding.
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let html = null;
+  let finalLine = null;
+  let lastHeartbeatAt = startTime;
+  let heartbeatCount = 0;
+
+  try {
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+
+      // Process complete lines (each line is a JSON object)
+      let nlIdx;
+      while ((nlIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nlIdx).trim();
+        buffer = buffer.slice(nlIdx + 1);
+        if (!line) continue;
+
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch (e) {
+          log("warn", `[telemetry] T+${t()}: skipping unparseable line`, {
+            requestId, linePreview: line.substring(0, 200),
+          });
+          continue;
+        }
+
+        if (event.type === "start") {
+          log("info", `[telemetry] T+${t()}: stream start received`, {
+            requestId, jobId: event.jobId,
+          });
+        } else if (event.type === "heartbeat") {
+          heartbeatCount++;
+          lastHeartbeatAt = Date.now();
+          // Only log every 5th heartbeat (every ~100s) so we don't spam Railway logs.
+          if (heartbeatCount % 5 === 0) {
+            log("info", `[telemetry] T+${t()}: heartbeat #${heartbeatCount} (bridge elapsed=${event.elapsedSeconds}s)`, { requestId });
+          }
+        } else if (event.type === "result") {
+          finalLine = event;
+          html = event.html;
+          log("info", `[telemetry] T+${t()}: result line received`, {
+            requestId, jobId: event.jobId, bytesGenerated: event.bytesGenerated, heartbeats: heartbeatCount,
+          });
+          // Don't break — let the stream drain naturally so we honor any
+          // trailing bytes/CRLF the bridge sends.
+        } else if (event.type === "error") {
+          finalLine = event;
+          log("error", `[telemetry] T+${t()}: error line received`, {
+            requestId, event,
+          });
+        } else {
+          log("warn", `[telemetry] T+${t()}: unknown event type`, {
+            requestId, type: event.type,
+          });
+        }
+      }
+    }
+  } catch (streamErr) {
+    log("error", `[telemetry] T+${t()}: stream read failed`, {
+      requestId,
+      message: streamErr.message,
+      code: streamErr.code,
+      heartbeatCount,
+      stack: streamErr.stack?.substring(0, 2000),
+    });
+    throw new Error(`Bridge stream failed at ${t()}: ${streamErr.message}`);
+  }
+
+  // Process any remaining buffered content (in case the last line had no \n)
+  if (buffer.trim()) {
+    try {
+      const event = JSON.parse(buffer.trim());
+      if (event.type === "result") { finalLine = event; html = event.html; }
+      else if (event.type === "error") { finalLine = event; }
+    } catch { /* ignore trailing garbage */ }
+  }
+
+  if (!finalLine) {
+    throw new Error(`Bridge stream ended without a result or error line (received ${heartbeatCount} heartbeats over ${t()})`);
+  }
+
+  if (finalLine.type === "error") {
+    throw new Error(`Mac bridge error: ${finalLine.error} (exitCode=${finalLine.exitCode ?? "n/a"})`);
+  }
+
+  if (!html) {
+    throw new Error(`Mac bridge result missing html field: ${JSON.stringify(finalLine).substring(0, 500)}`);
   }
 
   log("info", "Claude Code: bridge returned HTML", {
     requestId,
-    jobId: result.jobId,
-    bytesGenerated: result.bytesGenerated,
+    jobId: finalLine.jobId,
+    bytesGenerated: finalLine.bytesGenerated,
     elapsedSeconds: parseFloat(((Date.now() - startTime) / 1000).toFixed(1)),
+    heartbeatsReceived: heartbeatCount,
   });
 
-  return result.html;
+  return html;
 }
 
 // =====================================================================

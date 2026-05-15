@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.1.3-telemetry",
-  "description": "Maveloper backend — v9.1.3 DIAGNOSTIC: full timing + error.cause logging on bridge fetch. No behavior change; pure observability to find where the timeout actually fires.",
+  "version": "9.1.4-ndjson-stream",
+  "description": "Maveloper backend — v9.1.4: NDJSON streaming protocol with bridge. Bridge (v1.0.4+) sends 20s heartbeats during cc-runner's silent window so the connection never goes idle. Eliminates the 5-min cutoff regardless of which proxy enforces it.",
   "private": true,
   "type": "module",
   "main": "server.js",
