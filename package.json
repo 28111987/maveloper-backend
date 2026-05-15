@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.2.0-callback",
-  "description": "Maveloper backend — v9.2.0: callback architecture. Bridge returns 202 immediately, POSTs result to /bridge-callback when done. No long HTTP connections. Works with ngrok free tier.",
+  "version": "9.2.1-lovable-shape",
+  "description": "Maveloper backend — v9.2.1: /job-status returns Lovable-compatible response shape (result.html + snake_case progress_message) alongside legacy top-level fields.",
   "private": true,
   "type": "module",
   "main": "server.js",

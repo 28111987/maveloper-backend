@@ -6156,6 +6156,13 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
     if (job.status === "completed") {
       return res.json({
         ...baseResponse,
+        // Lovable-compatible shape (v9.2.1): result.html + snake_case progress_message
+        result: {
+          html: job.result_html,
+          engineUsed: job.engine_used,
+        },
+        progress_message: job.progress_message,
+        // Legacy top-level fields kept for backward compatibility
         html: job.result_html,
         engineUsed: job.engine_used,
         completedAt: job.completed_at,
@@ -6166,6 +6173,7 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
       return res.json({
         ...baseResponse,
         error: job.error_message,
+        progress_message: job.progress_message,
         completedAt: job.completed_at,
       });
     }
@@ -6173,6 +6181,8 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
     // pending or running
     return res.json({
       ...baseResponse,
+      // Both shapes for compatibility
+      progress_message: job.progress_message,
       progressMessage: job.progress_message,
     });
   } catch (err) {
