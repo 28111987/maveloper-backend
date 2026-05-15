@@ -3731,7 +3731,7 @@ function settleBridgeJob(bridgeJobId, payload) {
   return true;
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, log }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, log }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
   }
@@ -3749,6 +3749,20 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     "https://maveloper-backend-production.up.railway.app";
   const callbackUrl = `${publicBackendUrl}/bridge-callback`;
 
+  // v9.3.0 Bug B fix: tag the Supabase maveloper_jobs row with bridgeJobId BEFORE
+  // dispatching, so /bridge-callback can find the row even if this Railway worker
+  // restarts. Without this, the in-memory PENDING_BRIDGE_JOBS map is lost on
+  // restart and late callbacks get 404.
+  if (maveloperJobId && supabaseAdmin) {
+    await updateJobStatus(maveloperJobId, {
+      progress_message: `Dispatched to bridge (bridgeJobId=${bridgeJobId})`,
+      // Stash bridgeJobId in error_message column as a side-channel since the
+      // table doesn't have a dedicated column. We clear it when the job succeeds.
+      // The /bridge-callback endpoint searches by this stashed value.
+      error_message: `__BRIDGE__:${bridgeJobId}`,
+    }, requestId);
+  }
+
   const payload = {
     spec: designSpec,
     referenceHtml: referenceHtml || null,
@@ -3756,11 +3770,13 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     model: model || "sonnet",
     requestId,
     bridgeJobId,
+    maveloperJobId: maveloperJobId || null,
     callbackUrl,
   };
 
   log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
     requestId,
+    maveloperJobId,
     bridgeJobId,
     bridgeUrl: MAC_BRIDGE_URL,
     callbackUrl,
@@ -4918,6 +4934,7 @@ ${specs.join("\n\n")}
           designImageBase64: null, // TODO: pass Phase B render image
           model: req.body?.model || "sonnet",
           requestId: req.id,
+          maveloperJobId: req.body?._maveloperJobId || null,
           log,
         });
       } catch (err) {
@@ -5757,6 +5774,7 @@ ${specs.join("\n\n")}
           designImageBase64: designImageBase64ForCC,
           model: req.body?.model || "sonnet",
           requestId: req.id,
+          maveloperJobId: req.body?._maveloperJobId || null,
           log,
         });
       } catch (err) {
@@ -6005,8 +6023,10 @@ app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req
 
         // Build a fake request mirroring the real one. The existing
         // /generate-from-figma handler will read req.body and req.id from it.
+        // v9.3.0: pass _maveloperJobId so callClaudeCodeBridge can tag the
+        // Supabase row with bridgeJobId, enabling restart-resilient callbacks.
         const fakeReq = {
-          body: req.body,
+          body: { ...req.body, _maveloperJobId: jobId },
           id: req.id,
           user: req.user,
           headers: req.headers || {},
@@ -6199,17 +6219,20 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────
-// v9.2.0 — POST /bridge-callback
+// v9.3.0 — POST /bridge-callback (durable via Supabase)
 //
 // The Mac bridge calls this endpoint when cc-runner finishes (success OR
 // failure). Body shape:
-//   Success: { bridgeJobId, html, bytesGenerated, elapsedSeconds, jobId? }
-//   Error:   { bridgeJobId, error, exitCode?, stderr? }
+//   Success: { bridgeJobId, html, bytesGenerated, elapsedSeconds, maveloperJobId? }
+//   Error:   { bridgeJobId, error, exitCode?, stderr?, maveloperJobId? }
 //
-// We look up the pending promise by bridgeJobId and resolve/reject it.
-// This unblocks callClaudeCodeBridge in the async background handler.
+// We do two things:
+//   1. Write the result to Supabase maveloper_jobs row keyed by bridgeJobId
+//      (durable — survives Railway restarts so Lovable's poll sees the result).
+//   2. Settle the in-memory promise if it still exists (so any awaiting
+//      handler can return cleanly — common case where Railway didn't restart).
 //
-// Auth: same shared secret as outbound calls, sent in X-Bridge-Secret.
+// Auth: shared secret in X-Bridge-Secret.
 // ────────────────────────────────────────────────────────────────────────
 app.post("/bridge-callback", async (req, res) => {
   const incomingSecret = req.headers["x-bridge-secret"];
@@ -6221,56 +6244,116 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr } = req.body || {};
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId } = req.body || {};
 
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
   }
 
+  // ── Durable path: find the maveloper_jobs row by bridgeJobId ──────
+  // The row was tagged with `__BRIDGE__:<bridgeJobId>` in error_message
+  // at dispatch time (see callClaudeCodeBridge). We look it up here.
+  // If maveloperJobId was passed in the body, use it directly as a fast path.
+  let dbJobId = maveloperJobId;
+  if (!dbJobId && supabaseAdmin) {
+    try {
+      const { data: rows } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("id")
+        .eq("error_message", `__BRIDGE__:${bridgeJobId}`)
+        .limit(1);
+      if (rows && rows.length > 0) {
+        dbJobId = rows[0].id;
+      }
+    } catch (e) {
+      log("warn", "/bridge-callback Supabase lookup failed", {
+        requestId: req.id,
+        bridgeJobId,
+        error: e.message,
+      });
+    }
+  }
+
+  // ── Write durable result to Supabase ──────────────────────────────
+  if (dbJobId && supabaseAdmin) {
+    try {
+      if (error) {
+        await supabaseAdmin
+          .from("maveloper_jobs")
+          .update({
+            status: "failed",
+            error_message: `Bridge: ${String(error).substring(0, 1500)}${exitCode != null ? ` (exitCode=${exitCode})` : ""}`,
+            completed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", dbJobId);
+      } else if (html) {
+        await supabaseAdmin
+          .from("maveloper_jobs")
+          .update({
+            status: "completed",
+            result_html: html,
+            error_message: null, // clear the __BRIDGE__ tag
+            progress_message: `Generation complete (${bytesGenerated || html.length} bytes, ${elapsedSeconds}s)`,
+            completed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", dbJobId);
+      }
+      log("info", "/bridge-callback wrote result to Supabase", {
+        requestId: req.id,
+        bridgeJobId,
+        dbJobId,
+        outcome: error ? "failed" : "completed",
+      });
+    } catch (e) {
+      log("error", "/bridge-callback Supabase write failed", {
+        requestId: req.id,
+        bridgeJobId,
+        dbJobId,
+        error: e.message,
+      });
+    }
+  } else {
+    log("warn", "/bridge-callback no Supabase row found for bridgeJobId — result still posted to in-memory promise if exists", {
+      requestId: req.id,
+      bridgeJobId,
+    });
+  }
+
+  // ── Settle the in-memory promise (fast path for non-restarted Railway) ──
   const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
-  if (!entry) {
-    log("warn", "/bridge-callback for unknown or already-settled bridgeJobId", {
+  if (entry) {
+    if (error) {
+      log("info", "/bridge-callback settling in-memory promise (rejected)", {
+        requestId: req.id,
+        bridgeJobId,
+      });
+      settleBridgeJob(bridgeJobId, { error });
+    } else if (html) {
+      log("info", "/bridge-callback settling in-memory promise (resolved)", {
+        requestId: req.id,
+        bridgeJobId,
+        bytesGenerated: bytesGenerated || html.length,
+      });
+      settleBridgeJob(bridgeJobId, { html, bytesGenerated: bytesGenerated || html.length, elapsedSeconds });
+    } else {
+      settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
+    }
+  } else {
+    log("info", "/bridge-callback no in-memory promise (Railway likely restarted) — durable Supabase write is the result of record", {
       requestId: req.id,
       bridgeJobId,
-      hasHtml: !!html,
-      hasError: !!error,
-    });
-    return res.status(404).json({
-      error: "Unknown or already-settled bridgeJobId",
-      bridgeJobId,
+      dbJobId,
     });
   }
 
-  if (error) {
-    log("error", "/bridge-callback delivered error", {
-      requestId: req.id,
-      bridgeJobId,
-      error,
-      exitCode,
-      stderrPreview: stderr?.substring(0, 500),
-    });
-    settleBridgeJob(bridgeJobId, { error });
-    return res.status(200).json({ ok: true, settled: "rejected" });
-  }
-
-  if (!html || typeof html !== "string") {
-    log("error", "/bridge-callback missing or invalid html field", {
-      requestId: req.id,
-      bridgeJobId,
-      htmlType: typeof html,
-    });
-    settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
-    return res.status(400).json({ error: "Missing or invalid html field" });
-  }
-
-  log("info", "/bridge-callback delivered html", {
-    requestId: req.id,
-    bridgeJobId,
-    bytesGenerated: bytesGenerated || html.length,
-    elapsedSeconds,
+  return res.status(200).json({
+    ok: true,
+    settled: error ? "rejected" : "resolved",
+    durableWrite: !!dbJobId,
+    inMemorySettled: !!entry,
   });
-  settleBridgeJob(bridgeJobId, { html, bytesGenerated: bytesGenerated || html.length, elapsedSeconds });
-  res.status(200).json({ ok: true, settled: "resolved" });
 });
 
 // -----------------------------------------------------------------

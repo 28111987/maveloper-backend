@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.2.1-lovable-shape",
-  "description": "Maveloper backend — v9.2.1: /job-status returns Lovable-compatible response shape (result.html + snake_case progress_message) alongside legacy top-level fields.",
+  "version": "9.3.0-durable-callback",
+  "description": "Maveloper backend — v9.3.0: bridge callback writes directly to Supabase, surviving Railway restarts. cc-runner v1.6.2 uses taskkill /F /T on Windows for reliable process-tree kill.",
   "private": true,
   "type": "module",
   "main": "server.js",
