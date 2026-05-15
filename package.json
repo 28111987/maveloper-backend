@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.1.1-bridge-timeout",
-  "description": "Maveloper backend — v9.1.1: long-timeout undici Agent for bridge fetch (cc-runner can take 15-30 min). Also v9.1.0-async-preview pattern retained.",
+  "version": "9.1.2-global-dispatcher",
+  "description": "Maveloper backend — v9.1.2: set undici global dispatcher with 45min timeout for bridge fetch. Fixes v9.1.1 bug where per-call dispatcher was closed before body read completed.",
   "private": true,
   "type": "module",
   "main": "server.js",

@@ -16,7 +16,22 @@ import { figmaToDesignSpec } from "./figma-parser.js";
 import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrls } from "./figma-image-export.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
-import { Agent } from "undici";
+import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
+
+// v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
+// Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
+// but Node's fetch reads the response body lazily — closing the Agent before
+// .json() reads the body kills the in-flight read. Global dispatcher avoids
+// this entirely; the agent stays alive for the process lifetime.
+const BRIDGE_LONG_TIMEOUT_MS = 45 * 60 * 1000;
+const _bridgeAgent = new Agent({
+  headersTimeout: BRIDGE_LONG_TIMEOUT_MS,
+  bodyTimeout: BRIDGE_LONG_TIMEOUT_MS,
+  connectTimeout: 30 * 1000,
+  keepAliveTimeout: 60 * 1000,
+  keepAliveMaxTimeout: BRIDGE_LONG_TIMEOUT_MS,
+});
+setGlobalDispatcher(_bridgeAgent);
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -3704,40 +3719,20 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
 
   const startTime = Date.now();
 
-  // v9.1.1: Claude Code legitimately takes 15-30 min on successful runs.
-  // Node's default undici body/headers timeout is ~5 min, which was killing
-  // valid generations before the bridge could respond. Use a per-call Agent
-  // with very long timeouts. cc-runner has its own 20-min hard timeout, so
-  // 45 min here is a safe upper bound that accommodates retries and slow runs.
-  const LONG_TIMEOUT_MS = 45 * 60 * 1000;
-  const bridgeDispatcher = new Agent({
-    headersTimeout: LONG_TIMEOUT_MS,
-    bodyTimeout: LONG_TIMEOUT_MS,
-    connectTimeout: 30 * 1000,
-    keepAliveTimeout: 60 * 1000,
-    keepAliveMaxTimeout: LONG_TIMEOUT_MS,
+  // v9.1.2: long-timeout dispatcher is set globally at top of file (setGlobalDispatcher).
+  // Plain fetch() will use it automatically. No per-call dispatcher tear-down needed.
+  const response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Secret": MAC_BRIDGE_SECRET,
+      // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
+      // ngrok returns an HTML warning page instead of forwarding to the
+      // bridge, causing JSON parse failures on the Railway side.
+      "ngrok-skip-browser-warning": "true",
+    },
+    body: JSON.stringify(payload),
   });
-
-  let response;
-  try {
-    response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Bridge-Secret": MAC_BRIDGE_SECRET,
-        // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
-        // ngrok returns an HTML warning page instead of forwarding to the
-        // bridge, causing JSON parse failures on the Railway side.
-        "ngrok-skip-browser-warning": "true",
-      },
-      body: JSON.stringify(payload),
-      dispatcher: bridgeDispatcher,
-    });
-  } finally {
-    // Tear down the dispatcher after the request completes (success or fail)
-    // so we don't leak sockets across many requests.
-    bridgeDispatcher.close().catch(() => {});
-  }
 
   const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
 
