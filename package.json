@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.1.4-ndjson-stream",
-  "description": "Maveloper backend — v9.1.4: NDJSON streaming protocol with bridge. Bridge (v1.0.4+) sends 20s heartbeats during cc-runner's silent window so the connection never goes idle. Eliminates the 5-min cutoff regardless of which proxy enforces it.",
+  "version": "9.2.0-callback",
+  "description": "Maveloper backend — v9.2.0: callback architecture. Bridge returns 202 immediately, POSTs result to /bridge-callback when done. No long HTTP connections. Works with ngrok free tier.",
   "private": true,
   "type": "module",
   "main": "server.js",

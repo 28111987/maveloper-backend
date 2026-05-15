@@ -3696,10 +3696,58 @@ async function loadReferenceForFigmaFile(figmaFileKey) {
   return REFERENCE_CACHE.get(figmaFileKey) || null;
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// v9.2.0 — Bridge callback architecture
+//
+// Why this exists:
+//   We tried streaming responses (v9.1.4 / bridge v1.0.4). ngrok free tier
+//   buffers responses server-side and enforces a 5-minute response wall —
+//   even with chunked heartbeats. The only architecture that works in all
+//   environments is: bridge accepts the job, immediately returns 202, then
+//   POSTs the result back to Railway when done. No long HTTP connections.
+//
+// In-memory pending map:
+//   When callClaudeCodeBridge dispatches a job, it creates a unique
+//   bridgeJobId and stashes {resolve, reject, timer} keyed by that id.
+//   When /bridge-callback receives a POST with that bridgeJobId, it
+//   resolves the promise. If the bridge never calls back (machine off,
+//   crash, network), the timer rejects after 45 minutes.
+//
+// This map is process-local on Railway. If Railway restarts mid-job, that
+// job is lost (caller times out). Acceptable for now; durable queue
+// would need Supabase persistence and is out of scope for this fix.
+// ────────────────────────────────────────────────────────────────────────
+
+const PENDING_BRIDGE_JOBS = new Map();
+const BRIDGE_JOB_MAX_WAIT_MS = 45 * 60 * 1000; // 45 min hard ceiling
+
+function settleBridgeJob(bridgeJobId, payload) {
+  const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+  if (!entry) return false;
+  clearTimeout(entry.timer);
+  PENDING_BRIDGE_JOBS.delete(bridgeJobId);
+  if (payload.error) entry.reject(new Error(payload.error));
+  else entry.resolve(payload);
+  return true;
+}
+
 async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, log }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
   }
+
+  // Generate a unique id we'll use to correlate the callback with this call.
+  const bridgeJobId = `bj_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+
+  // Compute the public callback URL. We need an absolute URL the bridge
+  // can reach from outside Railway. PUBLIC_BACKEND_URL is the env var
+  // pointing at the Railway service (set during deploy). Fallback to the
+  // hardcoded production URL if not configured, since that's our known
+  // deployment target.
+  const publicBackendUrl =
+    process.env.PUBLIC_BACKEND_URL ||
+    "https://maveloper-backend-production.up.railway.app";
+  const callbackUrl = `${publicBackendUrl}/bridge-callback`;
 
   const payload = {
     spec: designSpec,
@@ -3707,177 +3755,98 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     imageBase64: designImageBase64 || null,
     model: model || "sonnet",
     requestId,
+    bridgeJobId,
+    callbackUrl,
   };
 
-  log("info", "Claude Code: dispatching to Mac bridge", {
+  log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
     requestId,
+    bridgeJobId,
     bridgeUrl: MAC_BRIDGE_URL,
+    callbackUrl,
     specSections: designSpec?.sections?.length || 0,
     hasReference: !!referenceHtml,
     hasImage: !!designImageBase64,
   });
 
-  // v9.1.4 — NDJSON streaming protocol.
-  //
-  // Previously we awaited a single JSON response. Bridge takes ~20 min to
-  // produce HTML and was silent the entire time, causing the path
-  // (ngrok / proxy / undici) to declare the connection idle and abort at ~5 min.
-  // The bridge (v1.0.4+) now streams newline-delimited JSON with a 20-second
-  // heartbeat. We read line-by-line, ignore heartbeats, and extract the html
-  // from the final {"type":"result", ...} line.
-  const startTime = Date.now();
-  const t = () => `${((Date.now() - startTime) / 1000).toFixed(1)}s`;
+  // Set up the promise BEFORE dispatching, so a fast bridge can't race the
+  // callback in before we've registered the resolver.
+  const resultPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (PENDING_BRIDGE_JOBS.delete(bridgeJobId)) {
+        log("error", "Bridge job timed out waiting for callback", {
+          requestId,
+          bridgeJobId,
+          maxWaitMinutes: BRIDGE_JOB_MAX_WAIT_MS / 60000,
+        });
+        reject(new Error(`Bridge did not call back within ${BRIDGE_JOB_MAX_WAIT_MS / 60000} minutes`));
+      }
+    }, BRIDGE_JOB_MAX_WAIT_MS);
+    PENDING_BRIDGE_JOBS.set(bridgeJobId, { resolve, reject, timer, requestId, startedAt: Date.now() });
+  });
 
-  log("info", "[telemetry] T+0s: about to call fetch() (NDJSON stream)", { requestId });
-
-  let response;
+  // Fire the dispatch. Bridge should respond 202 in <1 second.
+  let dispatchResp;
   try {
-    response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+    dispatchResp = await fetch(`${MAC_BRIDGE_URL}/generate`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/x-ndjson",
         "X-Bridge-Secret": MAC_BRIDGE_SECRET,
         "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify(payload),
+      // Short signal — dispatch should be near-instant. If it takes more
+      // than 60 sec, something is wrong at the network layer.
+      signal: AbortSignal.timeout(60 * 1000),
     });
-    log("info", `[telemetry] T+${t()}: fetch() resolved — headers received`, {
-      requestId,
-      status: response.status,
-      statusText: response.statusText,
-      contentType: response.headers.get("content-type"),
-    });
-  } catch (fetchErr) {
-    const causeChain = [];
-    let current = fetchErr;
-    while (current) {
-      causeChain.push({
-        name: current.name, message: current.message,
-        code: current.code, errno: current.errno, syscall: current.syscall,
-      });
-      current = current.cause;
+  } catch (dispatchErr) {
+    // Clean up the pending promise so it doesn't leak.
+    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+    if (entry) {
+      clearTimeout(entry.timer);
+      PENDING_BRIDGE_JOBS.delete(bridgeJobId);
     }
-    log("error", `[telemetry] T+${t()}: fetch() threw — full cause chain`, {
-      requestId, causeChain, stack: fetchErr.stack?.substring(0, 2000),
-    });
-    throw new Error(`Bridge fetch failed at ${t()}: ${fetchErr.message} (${fetchErr.cause?.code || fetchErr.code || "no-code"})`);
-  }
-
-  if (!response.ok) {
-    let errBody = "";
-    try { errBody = await response.text(); } catch { errBody = "(could not read error body)"; }
-    log("error", `[telemetry] T+${t()}: bridge returned non-2xx`, {
-      requestId, status: response.status, bodyPreview: errBody.substring(0, 500),
-    });
-    throw new Error(`Mac bridge returned ${response.status}: ${errBody.substring(0, 500)}`);
-  }
-
-  if (!response.body) {
-    throw new Error("Bridge response has no body stream");
-  }
-
-  // Stream-parse NDJSON. Use TextDecoder for incremental UTF-8 decoding.
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let html = null;
-  let finalLine = null;
-  let lastHeartbeatAt = startTime;
-  let heartbeatCount = 0;
-
-  try {
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-
-      // Process complete lines (each line is a JSON object)
-      let nlIdx;
-      while ((nlIdx = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nlIdx).trim();
-        buffer = buffer.slice(nlIdx + 1);
-        if (!line) continue;
-
-        let event;
-        try {
-          event = JSON.parse(line);
-        } catch (e) {
-          log("warn", `[telemetry] T+${t()}: skipping unparseable line`, {
-            requestId, linePreview: line.substring(0, 200),
-          });
-          continue;
-        }
-
-        if (event.type === "start") {
-          log("info", `[telemetry] T+${t()}: stream start received`, {
-            requestId, jobId: event.jobId,
-          });
-        } else if (event.type === "heartbeat") {
-          heartbeatCount++;
-          lastHeartbeatAt = Date.now();
-          // Only log every 5th heartbeat (every ~100s) so we don't spam Railway logs.
-          if (heartbeatCount % 5 === 0) {
-            log("info", `[telemetry] T+${t()}: heartbeat #${heartbeatCount} (bridge elapsed=${event.elapsedSeconds}s)`, { requestId });
-          }
-        } else if (event.type === "result") {
-          finalLine = event;
-          html = event.html;
-          log("info", `[telemetry] T+${t()}: result line received`, {
-            requestId, jobId: event.jobId, bytesGenerated: event.bytesGenerated, heartbeats: heartbeatCount,
-          });
-          // Don't break — let the stream drain naturally so we honor any
-          // trailing bytes/CRLF the bridge sends.
-        } else if (event.type === "error") {
-          finalLine = event;
-          log("error", `[telemetry] T+${t()}: error line received`, {
-            requestId, event,
-          });
-        } else {
-          log("warn", `[telemetry] T+${t()}: unknown event type`, {
-            requestId, type: event.type,
-          });
-        }
-      }
-    }
-  } catch (streamErr) {
-    log("error", `[telemetry] T+${t()}: stream read failed`, {
+    log("error", "Bridge dispatch failed", {
       requestId,
-      message: streamErr.message,
-      code: streamErr.code,
-      heartbeatCount,
-      stack: streamErr.stack?.substring(0, 2000),
+      bridgeJobId,
+      error: dispatchErr.message,
+      code: dispatchErr.code || dispatchErr.cause?.code,
     });
-    throw new Error(`Bridge stream failed at ${t()}: ${streamErr.message}`);
+    throw new Error(`Bridge dispatch failed: ${dispatchErr.message}`);
   }
 
-  // Process any remaining buffered content (in case the last line had no \n)
-  if (buffer.trim()) {
-    try {
-      const event = JSON.parse(buffer.trim());
-      if (event.type === "result") { finalLine = event; html = event.html; }
-      else if (event.type === "error") { finalLine = event; }
-    } catch { /* ignore trailing garbage */ }
+  if (!dispatchResp.ok && dispatchResp.status !== 202) {
+    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+    if (entry) {
+      clearTimeout(entry.timer);
+      PENDING_BRIDGE_JOBS.delete(bridgeJobId);
+    }
+    const errText = await dispatchResp.text().catch(() => "(no body)");
+    throw new Error(`Bridge rejected dispatch with status ${dispatchResp.status}: ${errText.substring(0, 500)}`);
   }
 
-  if (!finalLine) {
-    throw new Error(`Bridge stream ended without a result or error line (received ${heartbeatCount} heartbeats over ${t()})`);
-  }
-
-  if (finalLine.type === "error") {
-    throw new Error(`Mac bridge error: ${finalLine.error} (exitCode=${finalLine.exitCode ?? "n/a"})`);
-  }
-
-  if (!html) {
-    throw new Error(`Mac bridge result missing html field: ${JSON.stringify(finalLine).substring(0, 500)}`);
-  }
-
-  log("info", "Claude Code: bridge returned HTML", {
+  log("info", "Bridge accepted job — waiting for callback", {
     requestId,
-    jobId: finalLine.jobId,
-    bytesGenerated: finalLine.bytesGenerated,
-    elapsedSeconds: parseFloat(((Date.now() - startTime) / 1000).toFixed(1)),
-    heartbeatsReceived: heartbeatCount,
+    bridgeJobId,
+    dispatchStatus: dispatchResp.status,
   });
 
-  return html;
+  // Wait for /bridge-callback to settle this promise.
+  const result = await resultPromise;
+
+  if (!result.html) {
+    throw new Error(`Bridge callback delivered no HTML: ${JSON.stringify(result).substring(0, 500)}`);
+  }
+
+  log("info", "Claude Code: bridge callback delivered HTML", {
+    requestId,
+    bridgeJobId,
+    bytesGenerated: result.bytesGenerated,
+    elapsedSeconds: result.elapsedSeconds,
+  });
+
+  return result.html;
 }
 
 // =====================================================================
@@ -6217,6 +6186,81 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
       requestId: req.id,
     });
   }
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// v9.2.0 — POST /bridge-callback
+//
+// The Mac bridge calls this endpoint when cc-runner finishes (success OR
+// failure). Body shape:
+//   Success: { bridgeJobId, html, bytesGenerated, elapsedSeconds, jobId? }
+//   Error:   { bridgeJobId, error, exitCode?, stderr? }
+//
+// We look up the pending promise by bridgeJobId and resolve/reject it.
+// This unblocks callClaudeCodeBridge in the async background handler.
+//
+// Auth: same shared secret as outbound calls, sent in X-Bridge-Secret.
+// ────────────────────────────────────────────────────────────────────────
+app.post("/bridge-callback", async (req, res) => {
+  const incomingSecret = req.headers["x-bridge-secret"];
+  if (!incomingSecret || incomingSecret !== MAC_BRIDGE_SECRET) {
+    log("warn", "/bridge-callback unauthorized", {
+      requestId: req.id,
+      hasHeader: !!incomingSecret,
+    });
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr } = req.body || {};
+
+  if (!bridgeJobId) {
+    return res.status(400).json({ error: "Missing bridgeJobId" });
+  }
+
+  const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+  if (!entry) {
+    log("warn", "/bridge-callback for unknown or already-settled bridgeJobId", {
+      requestId: req.id,
+      bridgeJobId,
+      hasHtml: !!html,
+      hasError: !!error,
+    });
+    return res.status(404).json({
+      error: "Unknown or already-settled bridgeJobId",
+      bridgeJobId,
+    });
+  }
+
+  if (error) {
+    log("error", "/bridge-callback delivered error", {
+      requestId: req.id,
+      bridgeJobId,
+      error,
+      exitCode,
+      stderrPreview: stderr?.substring(0, 500),
+    });
+    settleBridgeJob(bridgeJobId, { error });
+    return res.status(200).json({ ok: true, settled: "rejected" });
+  }
+
+  if (!html || typeof html !== "string") {
+    log("error", "/bridge-callback missing or invalid html field", {
+      requestId: req.id,
+      bridgeJobId,
+      htmlType: typeof html,
+    });
+    settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
+    return res.status(400).json({ error: "Missing or invalid html field" });
+  }
+
+  log("info", "/bridge-callback delivered html", {
+    requestId: req.id,
+    bridgeJobId,
+    bytesGenerated: bytesGenerated || html.length,
+    elapsedSeconds,
+  });
+  settleBridgeJob(bridgeJobId, { html, bytesGenerated: bytesGenerated || html.length, elapsedSeconds });
+  res.status(200).json({ ok: true, settled: "resolved" });
 });
 
 // -----------------------------------------------------------------
