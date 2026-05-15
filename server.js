@@ -3717,31 +3717,98 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     hasImage: !!designImageBase64,
   });
 
+  // v9.1.3 telemetry — capture exact stage each timing event happens at,
+  // plus deep error.cause when fetch fails. This is the diagnostic build:
+  // we are not trying to fix anything new here, only to see the truth.
   const startTime = Date.now();
+  const t = () => `${((Date.now() - startTime) / 1000).toFixed(1)}s`;
 
-  // v9.1.2: long-timeout dispatcher is set globally at top of file (setGlobalDispatcher).
-  // Plain fetch() will use it automatically. No per-call dispatcher tear-down needed.
-  const response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Bridge-Secret": MAC_BRIDGE_SECRET,
-      // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
-      // ngrok returns an HTML warning page instead of forwarding to the
-      // bridge, causing JSON parse failures on the Railway side.
-      "ngrok-skip-browser-warning": "true",
-    },
-    body: JSON.stringify(payload),
-  });
+  log("info", "[telemetry] T+0s: about to call fetch()", { requestId });
 
-  const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+  let response;
+  try {
+    response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Secret": MAC_BRIDGE_SECRET,
+        // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
+        // ngrok returns an HTML warning page instead of forwarding to the
+        // bridge, causing JSON parse failures on the Railway side.
+        "ngrok-skip-browser-warning": "true",
+      },
+      body: JSON.stringify(payload),
+    });
+    log("info", `[telemetry] T+${t()}: fetch() resolved — headers received`, {
+      requestId,
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get("content-type"),
+      contentLength: response.headers.get("content-length"),
+    });
+  } catch (fetchErr) {
+    // Deep dump — we want to see EVERY layer of the error, especially .cause
+    const causeChain = [];
+    let current = fetchErr;
+    while (current) {
+      causeChain.push({
+        name: current.name,
+        message: current.message,
+        code: current.code,
+        errno: current.errno,
+        syscall: current.syscall,
+      });
+      current = current.cause;
+    }
+    log("error", `[telemetry] T+${t()}: fetch() threw — full cause chain`, {
+      requestId,
+      causeChain,
+      stack: fetchErr.stack?.substring(0, 2000),
+    });
+    throw new Error(`Bridge fetch failed at ${t()}: ${fetchErr.message} (${fetchErr.cause?.code || fetchErr.code || "no-code"})`);
+  }
 
   if (!response.ok) {
-    const errBody = await response.text();
+    let errBody = "";
+    try { errBody = await response.text(); } catch { errBody = "(could not read error body)"; }
+    log("error", `[telemetry] T+${t()}: bridge returned non-2xx`, {
+      requestId,
+      status: response.status,
+      bodyPreview: errBody.substring(0, 500),
+    });
     throw new Error(`Mac bridge returned ${response.status}: ${errBody.substring(0, 500)}`);
   }
 
-  const result = await response.json();
+  log("info", `[telemetry] T+${t()}: response.ok=true, starting body read`, { requestId });
+
+  let result;
+  try {
+    result = await response.json();
+    log("info", `[telemetry] T+${t()}: response.json() completed`, {
+      requestId,
+      hasHtml: !!result.html,
+      htmlBytes: result.html?.length || 0,
+      jobId: result.jobId,
+    });
+  } catch (bodyErr) {
+    const causeChain = [];
+    let current = bodyErr;
+    while (current) {
+      causeChain.push({
+        name: current.name,
+        message: current.message,
+        code: current.code,
+      });
+      current = current.cause;
+    }
+    log("error", `[telemetry] T+${t()}: response.json() threw`, {
+      requestId,
+      causeChain,
+      stack: bodyErr.stack?.substring(0, 2000),
+    });
+    throw new Error(`Bridge body read failed at ${t()}: ${bodyErr.message} (${bodyErr.cause?.code || bodyErr.code || "no-code"})`);
+  }
+
   if (!result.html) {
     throw new Error(`Mac bridge returned no HTML: ${JSON.stringify(result).substring(0, 500)}`);
   }
@@ -3750,7 +3817,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     requestId,
     jobId: result.jobId,
     bytesGenerated: result.bytesGenerated,
-    elapsedSeconds: parseFloat(elapsedSeconds),
+    elapsedSeconds: parseFloat(((Date.now() - startTime) / 1000).toFixed(1)),
   });
 
   return result.html;
