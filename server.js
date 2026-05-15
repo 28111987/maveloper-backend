@@ -16,6 +16,7 @@ import { figmaToDesignSpec } from "./figma-parser.js";
 import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrls } from "./figma-image-export.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
+import { Agent } from "undici";
 
 // =====================================================================
 // STARTUP VALIDATION
@@ -3702,18 +3703,41 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   });
 
   const startTime = Date.now();
-  const response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Bridge-Secret": MAC_BRIDGE_SECRET,
-      // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
-      // ngrok returns an HTML warning page instead of forwarding to the
-      // bridge, causing JSON parse failures on the Railway side.
-      "ngrok-skip-browser-warning": "true",
-    },
-    body: JSON.stringify(payload),
+
+  // v9.1.1: Claude Code legitimately takes 15-30 min on successful runs.
+  // Node's default undici body/headers timeout is ~5 min, which was killing
+  // valid generations before the bridge could respond. Use a per-call Agent
+  // with very long timeouts. cc-runner has its own 20-min hard timeout, so
+  // 45 min here is a safe upper bound that accommodates retries and slow runs.
+  const LONG_TIMEOUT_MS = 45 * 60 * 1000;
+  const bridgeDispatcher = new Agent({
+    headersTimeout: LONG_TIMEOUT_MS,
+    bodyTimeout: LONG_TIMEOUT_MS,
+    connectTimeout: 30 * 1000,
+    keepAliveTimeout: 60 * 1000,
+    keepAliveMaxTimeout: LONG_TIMEOUT_MS,
   });
+
+  let response;
+  try {
+    response = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Secret": MAC_BRIDGE_SECRET,
+        // v9.0.1: bypass ngrok free-tier interstitial. Without this header,
+        // ngrok returns an HTML warning page instead of forwarding to the
+        // bridge, causing JSON parse failures on the Railway side.
+        "ngrok-skip-browser-warning": "true",
+      },
+      body: JSON.stringify(payload),
+      dispatcher: bridgeDispatcher,
+    });
+  } finally {
+    // Tear down the dispatcher after the request completes (success or fail)
+    // so we don't leak sockets across many requests.
+    bridgeDispatcher.close().catch(() => {});
+  }
 
   const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
 

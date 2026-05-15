@@ -1,7 +1,7 @@
 {
   "name": "maveloper-backend",
-  "version": "9.1.0-async-preview",
-  "description": "Maveloper backend — v9.1.0-async-preview: Claude Code bridge integration. Engine selectable per-request: 'console' (existing API) or 'claude-code' (Mac bridge, Max 20x). Existing Stage 2 path unchanged when AI_ENGINE_DEFAULT=console.",
+  "version": "9.1.1-bridge-timeout",
+  "description": "Maveloper backend — v9.1.1: long-timeout undici Agent for bridge fetch (cc-runner can take 15-30 min). Also v9.1.0-async-preview pattern retained.",
   "private": true,
   "type": "module",
   "main": "server.js",
@@ -22,6 +22,7 @@
     "jsonwebtoken": "^9.0.2",
     "pdf-parse": "^1.1.1",
     "pdf-to-png-converter": "^3.3.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "undici": "^6.21.0"
   }
 }
