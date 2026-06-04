@@ -378,6 +378,286 @@ function extractBgHex(node) {
 }
 
 /**
+ * Layer-A capture: dominant SOLID stroke color + weight on a node.
+ * Mirrors extractBgHex's paint-array loop, but over node.strokes[] (same
+ * { type:"SOLID", color:{r,g,b,a} } paint shape). Returns { hex, weight }
+ * where weight = node.strokeWeight (or null if absent), or null when the
+ * node has no visible SOLID stroke. Capture-only — affects nothing else.
+ */
+function extractStrokeHex(node) {
+  const strokes = node.strokes;
+  if (!Array.isArray(strokes)) return null;
+  for (const stroke of strokes) {
+    if (stroke.visible === false) continue;
+    if (stroke.type === "SOLID") {
+      return {
+        hex: figmaColorToHex(stroke.color),
+        weight: typeof node.strokeWeight === "number" ? node.strokeWeight : null,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Layer-A capture: first gradient fill on a node, as DATA ONLY (no CSS).
+ * Scans node.fills for the first visible fill whose type starts with
+ * "GRADIENT_". Returns:
+ *   { kind: <GRADIENT_* type>,
+ *     stops: [{ pos: gradientStops[i].position, hex: <stop color hex> }, ...],
+ *     handles: gradientHandlePositions }
+ * or null if the node has no gradient fill.
+ */
+function extractGradient(node) {
+  const fills = node.fills;
+  if (!Array.isArray(fills)) return null;
+  for (const fill of fills) {
+    if (fill.visible === false) continue;
+    if (typeof fill.type === "string" && fill.type.startsWith("GRADIENT_")) {
+      const stops = Array.isArray(fill.gradientStops)
+        ? fill.gradientStops.map((s) => ({ pos: s.position, hex: figmaColorToHex(s.color) }))
+        : [];
+      return {
+        kind: fill.type,
+        stops,
+        handles: fill.gradientHandlePositions || null,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Layer-A (L-2a) capture: INNER containers deeper than the section root.
+ *
+ * Purely additive metadata. Does its OWN read-only walk of the section
+ * subtree — it never touches collect() or content[], so the content
+ * flattening output is structurally unchanged.
+ *
+ * A node qualifies as a captured container when it is a FRAME/GROUP/
+ * RECTANGLE/INSTANCE (and is NOT the section root) carrying at least one of:
+ *   - a visible SOLID stroke with strokeWeight > 0  (wt:0 invisible-leftover
+ *     paints are filtered out and never produce a border)
+ *   - cornerRadius > 0
+ *   - a GRADIENT_ fill
+ *   - a SOLID bg fill that differs from the enclosing section's bg
+ *
+ * Association: for each container we record content[] indices whose source
+ * node sits geometrically inside it (center-point containment), matched by
+ * value signature → node bbox, so cc-runner knows what each wrapper holds.
+ */
+const CONTAINER_CAPTURE_TYPES = new Set(["FRAME", "GROUP", "RECTANGLE", "INSTANCE"]);
+
+function captureContainers(sectionNode, sectionBg, content) {
+  // 1. Index content-leaf nodes by value signature → bbox(es).
+  const sigToBboxes = new Map();
+  const addSig = (key, bbox) => {
+    if (!bbox) return;
+    if (!sigToBboxes.has(key)) sigToBboxes.set(key, []);
+    sigToBboxes.get(key).push(bbox);
+  };
+  (function indexLeaves(n) {
+    if (!n || n.visible === false) return;
+    const bb = n.absoluteBoundingBox;
+    if (n.type === "TEXT" && typeof n.characters === "string" && n.characters.trim() !== "") {
+      addSig(`text:${n.characters}`, bb);
+    }
+    const imf = extractImageFill(n);
+    if ((imf && imf.imageRef) || isAtomicVisualUnit(n)) {
+      addSig(`img:${n.name || "Image"}`, bb);
+    }
+    for (const c of n.children || []) indexLeaves(c);
+  })(sectionNode);
+
+  const itemBbox = (item) => {
+    let key = null;
+    if (item.el === "text") key = `text:${item.text}`;
+    else if (item.el === "cta") key = `text:${item.cta_text}`;
+    else if (item.el === "image") key = `img:${item.alt}`;
+    if (!key) return null;
+    const arr = sigToBboxes.get(key);
+    return arr && arr.length ? arr[0] : null;
+  };
+
+  const inside = (b, C) => {
+    if (!b) return false;
+    const cx = (b.x ?? 0) + (b.width ?? 0) / 2;
+    const cy = (b.y ?? 0) + (b.height ?? 0) / 2;
+    return cx >= C.x - 1 && cx <= C.x + C.w + 1 && cy >= C.y - 1 && cy <= C.y + C.h + 1;
+  };
+
+  // 2. Walk the subtree; collect qualifying containers.
+  const containers = [];
+  (function walk(n) {
+    if (!n || n.visible === false) return;
+    if (n !== sectionNode && CONTAINER_CAPTURE_TYPES.has(n.type)) {
+      const stroke = extractStrokeHex(n);
+      const hasBorder = !!(stroke && typeof stroke.weight === "number" && stroke.weight > 0);
+      const radius = extractRadius(n);
+      const gradient = extractGradient(n);
+      const ownBg = extractBgHex(n);
+      const bgDiffers = !!(ownBg && ownBg !== sectionBg);
+      if (hasBorder || radius > 0 || gradient || bgDiffers) {
+        const bb = n.absoluteBoundingBox || {};
+        const C = {
+          x: Math.round(bb.x ?? 0),
+          y: Math.round(bb.y ?? 0),
+          w: Math.round(bb.width ?? 0),
+          h: Math.round(bb.height ?? 0),
+        };
+        const desc = { _figmaNodeId: n.id, name: n.name, bg: ownBg || null, bbox: C };
+        if (hasBorder) desc.stroke = { hex: stroke.hex, weight: stroke.weight };
+        if (radius > 0) desc.radius = radius;
+        if (gradient) desc.gradient = gradient;
+        const assoc = [];
+        content.forEach((item, i) => { if (inside(itemBbox(item), C)) assoc.push(i); });
+        desc.content_indices = assoc;
+        containers.push(desc);
+      }
+    }
+    for (const c of n.children || []) walk(c);
+  })(sectionNode);
+
+  return containers;
+}
+
+/** Median of a numeric array (0 for empty). */
+function gridMedian(arr) {
+  const a = arr.filter((x) => typeof x === "number").slice().sort((x, y) => x - y);
+  if (!a.length) return 0;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+/**
+ * Cluster a set of similar-sized tiles into rows by shared Y, then derive
+ * cols (max items in any row), rows, and gutter (median horizontal gap
+ * between adjacent items within a row).
+ */
+function clusterGridRows(members) {
+  const sorted = members.slice().sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
+  const medH = gridMedian(members.map((m) => m.bbox.h));
+  const ytol = Math.max(8, 0.25 * medH);
+  const rows = [];
+  for (const m of sorted) {
+    let row = rows.find((r) => Math.abs(r.y - m.bbox.y) <= ytol);
+    if (!row) { row = { y: m.bbox.y, items: [] }; rows.push(row); }
+    row.items.push(m);
+  }
+  const cols = Math.max(...rows.map((r) => r.items.length));
+  const gaps = [];
+  for (const r of rows) {
+    const xs = r.items.slice().sort((a, b) => a.bbox.x - b.bbox.x);
+    for (let i = 1; i < xs.length; i++) {
+      gaps.push(xs[i].bbox.x - (xs[i - 1].bbox.x + xs[i - 1].bbox.w));
+    }
+  }
+  const gutter = gaps.length ? Math.round(gridMedian(gaps)) : 0;
+  return { cols, rows: rows.length, gutter };
+}
+
+/**
+ * Layer-A (L-2b): derive grid geometry for multi-item rows from the L-2a
+ * containers[]. Additive — reads section.containers + the node tree only.
+ *
+ * Method: cluster captured containers by similar size (greedy, tolerance-
+ * based), build a row/col grid for each cluster with >= 2 members, and pick
+ * the cluster with the LARGEST item area among those with cols >= 2 (the
+ * repeated content tiles, not the small inner sub-wrappers). Geometry is
+ * primary; Figma parent layoutMode / itemSpacing are recorded for cross-
+ * check only and never override the geometry (conflicts noted in _note).
+ *
+ * Returns a grid descriptor or null when there is no >=2-column multi-item
+ * row (single items / non-grid sections produce no grid).
+ */
+function deriveSectionGrid(sectionNode, containers) {
+  const items = (containers || []).filter((c) => c.bbox && c.bbox.w > 0 && c.bbox.h > 0);
+  if (items.length < 2) return null;
+
+  // 1. Size-cluster (greedy, tolerance-based).
+  const clusters = [];
+  for (const it of items) {
+    const w = it.bbox.w, h = it.bbox.h;
+    let placed = null;
+    for (const cl of clusters) {
+      const wtol = Math.max(6, 0.06 * cl.w);
+      const htol = Math.max(8, 0.06 * cl.h);
+      if (Math.abs(w - cl.w) <= wtol && Math.abs(h - cl.h) <= htol) { placed = cl; break; }
+    }
+    if (placed) {
+      placed.members.push(it);
+      placed.w = gridMedian(placed.members.map((m) => m.bbox.w));
+      placed.h = gridMedian(placed.members.map((m) => m.bbox.h));
+    } else {
+      clusters.push({ w, h, members: [it] });
+    }
+  }
+
+  // 2. Best grid = largest-area cluster with cols >= 2.
+  let best = null;
+  for (const cl of clusters) {
+    if (cl.members.length < 2) continue;
+    const g = clusterGridRows(cl.members);
+    if (!g || g.cols < 2) continue;
+    const area = cl.w * cl.h;
+    if (!best || area > best.area) best = { ...g, area, members: cl.members, w: cl.w, h: cl.h };
+  }
+  if (!best) return null;
+
+  // L-2c guard: emit a grid ONLY for genuine tile grids; suppress sparse /
+  // incidental pairs. Require all of: cols >= 2; item_width >= 60px; gutter
+  // smaller than a tile (a real grid's gap < its cells); and similar-width
+  // tiles (max width within ~15% of the median). Containers[] is unaffected.
+  const widths = best.members.map((m) => m.bbox.w);
+  const medW = gridMedian(widths);
+  const maxW = Math.max(...widths);
+  const itemWidth = Math.round(best.w);
+  const similarWidth = medW > 0 && maxW <= medW * 1.15;
+  if (!(best.cols >= 2 && itemWidth >= 60 && best.gutter <= itemWidth && similarWidth)) {
+    return null;
+  }
+
+  const result = {
+    cols: best.cols,
+    rows: best.rows,
+    item_width: itemWidth,
+    gutter: best.gutter,
+  };
+
+  // 3. Corroborate with Figma parent layout (cross-check only; geometry wins).
+  const pmap = buildParentMap(sectionNode);
+  const parents = new Set();
+  for (const m of best.members) {
+    const p = pmap.get(m._figmaNodeId);
+    if (p) parents.add(p);
+  }
+  let layoutParent = null;
+  for (const p of parents) {
+    if (p.layoutMode === "HORIZONTAL" || typeof p.itemSpacing === "number") { layoutParent = p; break; }
+  }
+  if (!layoutParent) {
+    for (const p of parents) {
+      const gp = pmap.get(p.id);
+      if (gp && (gp.layoutMode === "HORIZONTAL" || typeof gp.itemSpacing === "number")) { layoutParent = gp; break; }
+    }
+  }
+  if (layoutParent) {
+    if (layoutParent.layoutMode) result.figma_layoutMode = layoutParent.layoutMode;
+    if (typeof layoutParent.itemSpacing === "number") result.figma_itemSpacing = Math.round(layoutParent.itemSpacing);
+    const notes = [];
+    if (typeof result.figma_itemSpacing === "number" && Math.abs(result.figma_itemSpacing - result.gutter) > 4) {
+      notes.push(`geometry gutter=${result.gutter}px differs from figma itemSpacing=${result.figma_itemSpacing}px; geometry wins`);
+    }
+    if (result.figma_layoutMode && result.figma_layoutMode !== "HORIZONTAL") {
+      notes.push(`figma parent layoutMode=${result.figma_layoutMode} (not HORIZONTAL) but geometry shows ${result.cols} columns; geometry wins`);
+    }
+    if (notes.length) result._note = notes.join("; ");
+  }
+
+  return result;
+}
+
+/**
  * v6.3.0: Walk up the parent chain to find the nearest ancestor with a
  * solid bg fill. Used when a section's immediate frame has no fill —
  * the section visually inherits the bg of its enclosing email frame,
@@ -1114,6 +1394,27 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
       height: Math.round(bbox.height ?? 0), // used by inferSectionType, then deleted
     };
 
+    // --- Layer-A capture (additive; does NOT touch bg/layout/flattening) ---
+    // Emit stroke / radius / gradient only when present & non-default.
+    const _stroke = extractStrokeHex(node);
+    if (_stroke) {
+      section.stroke = _stroke;
+      section.card_border = _stroke.hex; // mirror into existing palette-read field
+    }
+    const _radius = extractRadius(node);
+    if (_radius > 0) section.radius = _radius;
+    const _gradient = extractGradient(node);
+    if (_gradient) section.gradient = _gradient;
+    // Debug ground-truth: the section node's raw fills (type + SOLID hex),
+    // so we can see whether bg came from a real fill or a fallback.
+    section._raw_fills = Array.isArray(node.fills)
+      ? node.fills.map((f) => ({
+          type: f.type,
+          hex: f.type === "SOLID" ? figmaColorToHex(f.color) : null,
+          visible: f.visible !== false,
+        }))
+      : [];
+
     // v6.2.0: promote section-spanning image to bg_image. If the section's
     // FIRST content element is an image that covers ~the full section width,
     // it's a background image (hero pattern). The overlay text/CTA remain
@@ -1135,6 +1436,16 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
         content.shift();
       }
     }
+
+    // L-2a: inner-container capture (additive metadata; content[] untouched).
+    // Computed AFTER the bg_image shift so content_indices align with the
+    // final content[] order.
+    section.containers = captureContainers(node, bg, content);
+
+    // L-2b: grid geometry for multi-item rows (additive; derived from the
+    // L-2a containers + node layout fields; content[] untouched).
+    const _grid = deriveSectionGrid(node, section.containers);
+    if (_grid) section.grid = _grid;
 
     section.type = inferSectionType(section, idx, sectionNodes.length, content);
     delete section.height;
