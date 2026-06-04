@@ -72,6 +72,14 @@ const PORT = process.env.PORT || 3000;
 // but materially better at multi-step layout reasoning.
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
 
+// Charter §1.1 — bridge path defaults to Opus. Env override allows Sonnet
+// experimentation without redeploy. Short-token form ("opus"/"sonnet"/"haiku")
+// to match the bridge resolver's allowlist (bridge-server.mjs ALLOWED_MODELS).
+// Distinct from CLAUDE_MODEL above: CLAUDE_MODEL is the full Anthropic ID for
+// the direct-API fallback path; BRIDGE_DEFAULT_MODEL is the short token sent
+// over to the Mac bridge's cc-runner CLI.
+const BRIDGE_DEFAULT_MODEL = process.env.BRIDGE_DEFAULT_MODEL || "opus";
+
 // =====================================================================
 // v8.0.0 — REFERENCE HTML LIBRARY
 //
@@ -3767,7 +3775,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     spec: designSpec,
     referenceHtml: referenceHtml || null,
     imageBase64: designImageBase64 || null,
-    model: model || "sonnet",
+    model: model || BRIDGE_DEFAULT_MODEL,
     requestId,
     bridgeJobId,
     maveloperJobId: maveloperJobId || null,
@@ -4932,7 +4940,7 @@ ${specs.join("\n\n")}
           designSpec,
           referenceHtml: referenceHtmlForCC,
           designImageBase64: null, // TODO: pass Phase B render image
-          model: req.body?.model || "sonnet",
+          model: req.body?.model || BRIDGE_DEFAULT_MODEL,
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
           log,
@@ -5772,7 +5780,7 @@ ${specs.join("\n\n")}
           designSpec,
           referenceHtml: referenceHtml || null,
           designImageBase64: designImageBase64ForCC,
-          model: req.body?.model || "sonnet",
+          model: req.body?.model || BRIDGE_DEFAULT_MODEL,
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
           log,
