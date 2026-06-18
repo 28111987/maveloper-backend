@@ -904,6 +904,12 @@ const ATOMIC_GROUP_MAX_SIZE = 300;        // small vector-only GROUPs get raster
  */
 function walkSection(sectionNode, ctx) {
   const elements = [];
+  // CLASS A (decorative-shape capture): expose this section's geometry + paint
+  // order so the walker can (a) reject section-sized backgrounds and (b) decide
+  // whether a large shape sits BEHIND later-painted content. Reset per section.
+  ctx.section = sectionNode.absoluteBoundingBox || null;
+  ctx.sectionRoot = sectionNode;
+  ctx._paintOrder = null;
   collect(sectionNode, elements, ctx, /* isRoot */ true);
   return collapseRepeats(elements);
 }
@@ -1050,8 +1056,17 @@ function collect(node, out, ctx, isRoot = false) {
   // atomic units (icons, sector tags, dividers, decorative graphics).
   // Rasterize them via Figma /v1/images rather than walking into them.
   // Skip for root nodes (a section root shouldn't become a single image).
-  if (!isRoot && isAtomicVisualUnit(node)) {
-    pushImageElement(node, out, ctx, { source: "atomic" });
+  if (!isRoot && isAtomicVisualUnit(node, ctx)) {
+    // CLASS A: a large decorative shape that sits BEHIND later-painted content
+    // (or bleeds off the frame) is emitted as a BACKGROUND decoration (composited
+    // behind the overlapping content), not as a flow image that would push
+    // content down. Standalone shapes keep the A1 flow-image behavior.
+    const largeDeco = isLargeDecorationShape(node, ctx);
+    const asBackground = largeDeco && (isBehindLaterContent(node, ctx) || overhangsFrame(node, ctx));
+    pushImageElement(node, out, ctx, {
+      source: largeDeco ? "decoration" : "atomic",
+      background: asBackground,
+    });
     return;
   }
 
@@ -1105,6 +1120,120 @@ function collect(node, out, ctx, isRoot = false) {
   return;
 }
 
+// ─── CLASS A — DECORATIVE-SHAPE CAPTURE (v6.x) ──────────────────────────────
+// Non-rectangular shape types that can carry a solid/gradient decoration (e.g.
+// the Liesl hero's yellow curve, VECTOR 978×985 #FFD447 behind the headline).
+// ELLIPSE and LINE were previously unhandled — included here.
+const DECORATION_SHAPE_TYPES = new Set([
+  "VECTOR", "STAR", "REGULAR_POLYGON", "POLYGON", "BOOLEAN_OPERATION", "ELLIPSE", "LINE",
+]);
+
+// Does the node have at least one VISIBLE solid-or-gradient fill (NOT image)?
+function hasVisibleNonImageFill(node) {
+  if (!Array.isArray(node.fills)) return false;
+  return node.fills.some(
+    (f) => f && f.visible !== false &&
+      (f.type === "SOLID" || (typeof f.type === "string" && f.type.startsWith("GRADIENT")))
+  );
+}
+
+// Does this node's bbox extend OUTSIDE the email frame on any axis (an organic
+// shape bleeding off-frame, e.g. the curve at x=-170..808)? Such a shape is a
+// decoration, not a flat section background.
+function overhangsFrame(node, ctx) {
+  const c = ctx && ctx.clip;
+  const b = node && node.absoluteBoundingBox;
+  if (!c || !b || !c.width || !c.height) return false;
+  const TOL = 2;
+  const left = b.x - c.originX, top = b.y - c.originY;
+  const right = left + (b.width ?? 0), bottom = top + (b.height ?? 0);
+  return left < -TOL || top < -TOL || right > c.width + TOL || bottom > c.height + TOL;
+}
+
+// BACKGROUND-SIZE GUARD: is this large shape actually a SECTION BACKGROUND (so
+// we must NOT export it as a decoration)? A bg is contained within the section
+// and ~fills it. A shape that OVERHANGS the section bounds (bleeds off) is an
+// organic decoration, not a bg. Missing geometry → treat as NOT a bg (allow).
+function isSectionSizedBackground(node, ctx) {
+  const s = ctx && ctx.section;
+  const b = node && node.absoluteBoundingBox;
+  if (!s || !b || !s.width || !s.height || !b.width || !b.height) return false;
+  const TOL = 2;
+  const overhangs =
+    b.x < s.x - TOL || b.y < s.y - TOL ||
+    b.x + b.width > s.x + s.width + TOL || b.y + b.height > s.y + s.height + TOL;
+  if (overhangs) return false; // bleeds off the section → organic decoration
+  const areaRatio = (b.width * b.height) / (s.width * s.height);
+  if (areaRatio >= 0.85) return true; // fills most of the section → background
+  return (
+    Math.abs(b.x - s.x) <= TOL && Math.abs(b.y - s.y) <= TOL &&
+    Math.abs(b.width - s.width) <= TOL && Math.abs(b.height - s.height) <= TOL
+  );
+}
+
+// A LARGE non-rectangular decorative shape: above the small-icon cap, with a
+// visible solid/gradient fill, NOT a section background. Gated on section
+// context (ctx.section) so non-walker callers (dedup index) are unaffected.
+function isLargeDecorationShape(node, ctx) {
+  if (!ctx || !ctx.section) return false;
+  if (!node || node.visible === false) return false;
+  if (!DECORATION_SHAPE_TYPES.has(node.type)) return false;
+  const w = getNodeWidth(node), h = getNodeHeight(node);
+  if (w <= 0 || h <= 0) return false;
+  if (w <= ATOMIC_VECTOR_MAX_SIZE && h <= ATOMIC_VECTOR_MAX_SIZE) return false; // small → A1
+  if (!hasVisibleNonImageFill(node)) return false;
+  if (isSectionSizedBackground(node, ctx)) return false;
+  return true;
+}
+
+// bbox overlap (absolute coords)
+function bboxOverlap(a, b) {
+  if (!a || !b || a.x == null || b.x == null) return false;
+  return !(
+    a.x + a.width <= b.x || a.x >= b.x + b.width ||
+    a.y + a.height <= b.y || a.y >= b.y + b.height
+  );
+}
+
+// Does the node itself render visible content (TEXT or a photo/image fill)?
+function rendersOwnContent(n) {
+  if (!n || n.visible === false) return false;
+  if (n.type === "TEXT" && typeof n.characters === "string" && n.characters.trim()) return true;
+  if (extractImageFill(n)) return true;
+  return false;
+}
+
+// LAYERING: does any content node painted AFTER `node` (later in the section's
+// pre-order paint order = on top) overlap its bbox? If so the shape sits BEHIND
+// content (A2). Uses section-level paint order, not just immediate siblings,
+// because the shape may be nested (the curve is the sole child of a GROUP).
+function isBehindLaterContent(node, ctx) {
+  const root = ctx && ctx.sectionRoot;
+  const nb = node && node.absoluteBoundingBox;
+  if (!root || !nb) return false;
+  if (!ctx._paintOrder) {
+    const list = [];
+    (function pre(n) {
+      if (!n || n.visible === false) return;
+      list.push(n);
+      for (const c of n.children || []) pre(c);
+    })(root);
+    ctx._paintOrder = list;
+  }
+  const order = ctx._paintOrder;
+  const myIdx = order.indexOf(node);
+  if (myIdx < 0) return false;
+  const descendants = new Set();
+  (function d(n) { for (const c of n.children || []) { descendants.add(c); d(c); } })(node);
+  for (let i = myIdx + 1; i < order.length; i++) {
+    const other = order[i];
+    if (descendants.has(other)) continue;       // its own children are part of it
+    if (!rendersOwnContent(other)) continue;
+    if (bboxOverlap(nb, other.absoluteBoundingBox)) return true;
+  }
+  return false;
+}
+
 /**
  * Detect whether a node is an "atomic visual unit" — a designed graphical
  * atom that should be rasterized rather than walked into.
@@ -1115,18 +1244,23 @@ function collect(node, out, ctx, isRoot = false) {
  *   - VECTOR: atomic if both dimensions ≤ 200px (typical icon size)
  *   - GROUP: atomic if entirely composed of VECTOR/RECTANGLE/ELLIPSE
  *     (no text, no nested frames) and ≤ 300px on either axis
+ *   - CLASS A (v6.x): a LARGE non-rect shape (VECTOR/STAR/POLYGON/BOOLEAN/
+ *     ELLIPSE/LINE) with a solid/gradient fill that is NOT a section bg.
  *
  * NOT atomic:
  *   - Any FRAME (these are layout containers — walk into them)
- *   - Large vectors (≥ 200px — could be a section bg, recurse to confirm)
+ *   - Large vectors with no fill / image fill, or section-sized backgrounds
  *   - Groups containing text or frames (not visual atoms)
+ *
+ * `ctx` (optional) carries section geometry; the large-decoration branch only
+ * fires when it is present (i.e. from the section walker, not the dedup index).
  *
  * Why not capture standalone RECTANGLEs without image fills: those are
  * usually section dividers / accent bars / button bgs handled by the
  * CTA detector. Capturing every solid-fill rectangle would produce dozens
  * of tiny images per email.
  */
-function isAtomicVisualUnit(node) {
+function isAtomicVisualUnit(node, ctx = null) {
   if (!node || node.visible === false) return false;
 
   // Components and instances are atomic ONLY if they have no TEXT descendants.
@@ -1139,12 +1273,14 @@ function isAtomicVisualUnit(node) {
     return !hasTextDescendant(node);
   }
 
-  // Small vectors are icons
+  // Small vectors are icons (UNCHANGED behavior + size cap). If a vector-family
+  // shape is LARGER than the cap, do NOT return false here — fall through to the
+  // CLASS A large-decoration check below.
   if (node.type === "VECTOR" || node.type === "STAR" || node.type === "REGULAR_POLYGON" ||
       node.type === "POLYGON" || node.type === "BOOLEAN_OPERATION") {
     const w = getNodeWidth(node);
     const h = getNodeHeight(node);
-    return w > 0 && h > 0 && w <= ATOMIC_VECTOR_MAX_SIZE && h <= ATOMIC_VECTOR_MAX_SIZE;
+    if (w > 0 && h > 0 && w <= ATOMIC_VECTOR_MAX_SIZE && h <= ATOMIC_VECTOR_MAX_SIZE) return true;
   }
 
   // Vector-only groups are decorative compositions
@@ -1171,6 +1307,11 @@ function isAtomicVisualUnit(node) {
     return allVectorShape;
   }
 
+  // CLASS A (v6.x): large non-rectangular decorative shape (VECTOR/STAR/POLYGON/
+  // BOOLEAN/ELLIPSE/LINE) above the small cap, with a solid/gradient fill, that
+  // is NOT a section background. Only fires with section context (ctx).
+  if (isLargeDecorationShape(node, ctx)) return true;
+
   return false;
 }
 
@@ -1191,7 +1332,7 @@ function hasTextDescendant(node) {
  * Helper: push an image element to out[] and register it in imageRefs
  * for Phase B export. Used by both atomic-unit and image-fill paths.
  */
-function pushImageElement(node, out, ctx, { source }) {
+function pushImageElement(node, out, ctx, { source, background = false }) {
   const w = Math.round(getNodeWidth(node));
   const h = Math.round(getNodeHeight(node));
   if (w <= 0 || h <= 0) return;
@@ -1226,7 +1367,7 @@ function pushImageElement(node, out, ctx, { source }) {
     source, // "fill" or "atomic" — for diagnostics
   });
 
-  out.push({
+  const el = {
     el: "image",
     src: "", // Phase B fills this with Dropbox URL after export
     alt: node.name || "Image",
@@ -1234,7 +1375,30 @@ function pushImageElement(node, out, ctx, { source }) {
     height: h,
     _figmaNodeId: node.id,
     _imageRef: imgFill?.imageRef ?? null, // v6.5.0: raw imageRef for bg_image extraction
-  });
+  };
+
+  // CLASS A2: a decorative shape that sits behind content is marked so the
+  // framework composites it as a cell background-image with the overlapping
+  // content layered ON TOP — NOT rendered as its own flow row.
+  if (background) {
+    el.role = "bg_decoration";
+    el.layer = "background";
+    const b = node.absoluteBoundingBox;
+    if (b) {
+      const ox = ctx && ctx.clip ? ctx.clip.originX : 0;
+      const oy = ctx && ctx.clip ? ctx.clip.originY : 0;
+      el.bbox = {
+        x: Math.round(b.x - ox), y: Math.round(b.y - oy),
+        w: Math.round(b.width), h: Math.round(b.height),
+      };
+    }
+    if (ctx && ctx._paintOrder) {
+      const zi = ctx._paintOrder.indexOf(node);
+      if (zi >= 0) el.z_order = zi; // lower = further back
+    }
+  }
+
+  out.push(el);
 }
 
 /**
