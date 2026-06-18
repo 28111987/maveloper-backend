@@ -362,6 +362,23 @@ function figmaColorToHex(color) {
 }
 
 /**
+ * Is a #RRGGBB background "dark"? Uses relative luminance (Rec.709) on a 0–255
+ * scale; dark when luminance < ~64 (≈0.25 of full). Drives designSpec.dark_mode
+ * so the framework's dark-mode scaffold (DSF-3 / validator) fires for natively
+ * dark designs (Arsenal #060605 → dark) but not for light/cream bases
+ * (#FFFFFF / #F6F4EE → light). Unparseable input → not dark (false).
+ */
+function isDarkBackground(hex) {
+  if (typeof hex !== "string") return false;
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (!m) return false;
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return luminance < 64;
+}
+
+/**
  * Extract the dominant solid background fill from a node. Returns hex or null.
  * Skips IMAGE / GRADIENT fills — those are handled separately as image elements.
  */
@@ -1619,6 +1636,10 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     width: devOverrides.emailWidth || emailWidth,
     font_body: devOverrides.primaryFont || detectedFont,
     font_heading: devOverrides.secondaryFont || detectedFont,
+    // RC-3: derive dark_mode from the DOMINANT/email-wrapper bg (NOT per-section
+    // bgs — one light §3 band must not flip the verdict). emailFallbackBg is the
+    // email frame's own fill (extractBgHex(emailFrame)), the page's base colour.
+    dark_mode: isDarkBackground(emailFallbackBg),
     sections: dedupedSections,
     band_count: dedupedSections.length,
   };
