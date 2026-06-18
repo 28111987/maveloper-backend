@@ -1015,6 +1015,29 @@ function dedupAdjacentSections(sections) {
 function collect(node, out, ctx, isRoot = false) {
   if (!node || node.visible === false) return;
 
+  // ------ CLIP-BOUNDS guard (additive) ------
+  // Drop a node only when its bounding box lies ENTIRELY outside the fixed-size
+  // email frame on either axis — content the frame's clipsContent crops away and
+  // never renders (e.g. the phantom 6th sector tab in an 822px ticker that
+  // overflows the 600px frame at x=622). Nodes that straddle an edge (partially
+  // visible) are KEPT — we never clip partial content. Missing bbox or frame
+  // geometry → skip the check (never drop for missing data). 1px tolerance so a
+  // node flush at an edge is kept.
+  if (ctx && ctx.clip && node.absoluteBoundingBox) {
+    const bb = node.absoluteBoundingBox;
+    const TOL = 1;
+    const left = bb.x - ctx.clip.originX;
+    const right = left + (bb.width ?? 0);
+    const top = bb.y - ctx.clip.originY;
+    const bottom = top + (bb.height ?? 0);
+    if (
+      right <= -TOL || left >= ctx.clip.width + TOL ||
+      bottom <= -TOL || top >= ctx.clip.height + TOL
+    ) {
+      return;
+    }
+  }
+
   // ------ TEXT ------
   if (TEXT_TYPES.has(node.type)) {
     const el = textNodeToSpec(node);
@@ -1517,7 +1540,22 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
   const parentMap = buildParentMap(emailFrame);
 
   // 7. Walk each section into spec form
-  const ctx = { imageRefs: [] };
+  // Clip-bounds: thread the email frame geometry so the content walker can drop
+  // nodes the fixed-size frame clips away entirely (clipsContent overflow — e.g.
+  // a ticker/marquee tab positioned past the frame's right edge). null when the
+  // frame geometry is absent or degenerate → the guard is skipped (we never drop
+  // a node just because geometry is missing).
+  const _efbb = emailFrame.absoluteBoundingBox || null;
+  const _efh = Math.round(_efbb?.height ?? 0);
+  const ctx = {
+    imageRefs: [],
+    clip: (_efbb && emailWidth > 0 && _efh > 0) ? {
+      originX: _efbb.x ?? 0,
+      originY: _efbb.y ?? 0,
+      width: emailWidth,
+      height: _efh,
+    } : null,
+  };
   const sections = [];
   const frameOrigin = emailFrame.absoluteBoundingBox?.y ?? 0;
   // v6.3.0: email frame's bg becomes the fallback for sections without
