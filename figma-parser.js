@@ -1234,6 +1234,62 @@ function textNodeToSpec(node) {
   if (typeof style.letterSpacing === "number" && style.letterSpacing !== 0) {
     el.letter_spacing = Number(style.letterSpacing.toFixed(2));
   }
+
+  // ── ADDITIVE: per-run (per-character-range) colour/weight capture ──────────
+  // Figma stores in-node style runs as characterStyleOverrides (one override id
+  // per character; 0/absent = base) + styleOverrideTable (id -> partial style).
+  // Mixed-style text (a coloured or bolded word inside a line) is otherwise lost
+  // by the single flat color/weight above. We segment the characters into runs
+  // of constant effective (color, weight) and attach item.spans — ONLY when the
+  // node is genuinely mixed (>1 run, with a run differing from the base). The
+  // flat color/weight stay as the node's dominant/base value; spans is additive.
+  try {
+    const cso = node.characterStyleOverrides;
+    const sot = node.styleOverrideTable || {};
+    if (Array.isArray(cso) && cso.length > 0) {
+      const chars = characters.split("");
+      const baseColor = color;     // node base fill hex (== flat color field)
+      const baseWeight = weight;   // node base fontWeight (== flat weight field)
+
+      const resolveColor = (ov) => {
+        const o = ov && sot[ov];
+        if (o && Array.isArray(o.fills)) {
+          const solid = o.fills.find(
+            (f) => f && f.visible !== false && f.type === "SOLID" && f.color
+          );
+          if (solid) return figmaColorToHex(solid.color);
+        }
+        return baseColor;
+      };
+      const resolveWeight = (ov) => {
+        const o = ov && sot[ov];
+        return (o && typeof o.fontWeight === "number") ? o.fontWeight : baseWeight;
+      };
+
+      const runs = [];
+      for (let i = 0; i < chars.length; i++) {
+        const ov = cso[i] || 0;
+        const c = resolveColor(ov);
+        const w = resolveWeight(ov);
+        const last = runs[runs.length - 1];
+        if (last && last.color === c && last.weight === w) {
+          last.text += chars[i];
+        } else {
+          runs.push({ text: chars[i], color: c, weight: w });
+        }
+      }
+
+      const mixed =
+        runs.length > 1 &&
+        runs.some((r) => r.color !== baseColor || r.weight !== baseWeight);
+      if (mixed) {
+        el.spans = runs.map((r) => ({ text: r.text, color: r.color, weight: r.weight }));
+      }
+    }
+  } catch (_) {
+    /* defensive: never let span capture break the flat text element */
+  }
+
   return el;
 }
 
@@ -1566,6 +1622,19 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     sections: dedupedSections,
     band_count: dedupedSections.length,
   };
+
+  // RC-1 brand-font wiring: also emit brand_font + font_stack so the framework's
+  // existing brand-font machinery (DSF-1, the @import, the validator's hard
+  // brand-font check) keys off a populated field instead of staying dormant.
+  // ONLY when a REAL family was detected from text nodes — never when
+  // detectedFont fell back to the hardcoded "Arial" default, so we never
+  // force-enforce "Arial" as if it were a brand font. font_body/font_heading
+  // are left exactly as-is (this is purely additive).
+  if (detectedFont && detectedFont !== "Arial") {
+    designSpec.brand_font = detectedFont;
+    designSpec.font_stack = `'${detectedFont}', Arial, Helvetica, sans-serif`;
+  }
+
   designSpec._palette = buildPalette(designSpec);
   designSpec.palette_used = designSpec._palette;
 
