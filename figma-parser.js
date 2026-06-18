@@ -400,12 +400,89 @@ function extractStrokeHex(node) {
 }
 
 /**
- * Layer-A capture: first gradient fill on a node, as DATA ONLY (no CSS).
+ * Layer-A (Fix 3): build a ready-to-paste, email-safe CSS background string
+ * from a captured gradient {kind, stops, handles}. ADDITIVE — it never alters
+ * the captured kind/stops/handles. Returns { css, fallback_hex } or null when
+ * there are no usable stops.
+ *
+ * - fallback_hex = the stop covering the largest area (position span). When
+ *   every stop shares one hex (e.g. the Arsenal closing 2-stop, both #F05A28),
+ *   that hex is used. A bgcolor / Outlook fallback should be set to this.
+ * - css ALWAYS leads with `background-color:<fallback_hex>` so non-supporting
+ *   clients (incl. Outlook) get the solid colour, then `background:<…>-gradient(…)`
+ *   overrides it where supported.
+ * - RADIAL: centre derived from handles[0] (handle[0] is the centre); else 50% 50%.
+ * - LINEAR: angle derived from the handles[0]→handles[1] vector via atan2
+ *   (CSS convention: 0deg = up, increasing clockwise; Figma y is downward);
+ *   else 180deg.
+ * - All percentages and the angle are rounded to whole numbers.
+ */
+function buildGradientCss(kind, stops, handles) {
+  if (!Array.isArray(stops) || stops.length === 0) return null;
+
+  // --- solid fallback: stop with the largest area (position span) presence ---
+  const allSameHex = stops.every((s) => s.hex && s.hex === stops[0].hex);
+  let fallback_hex;
+  if (allSameHex) {
+    fallback_hex = stops[0].hex;
+  } else {
+    const sorted = stops
+      .map((s) => ({ pos: s.pos ?? 0, hex: s.hex }))
+      .sort((a, b) => a.pos - b.pos);
+    let best = sorted[0];
+    let bestSpan = -1;
+    for (let j = 0; j < sorted.length; j++) {
+      const left = j === 0 ? 0 : (sorted[j - 1].pos + sorted[j].pos) / 2;
+      const right = j === sorted.length - 1 ? 1 : (sorted[j].pos + sorted[j + 1].pos) / 2;
+      const span = right - left;
+      if (span > bestSpan) { bestSpan = span; best = sorted[j]; }
+    }
+    fallback_hex = best.hex || stops[0].hex;
+  }
+
+  // --- stop list "<hex> <pos%>" ---
+  const stopStr = stops
+    .map((s) => `${s.hex} ${Math.round((s.pos ?? 0) * 100)}%`)
+    .join(", ");
+
+  let grad;
+  if (kind === "GRADIENT_RADIAL") {
+    let cx = 50, cy = 50;
+    if (Array.isArray(handles) && handles[0] && typeof handles[0].x === "number") {
+      cx = Math.round(handles[0].x * 100);
+      cy = Math.round((handles[0].y ?? 0.5) * 100);
+    }
+    grad = `radial-gradient(circle at ${cx}% ${cy}%, ${stopStr})`;
+  } else {
+    // GRADIENT_LINEAR (and any other gradient kind) → linear with derived angle.
+    let angle = 180;
+    if (Array.isArray(handles) && handles[0] && handles[1]
+        && typeof handles[0].x === "number" && typeof handles[1].x === "number") {
+      const dx = handles[1].x - handles[0].x;
+      const dy = (handles[1].y ?? 0) - (handles[0].y ?? 0);
+      // CSS angle: 0deg = up, increasing clockwise; Figma y increases downward.
+      angle = Math.round(((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360);
+    }
+    grad = `linear-gradient(${angle}deg, ${stopStr})`;
+  }
+
+  return {
+    css: `background-color:${fallback_hex}; background:${grad};`,
+    fallback_hex,
+  };
+}
+
+/**
+ * Layer-A capture: first gradient fill on a node. Captures DATA (kind, stops,
+ * handles) and ALSO attaches a pre-rendered, email-safe `css` string plus a
+ * `fallback_hex` (Fix 3) so the model can paste the gradient verbatim.
  * Scans node.fills for the first visible fill whose type starts with
  * "GRADIENT_". Returns:
  *   { kind: <GRADIENT_* type>,
  *     stops: [{ pos: gradientStops[i].position, hex: <stop color hex> }, ...],
- *     handles: gradientHandlePositions }
+ *     handles: gradientHandlePositions,
+ *     css: <ready-to-paste background string>,     // NEW, additive
+ *     fallback_hex: <solid fallback colour> }       // NEW, additive
  * or null if the node has no gradient fill.
  */
 function extractGradient(node) {
@@ -417,11 +494,17 @@ function extractGradient(node) {
       const stops = Array.isArray(fill.gradientStops)
         ? fill.gradientStops.map((s) => ({ pos: s.position, hex: figmaColorToHex(s.color) }))
         : [];
-      return {
+      const gradient = {
         kind: fill.type,
         stops,
         handles: fill.gradientHandlePositions || null,
       };
+      const built = buildGradientCss(gradient.kind, gradient.stops, gradient.handles);
+      if (built) {
+        gradient.css = built.css;
+        gradient.fallback_hex = built.fallback_hex;
+      }
+      return gradient;
     }
   }
   return null;
