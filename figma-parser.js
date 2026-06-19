@@ -1218,6 +1218,17 @@ function collect(node, out, ctx, isRoot = false) {
     // "The Outliers Waiting For You" in Arsenal Pulse.)
   }
 
+  // ------ LINE → divider (CLASS A1 leftover) ------
+  // A Figma LINE is a 1-D rule (one dimension ~0) carrying a STROKE, not a fill.
+  // It was previously dropped by the silent-return below (not a CONTAINER, no
+  // image fill, and not in the atomic vector-family list). Emit it as a divider
+  // element so the framework renders a 1px bgcolor row/column — NOT an image.
+  if (node.type === "LINE") {
+    const d = lineToDivider(node);
+    if (d) out.push(d);
+    return;
+  }
+
   // ------ Non-container RECTANGLE / VECTOR without image fill: skip ------
   // (Vectors and rectangles handled above as atomic units if they qualify.)
   if (!CONTAINER_TYPES.has(node.type) && !imgFill) {
@@ -1411,8 +1422,13 @@ function isAtomicVisualUnit(node, ctx = null) {
   // Small vectors are icons (UNCHANGED behavior + size cap). If a vector-family
   // shape is LARGER than the cap, do NOT return false here — fall through to the
   // CLASS A large-decoration check below.
+  // CLASS A1: ELLIPSE included so a small (≤ cap) standalone solid ellipse
+  // (bullet dot / colored circle) rasterizes via the atomic/image path like
+  // every other small shape, instead of being silently dropped. LINE is NOT
+  // here — it renders as a divider (lineToDivider), not a 1px PNG. Large
+  // ellipses (> cap) still fall through to the A2 large-decoration path.
   if (node.type === "VECTOR" || node.type === "STAR" || node.type === "REGULAR_POLYGON" ||
-      node.type === "POLYGON" || node.type === "BOOLEAN_OPERATION") {
+      node.type === "POLYGON" || node.type === "BOOLEAN_OPERATION" || node.type === "ELLIPSE") {
     const w = getNodeWidth(node);
     const h = getNodeHeight(node);
     if (w > 0 && h > 0 && w <= ATOMIC_VECTOR_MAX_SIZE && h <= ATOMIC_VECTOR_MAX_SIZE) return true;
@@ -1688,6 +1704,43 @@ function tryDetectCta(node) {
     cta_size: ctaSize,
     cta_weight: ctaWeight,
     align,
+  };
+}
+
+/**
+ * CLASS A1 (LINE → divider): convert a Figma LINE node into a divider spec
+ * element. A LINE is a 1-D rule — one bbox dimension is ~0 — whose visible
+ * colour comes from its STROKE (lines have no fill). Email renders this as a
+ * 1px (or thickness-px) high <tr><td> with bgcolor = the stroke colour (a thin
+ * <td> column when vertical), NOT a rasterized image — lighter and Outlook-safe.
+ *
+ * Returns { el:"divider", orientation, color, thickness, length } or null when
+ * the node is invisible, has no visible stroke AND no solid fill, or is
+ * degenerate (both dims ~0). The clip-guard in collect() has already run.
+ */
+function lineToDivider(node) {
+  if (!node || node.visible === false) return null;
+  const w = getNodeWidth(node), h = getNodeHeight(node);
+  if (w < 1 && h < 1) return null; // degenerate (both dims ~0) → nothing to draw
+
+  // Visible colour: stroke first (the normal LINE case), then a solid fill as a
+  // fallback (a thin shape drawn with a fill rather than a stroke).
+  const stroke = extractStrokeHex(node);
+  let color = stroke ? stroke.hex : null;
+  let weight = stroke && typeof stroke.weight === "number" ? stroke.weight : null;
+  if (!color) {
+    const fillHex = extractBgHex(node);
+    if (fillHex) { color = fillHex; if (weight == null) weight = Math.min(w, h) || 1; }
+  }
+  if (!color) return null; // no visible stroke AND no solid fill → nothing to render
+
+  const orientation = w >= h ? "horizontal" : "vertical";
+  return {
+    el: "divider",
+    orientation,
+    color,
+    thickness: Math.max(1, Math.round(weight || 1)),
+    length: Math.round(orientation === "horizontal" ? w : h),
   };
 }
 
