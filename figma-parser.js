@@ -1599,6 +1599,15 @@ function textNodeToSpec(node) {
   // node is genuinely mixed (>1 run, with a run differing from the base). The
   // flat color/weight stay as the node's dominant/base value; spans is additive.
   try {
+    // CLASS D: node-level hyperlink (the WHOLE text line is a link, set at
+    // node.style.hyperlink) — applies whether or not the node has per-character
+    // style overrides, so it must NOT be gated behind characterStyleOverrides.
+    // Decode percent-encoding so merge-field tokens stay literal; never invent.
+    if (node.style && node.style.hyperlink && typeof node.style.hyperlink.url === "string") {
+      try { el.href = decodeURIComponent(node.style.hyperlink.url); }
+      catch (_) { el.href = node.style.hyperlink.url; }
+    }
+
     const cso = node.characterStyleOverrides;
     const sot = node.styleOverrideTable || {};
     if (Array.isArray(cso) && cso.length > 0) {
@@ -1620,25 +1629,43 @@ function textNodeToSpec(node) {
         const o = ov && sot[ov];
         return (o && typeof o.fontWeight === "number") ? o.fontWeight : baseWeight;
       };
+      // CLASS D: capture a real per-run hyperlink (Figma stores it on the style
+      // override as hyperlink:{ type:"URL", url:"..." }). Decode percent-encoding
+      // so merge-field tokens become literal again ({{customer.email}}) and work
+      // in the ESP — never invent a URL, only emit what the design carries.
+      const resolveHyperlink = (ov) => {
+        const o = ov && sot[ov];
+        const url = o && o.hyperlink && typeof o.hyperlink.url === "string" ? o.hyperlink.url : null;
+        if (!url) return null;
+        try { return decodeURIComponent(url); } catch (_) { return url; }
+      };
 
       const runs = [];
       for (let i = 0; i < chars.length; i++) {
         const ov = cso[i] || 0;
         const c = resolveColor(ov);
         const w = resolveWeight(ov);
+        const h = resolveHyperlink(ov);
         const last = runs[runs.length - 1];
-        if (last && last.color === c && last.weight === w) {
+        if (last && last.color === c && last.weight === w && last.href === h) {
           last.text += chars[i];
         } else {
-          runs.push({ text: chars[i], color: c, weight: w });
+          runs.push({ text: chars[i], color: c, weight: w, href: h });
         }
       }
 
+      const anyHref = runs.some((r) => r.href);
       const mixed =
         runs.length > 1 &&
         runs.some((r) => r.color !== baseColor || r.weight !== baseWeight);
-      if (mixed) {
-        el.spans = runs.map((r) => ({ text: r.text, color: r.color, weight: r.weight }));
+      // Emit spans when genuinely mixed by colour/weight OR when a run carries a
+      // hyperlink (so a partial inline link surfaces even on uniform-styled text).
+      if (mixed || anyHref) {
+        el.spans = runs.map((r) => {
+          const span = { text: r.text, color: r.color, weight: r.weight };
+          if (r.href) span.href = r.href; // include href ONLY on linked runs
+          return span;
+        });
       }
     }
   } catch (_) {
