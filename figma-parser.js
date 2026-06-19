@@ -757,6 +757,141 @@ function deriveSectionGrid(sectionNode, containers) {
   return result;
 }
 
+// =====================================================================
+// 6b. CLASS B — TWO-COLUMN IMAGE+TEXT ROW DETECTION (column_split)
+// =====================================================================
+
+/**
+ * Is a node an image COLUMN — i.e. it renders as a single <img> (an image-fill
+ * RECTANGLE/FRAME, or a captured atomic visual unit)? Used by the column_split
+ * detector to tell a real image column apart from the text node beside it.
+ * ctx is intentionally omitted so the large-decoration branch (which needs
+ * section context) never fires here — a column image is a flow image, not an
+ * A2 background shape.
+ */
+function isImageColumnNode(node) {
+  if (!node || node.visible === false) return false;
+  const imf = extractImageFill(node);
+  if (imf && imf.imageRef) return true;
+  return isAtomicVisualUnit(node);
+}
+
+/**
+ * CLASS B (L-2d): detect HORIZONTAL two-column image+text rows and emit a
+ * section.column_split descriptor scoped to the two content[] indices the row's
+ * children became. Mirrors how section.grid is attached — purely additive
+ * metadata; content[] is NEVER modified or re-split (the renderer maps the
+ * indices, which is what avoids the flat-list duplicate-text bug).
+ *
+ * A row qualifies when a FRAME with layoutMode "HORIZONTAL" has EXACTLY two
+ * visible children that are (a) a TEXT node and (b) an image column (image-fill
+ * RECTANGLE/FRAME or a captured image element), at ~the same top y (≤8px),
+ * non-overlapping, side-by-side left-to-right. The image column must be a real
+ * block (≥60×60) so an inline icon/adornment (a label with a trailing 10px
+ * arrow) does NOT count as a two-column row — mirrors the grid item_width≥60
+ * guard.
+ *
+ * GATES (anti-over-trigger):
+ *   - never fires when section.grid is set (the row is a real tile grid)
+ *   - exactly 2 children (>2 → not a clean two-column row)
+ *   - must be TEXT + image (two text nodes, or two images, do NOT qualify)
+ *   - non-overlapping bboxes (overlap → CLASS A2 background-decoration, not a column)
+ *
+ * Descriptor (scoped to ONE row; any heading above / card below stays
+ * full-width because only these two indices are referenced):
+ *   { content_indices:[textIdx,imageIdx], widths:[textW,imageW],
+ *     gutter:<itemSpacing>, order:"text-left"|"image-left" }
+ *
+ * Returns a single descriptor for one row, an array for multiple rows in the
+ * same section, or null when there is no qualifying row.
+ */
+function detectColumnSplits(sectionNode, content, grid) {
+  if (grid) return null;                                  // GATE: real tile grid
+  if (!sectionNode || !Array.isArray(content) || content.length < 2) return null;
+
+  // content signature → the single content index with that signature
+  // (unique-only; an ambiguous duplicate signature bails to keep scoping exact).
+  const indexForSig = (sig) => {
+    let found = -1;
+    for (let i = 0; i < content.length; i++) {
+      const it = content[i];
+      let key = null;
+      if (it.el === "text") key = `text:${it.text}`;
+      else if (it.el === "cta") key = `text:${it.cta_text}`;
+      else if (it.el === "image") key = `img:${it.alt}`;
+      if (key === sig) {
+        if (found !== -1) return -1; // duplicate signature → ambiguous → bail
+        found = i;
+      }
+    }
+    return found;
+  };
+
+  const matches = [];
+  (function walk(n) {
+    if (!n || n.visible === false) return;
+    if (n.type === "FRAME" && n.layoutMode === "HORIZONTAL") {
+      const kids = (n.children || []).filter((c) => {
+        const b = c && c.visible !== false && c.absoluteBoundingBox;
+        return b && (b.width ?? 0) > 0 && (b.height ?? 0) > 0;
+      });
+      if (kids.length === 2) {
+        const textKid = kids.find(
+          (c) => c.type === "TEXT" && typeof c.characters === "string" && c.characters.trim() !== ""
+        );
+        const imgKid = kids.find((c) => c !== textKid && isImageColumnNode(c));
+        if (textKid && imgKid) {
+          const tb = textKid.absoluteBoundingBox;
+          const ib = imgKid.absoluteBoundingBox;
+          const textW = Math.round(tb.width ?? 0);
+          const imgW = Math.round(ib.width ?? 0);
+          const imgH = Math.round(ib.height ?? 0);
+          // column-size guard: a real image column, not an inline icon.
+          const columnSized = imgW >= 60 && imgH >= 60 && textW >= 60;
+          const sameTop = Math.abs((tb.y ?? 0) - (ib.y ?? 0)) <= 8;
+          const noOverlap = !bboxOverlap(tb, ib);          // A2 guard (not behind/stacked)
+          const leftRight =
+            (tb.x + (tb.width ?? 0)) <= (ib.x ?? 0) + 1 ||
+            ((ib.x ?? 0) + (ib.width ?? 0)) <= (tb.x ?? 0) + 1; // disjoint x-ranges
+          if (columnSized && sameTop && noOverlap && leftRight) {
+            const textIdx = indexForSig(`text:${textKid.characters}`);
+            const imgIdx = indexForSig(`img:${imgKid.name || "Image"}`);
+            if (textIdx >= 0 && imgIdx >= 0 && textIdx !== imgIdx) {
+              const order = (tb.x ?? 0) <= (ib.x ?? 0) ? "text-left" : "image-left";
+              const gutter =
+                typeof n.itemSpacing === "number"
+                  ? Math.round(n.itemSpacing)
+                  : Math.max(
+                      0,
+                      order === "text-left"
+                        ? Math.round((ib.x ?? 0) - (tb.x + (tb.width ?? 0)))
+                        : Math.round((tb.x ?? 0) - (ib.x + (ib.width ?? 0)))
+                    );
+              matches.push({
+                content_indices: [textIdx, imgIdx],
+                widths: [textW, imgW],
+                gutter,
+                order,
+              });
+            }
+          }
+        }
+      }
+    }
+    for (const c of n.children || []) walk(c);
+  })(sectionNode);
+
+  if (matches.length === 0) return null;
+  // de-dup identical index pairs (defensive)
+  const seen = new Set();
+  const uniq = [];
+  for (const m of matches) {
+    const k = m.content_indices.join(",");
+    if (!seen.has(k)) { seen.add(k); uniq.push(m); }
+  }
+  return uniq.length === 1 ? uniq[0] : uniq;
+}
+
 /**
  * v6.3.0: Walk up the parent chain to find the nearest ancestor with a
  * solid bg fill. Used when a section's immediate frame has no fill —
@@ -1804,6 +1939,12 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     // L-2a containers + node layout fields; content[] untouched).
     const _grid = deriveSectionGrid(node, section.containers);
     if (_grid) section.grid = _grid;
+
+    // CLASS B (L-2d): two-column image+text rows → section.column_split.
+    // Additive; content[] is untouched. Gated OFF when a grid was derived
+    // (a tile grid is not a two-column image+text row).
+    const _split = detectColumnSplits(node, content, _grid);
+    if (_split) section.column_split = _split;
 
     section.type = inferSectionType(section, idx, sectionNodes.length, content);
     delete section.height;
