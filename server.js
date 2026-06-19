@@ -3748,9 +3748,10 @@ function mapEspPlatformToTarget(espPlatform) {
   const ESP_PLATFORM_TO_TARGET = {
     none: "plain_html",
     mailchimp: "mailchimp",
+    braze: "liquid_braze",        // canonical platform for the (now-ACTIVE) liquid_braze family; needs a "Braze" UI option to be selectable
     sfmc: "sfmc_content_builder", // CB default; sfmc_ampscript is a separate target
     hubspot: "hubspot_cdn",       // CDN default; hubspot_hubl (dual-output) is separate
-    klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze)
+    klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze — distinct tokens)
   };
   if (espPlatform == null) return "plain_html";
   const key = String(espPlatform).trim().toLowerCase();
