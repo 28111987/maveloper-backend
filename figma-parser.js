@@ -1552,6 +1552,40 @@ function pushImageElement(node, out, ctx, { source, background = false }) {
   out.push(el);
 }
 
+// CLASS C — non-destructive merge-field HINT (option B). The parser NEVER
+// alters design text (verbatim-faithfulness is load-bearing); it only FLAGS a
+// likely personalization placeholder so the ESP layer can later map the role to
+// the chosen ESP's token (see esp-registry.md). Detection is deliberately
+// conservative — a false positive corrupts meaning, a false negative is safe.
+const _MF_SALUT_RE = /^(hallo|hi|hello|hey|dear|liebe[rs]?|bonjour|hola)\b\s+(\S+)$/i;
+const _MF_KNOWN_STUBS = new Set(["xy", "xyz", "x", "name", "firstname", "fname", "recipient", "vorname", "first_name"]);
+// already a REAL merge token ({{…}} / %%…%% / ${…} / *|…|*) → handled verbatim, NOT a placeholder.
+const _MF_REAL_TOKEN_RE = /\{\{[^}]+\}\}|%%[^%]+%%|\$\{[^}]+\}|\*\|[^|]+\|\*/;
+
+/**
+ * Detect a personalization placeholder WITHOUT touching the text. Matches ONLY a
+ * salutation followed by EXACTLY one short non-name stub (the whole string is
+ * "<salutation> <stub>", nothing else). Returns { role, placeholder, reason } or
+ * null. Conservative by design: "Hi there" / "Hallo Welt" / "Dear Team" /
+ * "Hello again" / any salutation + a plausible real word or vowel-bearing short
+ * name (Al, Ed, Jo) → NOT flagged. Real tokens are excluded.
+ */
+function detectMergeFieldHint(text) {
+  if (typeof text !== "string") return null;
+  const t = text.trim();
+  if (_MF_REAL_TOKEN_RE.test(t)) return null;       // already a real merge token
+  const m = _MF_SALUT_RE.exec(t);
+  if (!m) return null;                              // not "<salutation> <one-token>"
+  const stub = m[2];
+  const lower = stub.toLowerCase();
+  let isStub = false;
+  if (_MF_KNOWN_STUBS.has(lower)) isStub = true;                               // known stub (xy, name, fname…)
+  else if (/^[[<{].+[\]>}]$/.test(stub)) isStub = true;                        // bracket/placeholder token: [name] <name> {name}
+  else if (/^[a-z]{1,2}$/i.test(stub) && !/[aeiou]/i.test(stub)) isStub = true; // 1–2 char consonant-only stub (xy, x) — excludes real short names (Al, Ed, Jo)
+  if (!isStub) return null;
+  return { role: "first_name", placeholder: stub, reason: "salutation+stub" };
+}
+
 /**
  * Convert a Figma TEXT node into a spec text element.
  * Uses verbatim characters, fontSize, fontWeight, lineHeightPx.
@@ -1671,6 +1705,11 @@ function textNodeToSpec(node) {
   } catch (_) {
     /* defensive: never let span capture break the flat text element */
   }
+
+  // CLASS C: non-destructive personalization hint. el.text stays EXACTLY the
+  // verbatim design text; we only ATTACH a hint when a placeholder is detected.
+  const _mfHint = detectMergeFieldHint(characters);
+  if (_mfHint) el.suspected_merge_field = _mfHint;
 
   return el;
 }
