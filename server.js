@@ -3739,9 +3739,33 @@ function settleBridgeJob(bridgeJobId, payload) {
   return true;
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, log }) {
+// ESP threading (v9.x): map the coarse Lovable/server `espPlatform` value onto
+// the canonical `spec.esp_target` key that cc-runner consumes (PART I). Single
+// source of truth: C:\maveloper-bridge\esp-registry.md. Unknown / absent →
+// "plain_html" (safe default). The parser never sets esp_target — it is a
+// delivery concern applied here, just before dispatch to the bridge.
+function mapEspPlatformToTarget(espPlatform) {
+  const ESP_PLATFORM_TO_TARGET = {
+    none: "plain_html",
+    mailchimp: "mailchimp",
+    sfmc: "sfmc_content_builder", // CB default; sfmc_ampscript is a separate target
+    hubspot: "hubspot_cdn",       // CDN default; hubspot_hubl (dual-output) is separate
+    klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze)
+  };
+  if (espPlatform == null) return "plain_html";
+  const key = String(espPlatform).trim().toLowerCase();
+  return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
+}
+
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, log }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
+  }
+
+  // Thread the selected ESP onto the spec so cc-runner (PART I) can emit
+  // ESP-specific markup. Don't override an esp_target already present on the spec.
+  if (designSpec && typeof designSpec === "object" && !designSpec.esp_target) {
+    designSpec.esp_target = mapEspPlatformToTarget(espPlatform);
   }
 
   // Generate a unique id we'll use to correlate the callback with this call.
@@ -4943,6 +4967,7 @@ ${specs.join("\n\n")}
           model: req.body?.model || BRIDGE_DEFAULT_MODEL,
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
+          espPlatform: req.body?.espPlatform || "none",
           log,
         });
       } catch (err) {
@@ -5783,6 +5808,7 @@ ${specs.join("\n\n")}
           model: req.body?.model || BRIDGE_DEFAULT_MODEL,
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
+          espPlatform: req.body?.espPlatform || "none",
           log,
         });
       } catch (err) {
