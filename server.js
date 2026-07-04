@@ -6004,6 +6004,49 @@ app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req
       });
     }
 
+    // ── v9.4.0 DEDUP GUARD (duplicate-generation cascade) ───────────────
+    // Lovable can fire this endpoint twice for the same design in quick
+    // succession (double-submit / re-render / retry), spawning two ~20-min
+    // generations. Before creating a new job, return the id of a recent
+    // still-active job for the SAME figma_url instead of starting a second.
+    const DEDUP_WINDOW_MS = 120000; // 2 min — catches rapid double-fires and
+                                    // retry-after-timeout; gated on active
+                                    // status, so completed jobs never block a
+                                    // deliberate re-run, and stuck jobs self-heal.
+    try {
+      const sinceIso = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
+      const { data: existing } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("id, status, created_at")
+        .eq("figma_url", figmaUrl)
+        .in("status", ["pending", "running"])
+        .gte("created_at", sinceIso)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existing && existing.id) {
+        log("info", "Dedup: returning existing active job for figma_url", {
+          requestId: req.id,
+          jobId: existing.id,
+          status: existing.status,
+          figmaUrl: figmaUrl.split("?")[0],
+        });
+        return res.status(202).json({
+          jobId: existing.id,
+          status: existing.status,
+          deduped: true,
+          requestId: req.id,
+        });
+      }
+    } catch (dedupErr) {
+      // Non-fatal: never block a real generation on the guard.
+      log("warn", "Dedup check failed; proceeding to create job", {
+        requestId: req.id,
+        error: dedupErr?.message,
+      });
+    }
+    // ── end dedup guard ─────────────────────────────────────────────────
+
     // Create the job row immediately. We need the jobId before returning to Lovable.
     const { data: job, error: insertErr } = await supabaseAdmin
       .from("maveloper_jobs")
