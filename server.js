@@ -3752,6 +3752,9 @@ function mapEspPlatformToTarget(espPlatform) {
     sfmc: "sfmc_content_builder", // CB default; sfmc_ampscript is a separate target
     hubspot: "hubspot_cdn",       // CDN default; hubspot_hubl (dual-output) is separate
     klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze — distinct tokens)
+    pardot: "pardot",             // Pardot / Account Engagement (ACTIVE v2.6.4, substitution-only)
+    dynamics: "ms_dynamics_365",  // ⚠️ CONFIRM the exact espPlatform value the Lovable dropdown sends for Dynamics
+    ms_dynamics_365: "ms_dynamics_365", // passthrough in case Lovable sends the canonical key
   };
   if (espPlatform == null) return "plain_html";
   const key = String(espPlatform).trim().toLowerCase();
