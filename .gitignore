@@ -5,3 +5,6 @@
 
 # Node
 node_modules/
+
+# Large local corpus dump — 4.6 GB; must NEVER enter the Railway-deployed repo
+HTML Extended Collection/
