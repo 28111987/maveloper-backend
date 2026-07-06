@@ -3755,6 +3755,11 @@ function mapEspPlatformToTarget(espPlatform) {
     pardot: "pardot",             // Pardot / Account Engagement (ACTIVE v2.6.4, substitution-only)
     dynamics: "ms_dynamics_365",  // ⚠️ CONFIRM the exact espPlatform value the Lovable dropdown sends for Dynamics
     ms_dynamics_365: "ms_dynamics_365", // passthrough in case Lovable sends the canonical key
+    sendgrid: "sendgrid",         // SendGrid Marketing Campaigns (ACTIVE v2.6.6, substitution-only)
+    customer_io: "customer_io",   // Customer.io (ACTIVE v2.6.6, substitution-only)
+    customerio: "customer_io",    // ⚠️ in case the Lovable dropdown sends "customerio" (no underscore)
+    sparkpost: "sparkpost",       // SparkPost (ACTIVE v2.6.6; data-msys-unsubscribe attribute mechanism)
+    marketo: "marketo",           // Marketo (ACTIVE v2.7.3, substitution + Layer-2 mktoText/mktoModule) — closes the only routing gap
   };
   if (espPlatform == null) return "plain_html";
   const key = String(espPlatform).trim().toLowerCase();
