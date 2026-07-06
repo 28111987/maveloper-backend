@@ -6155,6 +6155,13 @@ app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req
             status: "completed",
             result_html: result.body.html,
             engine_used: result.body.engineUsed ?? null,
+            // v9.5.0: persist orderId + imageUrlMap so the frontend can call /approve.
+            // Both are produced during generation (result.body) but were previously
+            // dropped — /job-status returned result.orderId/imageUrlMap = undefined,
+            // so the frontend disabled the Approve button. Requires the order_id +
+            // image_url_map columns (see migration note).
+            order_id: result.body.orderId ?? null,
+            image_url_map: result.body.imageUrlMap ?? null,
             progress_message: `Generation complete in ${durationSec}s`,
             completed_at: new Date().toISOString(),
           }, req.id);
@@ -6239,7 +6246,7 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
 
     const { data: job, error } = await supabaseAdmin
       .from("maveloper_jobs")
-      .select("id, status, progress_message, result_html, error_message, engine_used, created_at, updated_at, completed_at")
+      .select("id, status, progress_message, result_html, error_message, engine_used, order_id, image_url_map, created_at, updated_at, completed_at")
       .eq("id", jobId)
       .single();
 
@@ -6266,11 +6273,16 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
         result: {
           html: job.result_html,
           engineUsed: job.engine_used,
+          // v9.5.0: orderId + imageUrlMap so the frontend can call /approve
+          orderId: job.order_id ?? null,
+          imageUrlMap: job.image_url_map ?? null,
         },
         progress_message: job.progress_message,
         // Legacy top-level fields kept for backward compatibility
         html: job.result_html,
         engineUsed: job.engine_used,
+        orderId: job.order_id ?? null,
+        imageUrlMap: job.image_url_map ?? null,
         completedAt: job.completed_at,
       });
     }
