@@ -4891,11 +4891,13 @@ Now analyze the attached design image and produce the JSON specification per the
       }
     }
 
-    // Dark Mode — developer override wins, then fall back to Stage 1 detection
-    if (darkMode === true || darkMode === "true") {
-      specs.push(`DARK MODE: Include dark mode support. Add @media (prefers-color-scheme: dark) rules with design-specific dark colors. Use em_dark, em_dark1, em_dark2, em_dark3 classes on sections that need dark background overrides. Use em_dm_txt_white / em_color1 on text that should be white in dark mode. Invert CTA colors in dark mode using .em_cta class.`);
-    } else if (darkMode === false || darkMode === "false") {
-      specs.push(`DARK MODE: Do NOT include any dark mode CSS. No prefers-color-scheme media query. No em_dark classes. The email does not need dark mode support.`);
+    // Dark Mode — v2.7.10: DEVELOPER-CONTROLLED, DEFAULT LIGHT-ONLY (matches the Figma/async path).
+    const resolvedDarkMode = (darkMode === true || darkMode === "true");   // default (absent/false) = light-only
+    if (designSpec) designSpec.darkMode = resolvedDarkMode;                 // thread into spec.json for the validator
+    if (resolvedDarkMode) {
+      specs.push(`DARK_MODE: true (emit dark-mode support). Add @media (prefers-color-scheme: dark) rules with design-specific dark colors + em_dark1..em_dark5 on section backgrounds, em_txt_white/em_txt_lightwht on text that inverts, and the color-scheme / supported-color-schemes metas.`);
+    } else {
+      specs.push(`DARK_MODE: false (LIGHT-ONLY — OMIT the dark-mode @media block and color-scheme metas entirely). No prefers-color-scheme media query, no em_dark classes.`);
     }
 
     // --- Build image URL reference for Stage 2 (v5.0.0) ---
@@ -4949,7 +4951,7 @@ ${specs.join("\n\n")}
       finalWidth,
       finalFont,
       espPlatform: espPlatform || "none",
-      darkMode: darkMode ?? "auto",
+      darkMode: (darkMode === true || darkMode === "true"),  // v2.7.10: default false = light-only
       stage1DurationMs: Date.now() - stage1StartTime,
     });
 
@@ -5440,8 +5442,13 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     specs.push(`PRIMARY_FONT: ${finalFont}`);
     if (secondaryFont) specs.push(`SECONDARY_FONT: ${secondaryFont}`);
     if (espPlatform && espPlatform !== "none") specs.push(`ESP_PLATFORM: ${espPlatform}`);
-    if (darkMode === true) specs.push(`DARK_MODE: true (force dark mode CSS)`);
-    if (darkMode === false) specs.push(`DARK_MODE: false (skip dark mode CSS)`);
+    // v2.7.10: dark mode is DEVELOPER-CONTROLLED, DEFAULT LIGHT-ONLY. Resolve once; thread to the
+    // engine instruction (specs) AND the spec.json the validator reads (designSpec.darkMode).
+    const resolvedDarkMode = (darkMode === true || darkMode === "true");   // default (absent/false) = light-only
+    designSpec.darkMode = resolvedDarkMode;
+    specs.push(resolvedDarkMode
+      ? `DARK_MODE: true (emit dark-mode support: @media prefers-color-scheme:dark block + color-scheme metas + em_dark scaffold)`
+      : `DARK_MODE: false (LIGHT-ONLY — OMIT the dark-mode @media block and color-scheme metas entirely)`);
 
     // --- v6.2.0 Phase B: render & export images from Figma to Dropbox ---
     // For every image node the parser found (inline images, section bg_images,
@@ -5793,7 +5800,7 @@ ${specs.join("\n\n")}
       finalWidth,
       finalFont,
       espPlatform: espPlatform || "none",
-      darkMode: darkMode ?? "auto",
+      darkMode: (darkMode === true || darkMode === "true"),  // v2.7.10: default false = light-only
       hasVisualReference,                            // v6.6.0
       previewBytesKB: previewBufferForStage2 ? Math.round(previewBufferForStage2.length / 1024) : 0,
       hasReferenceHtml: Boolean(referenceHtml),      // v8.0.0
