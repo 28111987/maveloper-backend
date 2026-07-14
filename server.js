@@ -5068,7 +5068,9 @@ ${specs.join("\n\n")}
       bandMap: designSpec?._band_map || [],
       imageDimensionsMap,
       zipWasUploaded: !!assetsZipBase64,
-      secondaryFont: secondaryFont || designSpec?.font_heading,
+      // Only strip an EXPLICIT secondary font; never default to the spec's own
+      // font_heading (that stripped the design's brand font from every stack).
+      secondaryFont: secondaryFont,
     });
     const html = postProcessResult.html;
 
@@ -5914,7 +5916,12 @@ ${specs.join("\n\n")}
       bandMap: [], // Figma path has no band map
       imageDimensionsMap: {}, // Phase A: no dimension data without exporting
       zipWasUploaded: false,
-      secondaryFont: secondaryFont || designSpec.font_heading,
+      // Only strip a font the caller EXPLICITLY passed as secondary. The old
+      // `|| designSpec.font_heading` default aimed the strip at the design's own
+      // brand font (e.g. Clash Grotesk) — fixSecondaryFontInBodyStack then removed
+      // it from every font-family stack, leaving only the Arial/Helvetica fallback.
+      // Never default to the spec's font; when absent, strip nothing.
+      secondaryFont: secondaryFont,
     });
     const html = postProcessResult.html;
 
