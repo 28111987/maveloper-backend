@@ -6582,11 +6582,23 @@ app.post("/bridge-callback", async (req, res) => {
   if (dbJobId && supabaseAdmin) {
     try {
       if (error) {
+        // v9.8.1: cc-runner writes the honest quality-gate reason (IMAGE PARITY /
+        // STRUCTURAL COLLAPSE / BRAND FONT …) to STDERR; bridge-server.mjs forwards
+        // it in the callback `stderr` field while `error` is the hardcoded generic
+        // "Claude Code generation failed". Previously we persisted only `error`, so
+        // the categories never reached the lead. Prefer stderr when present; keep the
+        // generic `Bridge: <error>` form as the fallback when stderr is empty. The
+        // runner (commit 6687309) then copies error_message into os_queue.error_text.
+        const exitSuffix = exitCode != null ? ` (exitCode=${exitCode})` : "";
+        const gateDetail = String(stderr || "").trim();
+        const errMsg = gateDetail
+          ? `${gateDetail.substring(0, 1500)}${exitSuffix}`
+          : `Bridge: ${String(error).substring(0, 1500)}${exitSuffix}`;
         await supabaseAdmin
           .from("maveloper_jobs")
           .update({
             status: "failed",
-            error_message: `Bridge: ${String(error).substring(0, 1500)}${exitCode != null ? ` (exitCode=${exitCode})` : ""}`,
+            error_message: errMsg,
             completed_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
