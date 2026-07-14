@@ -111,7 +111,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         if (r.job_id) {
           const { data: job } = await supabaseAdmin
             .from('maveloper_jobs')
-            .select('id,status,result_html')
+            .select('id,status,result_html,error_message')
             .eq('id', r.job_id)
             .maybeSingle();
 
@@ -134,8 +134,20 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
             continue;
           }
           if (js === 'failed') {
-            await settleFailed(r.id, 'Bridge/generation failed');
-            log('warn', 'Runner: settled failed (maveloper_jobs failed)', { id: r.id, order: r.order_id });
+            // v9.8.0: surface the REAL cause. maveloper_jobs.error_message holds the
+            // honest reason — the bridge/engine error, or the cc-runner quality-gate
+            // stderr (e.g. "QUALITY GATE FAILED (v2.7.13): IMAGE PARITY … · STRUCTURAL
+            // COLLAPSE …"). Copy it into os_queue.error_text (trimmed) so a lead can
+            // tell a design-quality failure from a bad-link/engine failure instead of
+            // seeing the useless generic string. The full text stays in maveloper_jobs.
+            // Guard: the __BRIDGE__:<id> dispatch tag is a side-channel, not a reason.
+            const rawReason = String(job.error_message || '').trim();
+            const meaningful = rawReason && !rawReason.startsWith('__BRIDGE__:') ? rawReason : '';
+            const reason = meaningful
+              ? meaningful.slice(0, 500)
+              : 'Bridge/generation failed — no detail returned';
+            await settleFailed(r.id, reason);
+            log('warn', 'Runner: settled failed (maveloper_jobs failed)', { id: r.id, order: r.order_id, reason: reason.slice(0, 160) });
             continue;
           }
           // still running/pending → in flight. Only intervene on the 35-min timeout (§3).
