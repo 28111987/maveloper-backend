@@ -815,7 +815,7 @@ function saturationOfHex(hex) {
  * Scans for src="...filename" where filename matches a key in imageUrlMap.
  * Reliable string replace, zero Claude guessing.
  */
-function fixImageUrls(html, imageUrlMap, imageDimensionsMap) {
+function fixImageUrls(html, imageUrlMap, imageDimensionsMap, options = {}) {
   if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
     return { html, replaced: 0, unmatched: [], sequentialFallbacks: 0, fallbackUsed: [] };
   }
@@ -864,6 +864,25 @@ function fixImageUrls(html, imageUrlMap, imageDimensionsMap) {
     // No exact match — leave for second pass to handle
     return match;
   });
+
+  // v9.7.0 (Figma gate §3): on the Figma/bridge path the spec already carries
+  // absolute Dropbox URLs, so any relative src left after pass 1 is an ANOMALY,
+  // not something to guess at. The positional fallback below can silently bind
+  // the WRONG image, so we skip it here and instead RETURN the leftover names
+  // (the caller logs a WARN). PDF path passes no options → fallback runs as before.
+  if (options.skipPositionalFallback) {
+    const leftover = [];
+    const scanRe = /\bsrc\s*=\s*["']([^"']+)["']/gi;
+    let sm;
+    while ((sm = scanRe.exec(output)) !== null) {
+      const s = sm[1];
+      if (/^(https?:|data:|cid:)/i.test(s)) continue;
+      const fn = s.split("/").pop();
+      if (!fn || /^spacer\.gif$/i.test(fn)) continue;
+      leftover.push(fn);
+    }
+    return { html: output, replaced, sequentialFallbacks: 0, fallbackUsed: [], unmatched: leftover };
+  }
 
   // v5.4.2: Second pass — sequential positional fallback.
   // For any remaining relative-path images, replace with images from the
@@ -2233,12 +2252,21 @@ function fixStackedHeadingRows(html) {
   return { html: output, fixes };
 }
 
-function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded, secondaryFont }) {
+function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsMap, zipWasUploaded, secondaryFont, mode = "pdf", requestId }) {
   const report = {};
   const hadRelativePaths = /src="images\//i.test(html);
 
-  // v5.4.2: fixImageUrls now has filename match + sequential positional fallback
-  const r1 = fixImageUrls(html, imageUrlMap, imageDimensionsMap);
+  // v9.7.0 — path mode gate. 'pdf' (default) runs the FULL deterministic pipeline
+  // exactly as before (byte-for-byte). 'figma' runs ONLY the HTML-hygiene subset,
+  // because the bridge output is already VALIDATED — the PDF/OCR/Stage-2-era
+  // colour/text/structure correctors must never override a validated design
+  // decision. See MAVELOPER_POSTPROCESS_GATE_SPEC.
+  const FIGMA_SAFE = mode === "figma";
+
+  // [RUN on both] Image URL fix — pass 1 (filename match). On Figma the positional
+  // fallback (pass 2) is DISABLED (it can silently mis-bind images); any leftover
+  // relative src is logged as a WARN instead of guessed at (§3).
+  const r1 = fixImageUrls(html, imageUrlMap, imageDimensionsMap, FIGMA_SAFE ? { skipPositionalFallback: true } : {});
   html = r1.html;
   report.imageUrls = {
     replaced: r1.replaced,
@@ -2246,93 +2274,191 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
     fallbackUsed: r1.fallbackUsed,
     unmatched: r1.unmatched,
   };
+  if (FIGMA_SAFE && r1.unmatched && r1.unmatched.length > 0) {
+    log("warn", "postProcess(figma): relative/non-http image src(s) left after filename match — NOT guessing (positional fallback disabled)", {
+      requestId,
+      leftover: r1.unmatched,
+    });
+  }
 
-  // v5.4.2: Convert Google Fonts @import to <link> in <head>
+  // [RUN on both] Convert Google Fonts @import to <link> in <head> — font-loading mechanics
   const rGFont = convertGoogleFontImportToLink(html);
   html = rGFont.html;
   report.googleFontLinkConvert = { fixes: rGFont.fixes };
 
-  // v5.4.2: Repair malformed self-closing img tags
+  // [RUN on both] Repair malformed self-closing img tags — malformed syntax
   const rImgMal = fixMalformedSelfClosingImg(html);
   html = rImgMal.html;
   report.malformedImgFix = { fixes: rImgMal.fixes };
 
-  // v5.4.2: Strip user-specified secondary font from body font-family stacks
-  const rSecFont = fixSecondaryFontInBodyStack(html, secondaryFont);
-  html = rSecFont.html;
-  report.secondaryFontStrip = { fixes: rSecFont.fixes };
+  if (!FIGMA_SAFE) {
+    // ── PDF/OCR/Stage-2-era transforms — SKIPPED on the Figma/bridge path (§2). ──
+    // Each can silently override a validated design decision. They run ONLY for
+    // the PDF pipeline (mode='pdf'), unchanged. Functions themselves are untouched.
 
-  // v5.4.2: Merge stacked-color heading rows into single cell with spans
-  const rStacked = fixStackedHeadingRows(html);
-  html = rStacked.html;
-  report.stackedHeadingMerge = { fixes: rStacked.fixes };
+    // v5.4.2: Strip user-specified secondary font from body font-family stacks
+    const rSecFont = fixSecondaryFontInBodyStack(html, secondaryFont);
+    html = rSecFont.html;
+    report.secondaryFontStrip = { fixes: rSecFont.fixes };
 
-  const r2 = rebindSectionColors(html, bandMap, palette);
-  html = r2.html;
-  report.rebindSectionColors = { rebound: r2.rebound, checked: r2.checked, skipped: r2.skipped };
+    // v5.4.2: Merge stacked-color heading rows into single cell with spans
+    const rStacked = fixStackedHeadingRows(html);
+    html = rStacked.html;
+    report.stackedHeadingMerge = { fixes: rStacked.fixes };
 
-  const r3 = fixNearWhite(html, palette);
-  html = r3.html;
-  report.nearWhite = { normalizedColors: r3.normalizedColors, count: r3.count };
+    const r2 = rebindSectionColors(html, bandMap, palette);
+    html = r2.html;
+    report.rebindSectionColors = { rebound: r2.rebound, checked: r2.checked, skipped: r2.skipped };
 
-  const r4 = forceAlertBarWarmBg(html, palette);
-  html = r4.html;
-  report.alertBarWarmBg = { fixes: r4.fixes };
+    const r3 = fixNearWhite(html, palette);
+    html = r3.html;
+    report.nearWhite = { normalizedColors: r3.normalizedColors, count: r3.count };
 
-  const r5 = fixAlertBarContrast(html);
-  html = r5.html;
-  report.alertBar = { fixes: r5.fixes };
+    const r4 = forceAlertBarWarmBg(html, palette);
+    html = r4.html;
+    report.alertBarWarmBg = { fixes: r4.fixes };
 
-  const r6 = universalTextContrast(html);
-  html = r6.html;
-  report.universalContrast = { fixes: r6.fixes };
+    const r5 = fixAlertBarContrast(html);
+    html = r5.html;
+    report.alertBar = { fixes: r5.fixes };
 
-  // Run accent-bg text AFTER universalTextContrast so brand-dark text isn't
-  // reverted by the generic luminance rule.
-  const r5b = fixAccentBgText(html, palette);
-  html = r5b.html;
-  report.accentBgText = { fixes: r5b.fixes };
+    const r6 = universalTextContrast(html);
+    html = r6.html;
+    report.universalContrast = { fixes: r6.fixes };
 
-  const r6b = fixCtaContrast(html);
-  html = r6b.html;
-  report.ctaContrast = { fixes: r6b.fixes };
+    // Run accent-bg text AFTER universalTextContrast so brand-dark text isn't
+    // reverted by the generic luminance rule.
+    const r5b = fixAccentBgText(html, palette);
+    html = r5b.html;
+    report.accentBgText = { fixes: r5b.fixes };
 
+    const r6b = fixCtaContrast(html);
+    html = r6b.html;
+    report.ctaContrast = { fixes: r6b.fixes };
+  }
+
+  // [RUN on both] Font-stack quote sanitizer — de-nest/de-dupe, PRESERVES first-seen order
   const r6c = fixFontStackQuotes(html);
   html = r6c.html;
   report.fontStackQuotes = { fixes: r6c.fixes };
 
-  const r6d = fixOcrCapitalI(html);
-  html = r6d.html;
-  report.ocrCapitalI = { fixes: r6d.fixes };
+  if (!FIGMA_SAFE) {
+    const r6d = fixOcrCapitalI(html);
+    html = r6d.html;
+    report.ocrCapitalI = { fixes: r6d.fixes };
 
-  // v5.2.2: Strip inline SVG/data-URL backgrounds that break style attribute parsing
-  const rSvg = fixInlineSvgDataUrl(html);
-  html = rSvg.html;
-  report.inlineSvgDataUrl = { fixes: rSvg.fixes, ulFixes: rSvg.ulFixes };
+    // v5.2.2: Strip inline SVG/data-URL backgrounds that break style attribute parsing
+    const rSvg = fixInlineSvgDataUrl(html);
+    html = rSvg.html;
+    report.inlineSvgDataUrl = { fixes: rSvg.fixes, ulFixes: rSvg.ulFixes };
 
-  // v5.2.2: Clamp image widths to min(placeholder, original)
-  const rDims = fixImageDimensions(html, imageDimensionsMap);
-  html = rDims.html;
-  report.imageDimensions = { fixes: rDims.fixes, skipped: rDims.skipped };
+    // v5.2.2: Clamp image widths to min(placeholder, original)
+    const rDims = fixImageDimensions(html, imageDimensionsMap);
+    html = rDims.html;
+    report.imageDimensions = { fixes: rDims.fixes, skipped: rDims.skipped };
 
-  const r7 = fixActivityFeed(html);
-  html = r7.html;
-  report.activityFeed = { fixes: r7.fixes };
+    const r7 = fixActivityFeed(html);
+    html = r7.html;
+    report.activityFeed = { fixes: r7.fixes };
 
-  const r8 = fixThinBands(html, palette, bandMap);
-  html = r8.html;
-  report.thinBands = { removed: r8.removed };
+    const r8 = fixThinBands(html, palette, bandMap);
+    html = r8.html;
+    report.thinBands = { removed: r8.removed };
 
-  // v5.2.2: Merge adjacent same-bg body_text / heading / bullet sections
-  const rMerge = mergeAdjacentSameBgSections(html);
-  html = rMerge.html;
-  report.mergedSections = { merges: rMerge.merges };
+    // v5.2.2: Merge adjacent same-bg body_text / heading / bullet sections
+    const rMerge = mergeAdjacentSameBgSections(html);
+    html = rMerge.html;
+    report.mergedSections = { merges: rMerge.merges };
 
-  html = addMissingZipWarning(html, imageUrlMap, hadRelativePaths);
-  // v5.2.2: Escalate to visible warning if ZIP was uploaded but upload failed
-  html = addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUploaded);
+    html = addMissingZipWarning(html, imageUrlMap, hadRelativePaths);
+    // v5.2.2: Escalate to visible warning if ZIP was uploaded but upload failed
+    html = addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUploaded);
+  }
 
+  report.mode = mode;
   return { html, report };
+}
+
+// =====================================================================
+// v9.7.0 — POST-POST-PROCESS ASSERTION (Figma path)
+//
+// The font bug survived because the validator is NOT the last gate — Railway
+// mutated the HTML after it passed. This asserts that the hygiene pass did not
+// break a validator guarantee. It NEVER hard-fails delivery — it logs an ERROR
+// and returns the violations so the caller can surface them (make it observable).
+//
+//   brandFont : every font-family that led with designSpec.brand_font BEFORE must
+//               still lead with it AFTER (count must not drop). Skipped when the
+//               spec has no brand_font (Arial-fallback designs).
+//   fontCount : number of font-family declarations unchanged.
+//   size      : byte count not dropped by more than 2%.
+//   imgCount  : number of <img unchanged.
+//   anchorCount: number of <a  unchanged.
+// =====================================================================
+function assertFigmaPostProcess(before, after, designSpec, { requestId, source = "figma" } = {}) {
+  const violations = [];
+  const countOf = (s, re) => (s.match(re) || []).length;
+
+  const ffRe = /font-family\s*:\s*([^;"}]+)/gi;
+  const leadCountWith = (s, brand) => {
+    if (!brand) return 0;
+    const b = brand.trim().toLowerCase();
+    let n = 0, m;
+    const re = new RegExp(ffRe.source, "gi");
+    while ((m = re.exec(s)) !== null) {
+      const first = m[1].split(",")[0].trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+      if (first === b) n++;
+    }
+    return n;
+  };
+
+  // brandFont — count must not drop
+  const brand = designSpec && designSpec.brand_font;
+  if (brand) {
+    const leadBefore = leadCountWith(before, brand);
+    const leadAfter = leadCountWith(after, brand);
+    if (leadAfter < leadBefore) {
+      violations.push(`brandFont: declarations leading with '${brand}' dropped ${leadBefore}→${leadAfter}`);
+    }
+  }
+
+  // fontCount
+  const ffBefore = countOf(before, /font-family\s*:/gi);
+  const ffAfter = countOf(after, /font-family\s*:/gi);
+  if (ffBefore !== ffAfter) {
+    violations.push(`fontCount: font-family declarations changed ${ffBefore}→${ffAfter}`);
+  }
+
+  // size (>2% drop)
+  if (before.length > 0) {
+    const dropPct = ((before.length - after.length) / before.length) * 100;
+    if (dropPct > 2) {
+      violations.push(`size: byte count dropped ${dropPct.toFixed(1)}% (${before.length}→${after.length})`);
+    }
+  }
+
+  // imgCount
+  const imgBefore = countOf(before, /<img\b/gi);
+  const imgAfter = countOf(after, /<img\b/gi);
+  if (imgBefore !== imgAfter) {
+    violations.push(`imgCount: <img> count changed ${imgBefore}→${imgAfter}`);
+  }
+
+  // anchorCount
+  const aBefore = countOf(before, /<a\b/gi);
+  const aAfter = countOf(after, /<a\b/gi);
+  if (aBefore !== aAfter) {
+    violations.push(`anchorCount: <a> count changed ${aBefore}→${aAfter}`);
+  }
+
+  if (violations.length > 0) {
+    log("error", "POST-PROCESS ASSERTION FAILED — post-processing altered validated HTML", {
+      requestId,
+      source,
+      violations,
+    });
+  }
+  return violations;
 }
 
 
@@ -5922,8 +6048,19 @@ ${specs.join("\n\n")}
       // it from every font-family stack, leaving only the Arial/Helvetica fallback.
       // Never default to the spec's font; when absent, strip nothing.
       secondaryFont: secondaryFont,
+      // v9.7.0: Figma/bridge path → hygiene-only. Skips every PDF/OCR/Stage-2-era
+      // colour/text/structure corrector so the validated design is never overridden.
+      mode: "figma",
+      requestId: req.id,
     });
     const html = postProcessResult.html;
+
+    // v9.7.0 (§5): assert the hygiene pass did not break a validator guarantee.
+    // Never hard-fails — logs ERROR + returns violations so they are observable.
+    const postProcessAssertions = assertFigmaPostProcess(html_raw, html, designSpec, {
+      requestId: req.id,
+      source: "generate-from-figma",
+    });
 
     log("info", "Figma generation complete", {
       requestId: req.id,
@@ -5962,6 +6099,9 @@ ${specs.join("\n\n")}
       },
       designSpec,
       warnings,
+      // v9.7.0 (§5): post-process assertion violations (empty array = clean). The
+      // async wrapper surfaces these into the job's progress_message for DB visibility.
+      postProcessAssertions,
       requestId: req.id,
     });
   } catch (err) {
@@ -6183,6 +6323,14 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
 
       if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
         // SUCCESS
+        // v9.7.0 (§5): surface post-process assertion violations into the job's
+        // progress_message so they are DB-visible via /job-status (not just in logs).
+        const ppAssertions = Array.isArray(result.body.postProcessAssertions)
+          ? result.body.postProcessAssertions
+          : [];
+        const progressMsg = ppAssertions.length > 0
+          ? `Generation complete in ${durationSec}s — POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
+          : `Generation complete in ${durationSec}s`;
         await updateJobStatus(jobId, {
           status: "completed",
           result_html: result.body.html,
@@ -6194,10 +6342,10 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
           // image_url_map columns (see migration note).
           order_id: result.body.orderId ?? null,
           image_url_map: result.body.imageUrlMap ?? null,
-          progress_message: `Generation complete in ${durationSec}s`,
+          progress_message: progressMsg,
           completed_at: new Date().toISOString(),
         }, requestId);
-        log("info", "Async job completed", { requestId, jobId, durationSec });
+        log("info", "Async job completed", { requestId, jobId, durationSec, postProcessViolations: ppAssertions.length });
       } else {
         // FAILURE — handler set non-2xx status or no html
         const errMsg = result.body?.error
@@ -6444,13 +6592,36 @@ app.post("/bridge-callback", async (req, res) => {
           })
           .eq("id", dbJobId);
       } else if (html) {
+        // v9.7.0 (§4): apply the SAME Figma hygiene pass the in-process handler
+        // applies, BEFORE persisting. This kills the restart-dependent delivery
+        // inconsistency: previously this durable write stored RAW bridge HTML while
+        // the normal path stored the (hygiene-processed) HTML — so the SAME job
+        // delivered different bytes depending on whether Railway restarted.
+        // NOTE: /bridge-callback has no designSpec/imageUrlMap context, so the
+        // hygiene pass here runs WITHOUT image-URL matching (the bridge already
+        // emits absolute Dropbox URLs, so pass-1 would be a no-op anyway) and the
+        // brand-font assertion is skipped (no designSpec → no brand_font to check);
+        // the count/size/img/anchor assertions still run for observability.
+        // Non-fatal: if post-processing throws, we store the raw html.
+        let finalHtml = html;
+        try {
+          finalHtml = postProcessHtml(html, { mode: "figma", requestId: req.id }).html;
+          assertFigmaPostProcess(html, finalHtml, null, { requestId: req.id, source: "bridge-callback" });
+        } catch (ppErr) {
+          log("warn", "/bridge-callback post-process failed; storing raw html (non-fatal)", {
+            requestId: req.id,
+            bridgeJobId,
+            error: ppErr.message,
+          });
+          finalHtml = html;
+        }
         await supabaseAdmin
           .from("maveloper_jobs")
           .update({
             status: "completed",
-            result_html: html,
+            result_html: finalHtml,
             error_message: null, // clear the __BRIDGE__ tag
-            progress_message: `Generation complete (${bytesGenerated || html.length} bytes, ${elapsedSeconds}s)`,
+            progress_message: `Generation complete (${finalHtml.length} bytes, ${elapsedSeconds}s)`,
             completed_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
