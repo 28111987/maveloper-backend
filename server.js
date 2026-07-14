@@ -17,6 +17,7 @@ import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrl
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
+import { createQueueRunner } from "./queue-runner.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -79,6 +80,14 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
 // the direct-API fallback path; BRIDGE_DEFAULT_MODEL is the short token sent
 // over to the Mac bridge's cc-runner CLI.
 const BRIDGE_DEFAULT_MODEL = process.env.BRIDGE_DEFAULT_MODEL || "opus";
+
+// v9.6.0 — server-side queue runner master switch. SHIPPED DARK: with this
+// unset or "false", the runner never starts and no runner-driven writes occur,
+// so backend behaviour is unchanged. Flip to "true" only AFTER the /os client
+// runner is disabled (never run both — they would double-dispatch). This flag
+// also gates the /approve dropbox_url write-back (spec §9) so the dark build is
+// byte-for-byte unchanged; see the note there.
+const RUNNER_ENABLED = process.env.RUNNER_ENABLED === "true";
 
 // =====================================================================
 // v8.0.0 — REFERENCE HTML LIBRARY
@@ -5999,214 +6008,249 @@ ${specs.join("\n\n")}
 //   status="completed", result_html=<string>, engine_used=<string>
 //   status="failed", error_message=<string>
 // =====================================================================
-app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req, res) => {
+//
+// v9.6.0 — startFigmaJobAsync: the reusable core of /generate-from-figma-async.
+// Extracted (behaviour-preserving) so BOTH the HTTP route and the server-side
+// queue runner (queue-runner.js) can start a generation without an HTTP hop.
+// The runner has no user JWT, so calling this in-process sidesteps auth entirely.
+//
+// Params:  { body, requestId, user, headers }  (headers/user optional — the
+//          runner passes {} / null; the HTTP route passes req.headers / req.user).
+// Returns: { statusCode:202, jobId, status, deduped? }        on success
+//          { statusCode, error, details }                     on validation/setup fail
+//
+// The background worker below is byte-for-byte the same logic as before; only the
+// req.* references became the passed-in params (req.body→body, req.id→requestId,
+// req.user→user, req.headers→headers). No generation logic changed.
+//
+async function startFigmaJobAsync({ body, requestId, user, headers }) {
+  body = body || {};
+  headers = headers || {};
+  const figmaUrl = body.figmaUrl;
+
+  if (!figmaUrl || typeof figmaUrl !== "string") {
+    return {
+      statusCode: 400,
+      error: "Missing figmaUrl",
+      details: "Request body must include a figmaUrl field with a Figma share link.",
+    };
+  }
+
+  if (!supabaseAdmin) {
+    return {
+      statusCode: 503,
+      error: "Async generation unavailable",
+      details: "Supabase is not configured on the backend. The async job table is required.",
+    };
+  }
+
+  // ── v9.4.0 DEDUP GUARD (duplicate-generation cascade) ───────────────
+  // Lovable can fire this endpoint twice for the same design in quick
+  // succession (double-submit / re-render / retry), spawning two ~20-min
+  // generations. Before creating a new job, return the id of a recent
+  // still-active job for the SAME figma_url instead of starting a second.
+  const DEDUP_WINDOW_MS = 120000; // 2 min — catches rapid double-fires and
+                                  // retry-after-timeout; gated on active
+                                  // status, so completed jobs never block a
+                                  // deliberate re-run, and stuck jobs self-heal.
   try {
-    const { figmaUrl } = req.body;
-
-    if (!figmaUrl || typeof figmaUrl !== "string") {
-      return res.status(400).json({
-        error: "Missing figmaUrl",
-        details: "Request body must include a figmaUrl field with a Figma share link.",
-        requestId: req.id,
-      });
-    }
-
-    if (!supabaseAdmin) {
-      return res.status(503).json({
-        error: "Async generation unavailable",
-        details: "Supabase is not configured on the backend. The async job table is required.",
-        requestId: req.id,
-      });
-    }
-
-    // ── v9.4.0 DEDUP GUARD (duplicate-generation cascade) ───────────────
-    // Lovable can fire this endpoint twice for the same design in quick
-    // succession (double-submit / re-render / retry), spawning two ~20-min
-    // generations. Before creating a new job, return the id of a recent
-    // still-active job for the SAME figma_url instead of starting a second.
-    const DEDUP_WINDOW_MS = 120000; // 2 min — catches rapid double-fires and
-                                    // retry-after-timeout; gated on active
-                                    // status, so completed jobs never block a
-                                    // deliberate re-run, and stuck jobs self-heal.
-    try {
-      const sinceIso = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
-      const { data: existing } = await supabaseAdmin
-        .from("maveloper_jobs")
-        .select("id, status, created_at")
-        .eq("figma_url", figmaUrl)
-        .in("status", ["pending", "running"])
-        .gte("created_at", sinceIso)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (existing && existing.id) {
-        log("info", "Dedup: returning existing active job for figma_url", {
-          requestId: req.id,
-          jobId: existing.id,
-          status: existing.status,
-          figmaUrl: figmaUrl.split("?")[0],
-        });
-        return res.status(202).json({
-          jobId: existing.id,
-          status: existing.status,
-          deduped: true,
-          requestId: req.id,
-        });
-      }
-    } catch (dedupErr) {
-      // Non-fatal: never block a real generation on the guard.
-      log("warn", "Dedup check failed; proceeding to create job", {
-        requestId: req.id,
-        error: dedupErr?.message,
-      });
-    }
-    // ── end dedup guard ─────────────────────────────────────────────────
-
-    // Create the job row immediately. We need the jobId before returning to Lovable.
-    const { data: job, error: insertErr } = await supabaseAdmin
+    const sinceIso = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
+    const { data: existing } = await supabaseAdmin
       .from("maveloper_jobs")
-      .insert({
-        status: "pending",
-        figma_url: figmaUrl,
-        progress_message: "Job created; waiting to start",
-      })
-      .select("id")
-      .single();
-
-    if (insertErr || !job) {
-      log("error", "Failed to create maveloper_jobs row", {
-        requestId: req.id,
-        error: insertErr?.message,
+      .select("id, status, created_at")
+      .eq("figma_url", figmaUrl)
+      .in("status", ["pending", "running"])
+      .gte("created_at", sinceIso)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (existing && existing.id) {
+      log("info", "Dedup: returning existing active job for figma_url", {
+        requestId,
+        jobId: existing.id,
+        status: existing.status,
+        figmaUrl: figmaUrl.split("?")[0],
       });
-      return res.status(500).json({
-        error: "Failed to create job",
-        details: "Could not initialize the async generation job in Supabase.",
-        requestId: req.id,
-      });
+      return {
+        statusCode: 202,
+        jobId: existing.id,
+        status: existing.status,
+        deduped: true,
+      };
     }
-
-    const jobId = job.id;
-
-    log("info", "Async Figma generation started", {
-      requestId: req.id,
-      jobId,
-      figmaUrl: figmaUrl.split("?")[0],
-      userId: req.user?.id ?? "anonymous",
+  } catch (dedupErr) {
+    // Non-fatal: never block a real generation on the guard.
+    log("warn", "Dedup check failed; proceeding to create job", {
+      requestId,
+      error: dedupErr?.message,
     });
+  }
+  // ── end dedup guard ─────────────────────────────────────────────────
 
-    // Return jobId immediately. Lovable starts polling /job-status/:jobId.
-    res.status(202).json({
-      jobId,
+  // Create the job row immediately. We need the jobId before returning to Lovable.
+  const { data: job, error: insertErr } = await supabaseAdmin
+    .from("maveloper_jobs")
+    .insert({
       status: "pending",
-      requestId: req.id,
+      figma_url: figmaUrl,
+      progress_message: "Job created; waiting to start",
+    })
+    .select("id")
+    .single();
+
+  if (insertErr || !job) {
+    log("error", "Failed to create maveloper_jobs row", {
+      requestId,
+      error: insertErr?.message,
     });
+    return {
+      statusCode: 500,
+      error: "Failed to create job",
+      details: "Could not initialize the async generation job in Supabase.",
+    };
+  }
 
-    // ──────────────────────────────────────────────────────────────
-    // Background work — runs after res.json() returns to the client.
-    // setImmediate ensures Node finishes flushing the response before
-    // we start the long-running task.
-    // ──────────────────────────────────────────────────────────────
-    setImmediate(async () => {
-      const bgStartTime = Date.now();
-      try {
+  const jobId = job.id;
+
+  log("info", "Async Figma generation started", {
+    requestId,
+    jobId,
+    figmaUrl: figmaUrl.split("?")[0],
+    userId: user?.id ?? "anonymous",
+  });
+
+  // ──────────────────────────────────────────────────────────────
+  // Background work — runs after the caller flushes its 202 response.
+  // setImmediate ensures Node finishes flushing the response before
+  // we start the long-running task.
+  // ──────────────────────────────────────────────────────────────
+  setImmediate(async () => {
+    const bgStartTime = Date.now();
+    try {
+      await updateJobStatus(jobId, {
+        status: "running",
+        progress_message: "Generation started; calling /generate-from-figma handler internally",
+      }, requestId);
+
+      // Build a fake request mirroring the real one. The existing
+      // /generate-from-figma handler will read req.body and req.id from it.
+      // v9.3.0: pass _maveloperJobId so callClaudeCodeBridge can tag the
+      // Supabase row with bridgeJobId, enabling restart-resilient callbacks.
+      const fakeReq = {
+        body: { ...body, _maveloperJobId: jobId },
+        id: requestId,
+        user: user,
+        headers: headers || {},
+        get: (h) => (headers ? headers[h.toLowerCase()] : undefined),
+      };
+
+      // Build a fake response object that captures status + body in memory.
+      const { res: fakeRes, result } = createFakeResponse();
+
+      // Invoke the synchronous handler. It will populate `result.body`
+      // when it finishes (success or error). This call can take 10-30 min.
+      // We DELIBERATELY do not await any Railway HTTP timeout here — the
+      // outer endpoint has already returned to the client.
+      const handlerEntry = app._router?.stack?.find((layer) =>
+        layer.route?.path === "/generate-from-figma" && layer.route?.methods?.post
+      );
+
+      if (!handlerEntry || !handlerEntry.route) {
+        throw new Error("/generate-from-figma route not found in Express router");
+      }
+
+      // The route's handler stack includes generateLimiter and optionalAuth
+      // before the actual handler. For the internal call we skip those —
+      // the user has already passed them on the async endpoint. Find the
+      // last handler in the route's stack (the actual generation handler).
+      const handlerStack = handlerEntry.route.stack;
+      const actualHandler = handlerStack[handlerStack.length - 1].handle;
+
+      await actualHandler(fakeReq, fakeRes, (err) => {
+        // Express "next" — only called on error inside the handler.
+        if (err) throw err;
+      });
+
+      // Handler completed. Inspect result.
+      const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
+
+      if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
+        // SUCCESS
         await updateJobStatus(jobId, {
-          status: "running",
-          progress_message: "Generation started; calling /generate-from-figma handler internally",
-        }, req.id);
-
-        // Build a fake request mirroring the real one. The existing
-        // /generate-from-figma handler will read req.body and req.id from it.
-        // v9.3.0: pass _maveloperJobId so callClaudeCodeBridge can tag the
-        // Supabase row with bridgeJobId, enabling restart-resilient callbacks.
-        const fakeReq = {
-          body: { ...req.body, _maveloperJobId: jobId },
-          id: req.id,
-          user: req.user,
-          headers: req.headers || {},
-          get: (h) => (req.headers ? req.headers[h.toLowerCase()] : undefined),
-        };
-
-        // Build a fake response object that captures status + body in memory.
-        const { res: fakeRes, result } = createFakeResponse();
-
-        // Invoke the synchronous handler. It will populate `result.body`
-        // when it finishes (success or error). This call can take 10-30 min.
-        // We DELIBERATELY do not await any Railway HTTP timeout here — the
-        // outer endpoint has already returned to the client.
-        const handlerEntry = app._router?.stack?.find((layer) =>
-          layer.route?.path === "/generate-from-figma" && layer.route?.methods?.post
-        );
-
-        if (!handlerEntry || !handlerEntry.route) {
-          throw new Error("/generate-from-figma route not found in Express router");
-        }
-
-        // The route's handler stack includes generateLimiter and optionalAuth
-        // before the actual handler. For the internal call we skip those —
-        // the user has already passed them on the async endpoint. Find the
-        // last handler in the route's stack (the actual generation handler).
-        const handlerStack = handlerEntry.route.stack;
-        const actualHandler = handlerStack[handlerStack.length - 1].handle;
-
-        await actualHandler(fakeReq, fakeRes, (err) => {
-          // Express "next" — only called on error inside the handler.
-          if (err) throw err;
-        });
-
-        // Handler completed. Inspect result.
-        const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
-
-        if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
-          // SUCCESS
-          await updateJobStatus(jobId, {
-            status: "completed",
-            result_html: result.body.html,
-            engine_used: result.body.engineUsed ?? null,
-            // v9.5.0: persist orderId + imageUrlMap so the frontend can call /approve.
-            // Both are produced during generation (result.body) but were previously
-            // dropped — /job-status returned result.orderId/imageUrlMap = undefined,
-            // so the frontend disabled the Approve button. Requires the order_id +
-            // image_url_map columns (see migration note).
-            order_id: result.body.orderId ?? null,
-            image_url_map: result.body.imageUrlMap ?? null,
-            progress_message: `Generation complete in ${durationSec}s`,
-            completed_at: new Date().toISOString(),
-          }, req.id);
-          log("info", "Async job completed", { requestId: req.id, jobId, durationSec });
-        } else {
-          // FAILURE — handler set non-2xx status or no html
-          const errMsg = result.body?.error
-            ? `${result.body.error}: ${result.body.details ?? ""}`.trim()
-            : `Handler returned status ${result.statusCode} with no html`;
-          await updateJobStatus(jobId, {
-            status: "failed",
-            error_message: errMsg.substring(0, 2000),
-            completed_at: new Date().toISOString(),
-          }, req.id);
-          log("warn", "Async job failed", {
-            requestId: req.id,
-            jobId,
-            statusCode: result.statusCode,
-            error: errMsg,
-            durationSec,
-          });
-        }
-      } catch (bgErr) {
-        const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
-        log("error", "Async job crashed", {
-          requestId: req.id,
-          jobId,
-          error: bgErr.message,
-          stack: bgErr.stack?.substring(0, 1000),
-          durationSec,
-        });
+          status: "completed",
+          result_html: result.body.html,
+          engine_used: result.body.engineUsed ?? null,
+          // v9.5.0: persist orderId + imageUrlMap so the frontend can call /approve.
+          // Both are produced during generation (result.body) but were previously
+          // dropped — /job-status returned result.orderId/imageUrlMap = undefined,
+          // so the frontend disabled the Approve button. Requires the order_id +
+          // image_url_map columns (see migration note).
+          order_id: result.body.orderId ?? null,
+          image_url_map: result.body.imageUrlMap ?? null,
+          progress_message: `Generation complete in ${durationSec}s`,
+          completed_at: new Date().toISOString(),
+        }, requestId);
+        log("info", "Async job completed", { requestId, jobId, durationSec });
+      } else {
+        // FAILURE — handler set non-2xx status or no html
+        const errMsg = result.body?.error
+          ? `${result.body.error}: ${result.body.details ?? ""}`.trim()
+          : `Handler returned status ${result.statusCode} with no html`;
         await updateJobStatus(jobId, {
           status: "failed",
-          error_message: `Internal error: ${bgErr.message}`.substring(0, 2000),
+          error_message: errMsg.substring(0, 2000),
           completed_at: new Date().toISOString(),
-        }, req.id);
+        }, requestId);
+        log("warn", "Async job failed", {
+          requestId,
+          jobId,
+          statusCode: result.statusCode,
+          error: errMsg,
+          durationSec,
+        });
       }
+    } catch (bgErr) {
+      const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
+      log("error", "Async job crashed", {
+        requestId,
+        jobId,
+        error: bgErr.message,
+        stack: bgErr.stack?.substring(0, 1000),
+        durationSec,
+      });
+      await updateJobStatus(jobId, {
+        status: "failed",
+        error_message: `Internal error: ${bgErr.message}`.substring(0, 2000),
+        completed_at: new Date().toISOString(),
+      }, requestId);
+    }
+  });
+
+  return { statusCode: 202, jobId, status: "pending" };
+}
+
+app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req, res) => {
+  try {
+    const result = await startFigmaJobAsync({
+      body: req.body,
+      requestId: req.id,
+      user: req.user,
+      headers: req.headers,
     });
+
+    if (result.error) {
+      return res.status(result.statusCode || 500).json({
+        error: result.error,
+        details: result.details,
+        requestId: req.id,
+      });
+    }
+
+    // Success (202). Mirror the previous response shape exactly, adding
+    // `deduped: true` only when the dedup guard short-circuited.
+    const payload = { jobId: result.jobId, status: result.status, requestId: req.id };
+    if (result.deduped) payload.deduped = true;
+    return res.status(202).json(payload);
   } catch (err) {
     log("error", "Async endpoint setup error", {
       requestId: req.id,
@@ -6546,6 +6590,38 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       durationMs: Date.now() - startTime,
     });
 
+    // v9.6.0 (spec §9) — PERSIST the Dropbox link onto the os_queue row so the
+    // "Dropbox" affordance on Completed cards works for everyone, not just the
+    // session that clicked Approve (the /os ApproveButton kept it in local React
+    // state only, so os_queue.dropbox_url was always null). Response is unchanged.
+    //
+    // GATED behind RUNNER_ENABLED so the DARK build is byte-for-byte unchanged:
+    // with the flag off, /approve writes nothing new to os_queue. This couples an
+    // otherwise-independent fix to the runner flag on purpose — flip both together,
+    // or ungate this block once you accept the extra write. Non-fatal either way.
+    if (RUNNER_ENABLED && supabaseAdmin && orderId) {
+      try {
+        const { error: dbxErr } = await supabaseAdmin
+          .from("os_queue")
+          .update({ dropbox_url: dropboxUrl })
+          .eq("order_id", orderId)
+          .eq("status", "delivered");
+        if (dbxErr) {
+          log("warn", "Approve: os_queue dropbox_url write-back failed (non-fatal)", {
+            requestId: req.id,
+            orderId,
+            error: dbxErr.message,
+          });
+        }
+      } catch (writeErr) {
+        log("warn", "Approve: os_queue dropbox_url write-back threw (non-fatal)", {
+          requestId: req.id,
+          orderId,
+          error: writeErr.message,
+        });
+      }
+    }
+
     res.json({
       dropboxUrl,
       orderId,
@@ -6569,6 +6645,48 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 });
 
 // =====================================================================
+// v9.6.0 — SERVER-SIDE QUEUE RUNNER (shipped DARK behind RUNNER_ENABLED)
+//
+// Drains os_queue headless so the queue processes with NO /os tab open. The
+// instance is ALWAYS constructed (so the routes below have something to talk
+// to), but .start() no-ops unless RUNNER_ENABLED === "true" — the dark build
+// never ticks, never heartbeats, never writes. See queue-runner.js.
+// =====================================================================
+const queueRunner = createQueueRunner({
+  supabaseAdmin,
+  startFigmaJobAsync,
+  log,
+  env: process.env,
+});
+
+// GET /runner/status — debug/observability, no auth. Reports the flag + last
+// heartbeat + live queue counts. Harmless when dark (runnerEnabled:false).
+app.get("/runner/status", async (req, res) => {
+  try {
+    const s = await queueRunner.status();
+    res.json({ ...s, requestId: req.id });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to read runner status", details: err.message, requestId: req.id });
+  }
+});
+
+// POST /queue/run-next — manual trigger (replaces the /os "Run next now" button).
+// Requires a Supabase JWT (reuse requireAuth). Forces ONE immediate tick. When
+// the runner is dark it does NOT dispatch — it reports disabled so the button
+// stays honest until the flag is flipped.
+app.post("/queue/run-next", requireAuth, async (req, res) => {
+  try {
+    if (!queueRunner.cfg.enabled) {
+      return res.json({ dispatched: null, reason: "runner disabled (RUNNER_ENABLED != true)", requestId: req.id });
+    }
+    const result = await queueRunner.tick();
+    res.json({ ...result, requestId: req.id });
+  } catch (err) {
+    res.status(500).json({ error: "run-next failed", details: err.message, requestId: req.id });
+  }
+});
+
+// =====================================================================
 // SERVER START + PROCESS HANDLERS
 // =====================================================================
 const server = app.listen(PORT, () => {
@@ -6580,6 +6698,10 @@ const server = app.listen(PORT, () => {
     figmaConfigured,
     rasterizeScale: RASTERIZE_SCALE,
   });
+  // Boot the queue runner. No-ops (just logs a DISABLED boot line) unless
+  // RUNNER_ENABLED === "true" — so the dark build's only visible effect is one
+  // extra log line at startup.
+  queueRunner.start();
 });
 
 server.timeout = SERVER_TIMEOUT_MS;
