@@ -6595,11 +6595,11 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     // session that clicked Approve (the /os ApproveButton kept it in local React
     // state only, so os_queue.dropbox_url was always null). Response is unchanged.
     //
-    // GATED behind RUNNER_ENABLED so the DARK build is byte-for-byte unchanged:
-    // with the flag off, /approve writes nothing new to os_queue. This couples an
-    // otherwise-independent fix to the runner flag on purpose — flip both together,
-    // or ungate this block once you accept the extra write. Non-fatal either way.
-    if (RUNNER_ENABLED && supabaseAdmin && orderId) {
+    // Standalone defect fix for the CURRENT client-driven flow — runs whenever the
+    // Dropbox upload succeeded, INDEPENDENT of RUNNER_ENABLED (ungated deliberately:
+    // os_queue.dropbox_url is dead today, so this must be live before the runner is).
+    // Non-fatal: a write failure only warns; the response payload is identical.
+    if (supabaseAdmin && orderId) {
       try {
         const { error: dbxErr } = await supabaseAdmin
           .from("os_queue")
