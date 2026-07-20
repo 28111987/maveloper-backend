@@ -3901,7 +3901,7 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, log }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, log }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
   }
@@ -3949,6 +3949,23 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     maveloperJobId: maveloperJobId || null,
     callbackUrl,
   };
+
+  // COMPILER FLIP — STEP 4: thread the Figma coordinates the parser already
+  // extracted from the placed design URL as an OPTIONAL nested object. The bridge
+  // and cc-runner treat this as additive: only when BOTH fileKey and nodeId are
+  // present is the deterministic compiler even eligible (and then only if the
+  // bridge's COMPILER_ENABLED flag is on and the pair is allow-listed). A payload
+  // without figma coordinates — e.g. the PDF /generate path — is byte-identical
+  // to today. designWidth rides along for the compiler's render width.
+  if (figmaFileKey && figmaNodeId) {
+    payload.figma = {
+      fileKey: figmaFileKey,
+      nodeId: figmaNodeId,
+      designWidth: (figmaDesignWidth === undefined || figmaDesignWidth === null || figmaDesignWidth === "")
+        ? null
+        : figmaDesignWidth,
+    };
+  }
 
   log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
     requestId,
@@ -5962,6 +5979,13 @@ ${specs.join("\n\n")}
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
           espPlatform: req.body?.espPlatform || "none",
+          // COMPILER FLIP — STEP 4: the Figma coordinates parsed for this order
+          // (fileKey, nodeId from figmaResult; finalWidth as the design width).
+          // Threaded so the bridge can offer this design to the deterministic
+          // compiler when it is enabled + allow-listed. Optional and additive.
+          figmaFileKey: fileKey,
+          figmaNodeId: nodeId,
+          figmaDesignWidth: finalWidth,
           log,
         });
       } catch (err) {
