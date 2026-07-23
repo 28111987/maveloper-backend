@@ -20,6 +20,18 @@ import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
+import {
+  sanitizeOrderId,
+  collectReferencedUrls,
+  basenameFromUrl,
+  localizeHtml,
+  detectDarkMode,
+  looksCompilerAuthored,
+  collectFonts,
+  deriveWordFatalLedger,
+  buildDeliveryNotes,
+  buildCertificateText,
+} from "./delivery-folder.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -371,13 +383,20 @@ function optionalAuth(req, res, next) {
 
 /**
  * Get the Dropbox folder path for an order.
- * Format: /maveloper/MM-YYYY/ORDER_ID
+ * Format: /maveloper/<YYYY>/<MM-YYYY>/<ORDER ID>   (Mavlers human-coded layout)
+ *
+ * The NEW <YYYY> level sits above the existing month folder so the year rolls
+ * over (a 2027 order lands under /maveloper/2027/01-2027/…) and the month keeps
+ * auto-rolling (08-2026 when August arrives) — both derived from `new Date()`.
+ * ALL Dropbox writes (generation images, preview, and the /approve delivery
+ * folder) go through this one function, so image/preview/html always share a
+ * folder keyed by the same order id.
  */
 function getDropboxFolderPath(orderId) {
   const now = new Date();
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const yyyy = now.getFullYear();
-  return `/maveloper/${mm}-${yyyy}/${orderId}`;
+  return `/maveloper/${yyyy}/${mm}-${yyyy}/${orderId}`;
 }
 
 /**
@@ -519,6 +538,80 @@ async function uploadZipToDropbox(orderId, zipBuffer, logFn) {
   }
 
   return shareUrl;
+}
+
+/**
+ * Upload one file into a delivery FOLDER (no per-file shared link). Folder-
+ * internal files (the html, images/, preview.png, the two .txt files) are
+ * referenced by the html as LOCAL relative paths, so they never need their own
+ * public link — only the folder gets one (createFolderShareLink). Overwrite mode
+ * so a re-approve replaces cleanly. Returns nothing; throws on hard failure.
+ */
+async function uploadFileToDropboxRaw(filePath, fileBuffer) {
+  await dbx.filesUpload({
+    path: filePath,
+    contents: fileBuffer,
+    mode: { ".tag": "overwrite" },
+    mute: true,
+  });
+}
+
+/**
+ * Does a Dropbox path already exist? Used to avoid clobbering a preview.png /
+ * certificate.txt that generation (or /bridge-callback) already co-located.
+ * Any error (incl. not_found) → false.
+ */
+async function dropboxPathExists(filePath) {
+  try {
+    await dbx.filesGetMetadata({ path: filePath });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy a Dropbox file from one path to another (overwrite dest). Best-effort:
+ * returns true on success, false on any failure. Used to pull a generation-time
+ * preview.png into the owner-named delivery folder when the two ended up keyed
+ * differently (the id-space fallback).
+ */
+async function dropboxCopyFile(fromPath, toPath) {
+  try {
+    // filesDownload then re-upload — filesCopyV2 fails if dest exists; download/
+    // upload-overwrite is idempotent and avoids that edge.
+    const dl = await dbx.filesDownload({ path: fromPath });
+    const buf = dl?.result?.fileBinary
+      ? Buffer.from(dl.result.fileBinary)
+      : (dl?.result?.fileBlob ? Buffer.from(await dl.result.fileBlob.arrayBuffer()) : null);
+    if (!buf) return false;
+    await uploadFileToDropboxRaw(toPath, buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Create (or retrieve) a public shared link for a delivery FOLDER and return the
+ * regular Dropbox share URL (nicer UX than a direct-download link; Dropbox zips
+ * the folder for the recipient on download — exactly the "loose folder" the owner
+ * wants). Mirrors the ZIP link logic in uploadZipToDropbox.
+ */
+async function createFolderShareLink(folderPath) {
+  try {
+    const linkResult = await dbx.sharingCreateSharedLinkWithSettings({
+      path: folderPath,
+      settings: { requested_visibility: { ".tag": "public" }, audience: { ".tag": "public" } },
+    });
+    return linkResult.result.url;
+  } catch (linkErr) {
+    if (linkErr?.error?.error?.[".tag"] === "shared_link_already_exists") {
+      const existing = await dbx.sharingListSharedLinks({ path: folderPath, direct_only: true });
+      if (existing.result.links.length > 0) return existing.result.links[0].url;
+    }
+    throw linkErr;
+  }
 }
 
 // =====================================================================
@@ -5559,9 +5652,21 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
 
     const { designSpec, imageRefs, fileName, sourceFrame, warnings, fileKey, nodeId, layoutMode } = figmaResult;
 
-    // --- Extract Order ID from frame name (Mavlers convention: OF/OID + digits) ---
+    // --- Resolve the Order ID (id-space reconciliation) -------------------
+    // PRIORITY 1: the OWNER-SUPPLIED order id from the request body. This is the
+    // name the /os queue stores as os_queue.order_id (e.g. "TEST23-1930") and the
+    // exact id /approve packages the delivery folder under. The queue runner
+    // passes it as jobBody.orderId; a caller may pass it directly. Honouring it
+    // HERE is the fix for the two-id-space split: generation-time images + preview
+    // upload to /maveloper/<YYYY>/<MM-YYYY>/<OWNER ID>/ and maveloper_jobs.order_id
+    // becomes the OWNER id, so the html and its images finally share ONE folder
+    // keyed the same way /approve keys the html.
+    // PRIORITY 2 (fallback, unchanged): derive from the frame name (OF/OID + 8+
+    // digits). PRIORITY 3: a synthetic FIGMA-<ts> so a nameless order still runs.
+    const bodyOrderId = sanitizeOrderId(req.body?.orderId);
     const orderIdMatch = sourceFrame.name?.match(/(?:OID|OF)\d{8,}/i);
-    const orderId = orderIdMatch ? orderIdMatch[0].toUpperCase() : `FIGMA-${Date.now()}`;
+    const orderId = bodyOrderId
+      || (orderIdMatch ? orderIdMatch[0].toUpperCase() : `FIGMA-${Date.now()}`);
 
     log("info", "Figma parse complete", {
       requestId: req.id,
@@ -6276,12 +6381,21 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
   // ── end dedup guard ─────────────────────────────────────────────────
 
   // Create the job row immediately. We need the jobId before returning to Lovable.
+  // ID-SPACE RECONCILIATION: persist the OWNER-SUPPLIED order id (when the caller
+  // provided one — the queue runner always does) at INSERT time. /bridge-callback
+  // fires DURING generation (before the handler returns and the completion write
+  // below runs), and it reads maveloper_jobs.order_id to key the compiler slice
+  // folder. Setting it here means those slices land in the OWNER folder, not a
+  // bridgeJobId fallback folder. Null when no order id was supplied (unchanged
+  // behaviour: the handler then derives one and the completion write records it).
+  const insertOrderId = sanitizeOrderId(body.orderId) || null;
   const { data: job, error: insertErr } = await supabaseAdmin
     .from("maveloper_jobs")
     .insert({
       status: "pending",
       figma_url: figmaUrl,
       progress_message: "Job created; waiting to start",
+      ...(insertOrderId ? { order_id: insertOrderId } : {}),
     })
     .select("id")
     .single();
@@ -6589,7 +6703,7 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets } = req.body || {};
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets, compilerCertificate } = req.body || {};
 
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
@@ -6780,6 +6894,32 @@ app.post("/bridge-callback", async (req, res) => {
         if (compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0) {
           await persistSliceMapToDrafts(supabaseAdmin, log, compilerOrderId, compilerImageUrlMap, req.id);
         }
+
+        // COMPILER CERTIFICATE (delivery folder): the bridge forwards the frozen
+        // compiler's proof numbers (certificate.json + delivered-file verdict) as
+        // `compilerCertificate`. Persist to maveloper_jobs.delivery_meta so /approve
+        // can render certificate.txt with REAL numbers. Written in its OWN update,
+        // wrapped in try/catch, AFTER the completed-write above: if the delivery_meta
+        // column has not been migrated yet the failure is isolated (the delivered
+        // result_html is already committed) and certificate.txt degrades to an honest
+        // "certificate not located" note. Inert on the LLM path (no compilerCertificate).
+        if (compilerCertificate && typeof compilerCertificate === "object") {
+          try {
+            const { error: dmErr } = await supabaseAdmin
+              .from("maveloper_jobs")
+              .update({ delivery_meta: { certificate: compilerCertificate, generatedBy: "compiler" } })
+              .eq("id", dbJobId);
+            if (dmErr) {
+              log("warn", "/bridge-callback delivery_meta write failed (column not migrated?) — certificate.txt will degrade gracefully", {
+                requestId: req.id, bridgeJobId, error: dmErr.message,
+              });
+            }
+          } catch (dmThrow) {
+            log("warn", "/bridge-callback delivery_meta write threw (non-fatal)", {
+              requestId: req.id, bridgeJobId, error: dmThrow.message,
+            });
+          }
+        }
       }
       log("info", "/bridge-callback wrote result to Supabase", {
         requestId: req.id,
@@ -6844,17 +6984,103 @@ app.post("/bridge-callback", async (req, res) => {
 });
 
 // -----------------------------------------------------------------
-// POST /approve — Package ZIP and upload to Dropbox
+// Resolve, SERVER-SIDE, everything the /approve delivery folder may need beyond
+// the request body: the durable image map, the id generation keyed artifacts by
+// (genOrderId), the ESP / dark-mode the order was queued with, and the compiler
+// proof certificate. This removes /approve's dependence on the frontend sending a
+// complete map — the owner cannot change the frontend, so the backend reconciles.
+//
+// Reconciliation of the two id spaces the owner found:
+//   - os_queue.order_id  = the OWNER-supplied name (== the `orderId` arg here)
+//   - os_queue.job_id    → maveloper_jobs.id  (the generation job)
+//   - maveloper_jobs.order_id = the id GENERATION keyed images/preview under
+// We first try maveloper_jobs matched directly on this order id (the reconciled
+// path, where generation already used the owner id). If that misses, we hop
+// os_queue.order_id → job_id → maveloper_jobs.id. Every step is best-effort and
+// tolerant: a missing table/column/row yields nulls, never an approve failure.
+// -----------------------------------------------------------------
+async function resolveApproveJobMeta(orderId, requestId) {
+  const meta = { imageUrlMap: null, genOrderId: null, certificate: null, esp: null, darkMode: null };
+  if (!supabaseAdmin || !orderId) return meta;
+
+  // os_queue: ESP + dark-mode + the job link.
+  let jobId = null;
+  try {
+    const { data: q } = await supabaseAdmin
+      .from("os_queue")
+      .select("job_id, esp, dark_mode")
+      .eq("order_id", orderId)
+      .limit(1)
+      .maybeSingle();
+    if (q) {
+      jobId = q.job_id || null;
+      meta.esp = q.esp ?? null;
+      meta.darkMode = q.dark_mode ?? null;
+    }
+  } catch (e) {
+    log("warn", "Approve: os_queue lookup failed (non-fatal)", { requestId, orderId, error: e.message });
+  }
+
+  // maveloper_jobs: durable image map + the generation order id. Try a direct
+  // order_id match first (reconciled path), then fall back to the job link.
+  const loadJob = async (filterCol, filterVal) => {
+    try {
+      const { data } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("id, order_id, image_url_map")
+        .eq(filterCol, filterVal)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      return data || null;
+    } catch (e) {
+      log("warn", "Approve: maveloper_jobs lookup failed (non-fatal)", { requestId, orderId, by: filterCol, error: e.message });
+      return null;
+    }
+  };
+  let job = await loadJob("order_id", orderId);
+  if (!job && jobId) job = await loadJob("id", jobId);
+  if (job) {
+    meta.imageUrlMap = job.image_url_map || null;
+    meta.genOrderId = job.order_id || null;
+
+    // Compiler certificate lives in maveloper_jobs.delivery_meta (jsonb), written
+    // by /bridge-callback from the bridge-forwarded compilerCertificate. Selected
+    // SEPARATELY so a not-yet-migrated column (absent) never fails the map load.
+    try {
+      const { data: dm } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("delivery_meta")
+        .eq("id", job.id)
+        .limit(1)
+        .maybeSingle();
+      if (dm && dm.delivery_meta && typeof dm.delivery_meta === "object") {
+        meta.certificate = dm.delivery_meta.certificate || null;
+      }
+    } catch {
+      // delivery_meta column not present (migration not run) → certificate stays
+      // null → certificate.txt states the compiler cert was not located. Honest.
+    }
+  }
+  return meta;
+}
+
+// -----------------------------------------------------------------
+// POST /approve — assemble the LOOSE delivery folder and upload to Dropbox
 // Called after dev reviews preview and clicks "Approve & Upload"
-// Accepts: { orderId, html, imageUrlMap, images? }
-// Returns: { dropboxUrl, orderId, requestId }
+// Accepts: { orderId, html, imageUrlMap?, espPlatform? }
+// Writes:  /maveloper/<YYYY>/<MM-YYYY>/<ORDER ID>/ with <ORDER ID>.html, images/,
+//          preview.png, delivery-notes.txt, certificate.txt (loose, not zipped)
+// Returns: { dropboxUrl, orderId, folderPath, imageCount, previewStatus, requestId }
 // -----------------------------------------------------------------
 app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { orderId, html, imageUrlMap } = req.body;
+    const rawOrderId = req.body.orderId;
+    const html = req.body.html;
+    const bodyImageUrlMap = req.body.imageUrlMap;
 
-    if (!orderId || !html) {
+    if (!rawOrderId || !html) {
       return res.status(400).json({
         error: "Missing required fields",
         details: "Request must include orderId and html.",
@@ -6870,62 +7096,142 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       });
     }
 
-    if (!imageUrlMap || Object.keys(imageUrlMap).length === 0) {
-      log("warn", "No imageUrlMap provided to /approve — building ZIP with HTML only", { requestId: req.id, orderId });
+    // The OWNER-SUPPLIED order id IS the delivery folder name (Mavlers convention).
+    const orderId = sanitizeOrderId(rawOrderId) || String(rawOrderId);
+    const folderPath = getDropboxFolderPath(orderId); // /maveloper/<YYYY>/<MM-YYYY>/<orderId>
+
+    // ── ID-SPACE RECONCILIATION + SERVER-SIDE MAP RESOLUTION ──────────────────
+    // The images/preview were uploaded during generation, possibly keyed by a
+    // DIFFERENT id (a frame-derived / FIGMA-<ts> id) than this owner id — that is
+    // the split the owner found in production. We resolve everything the folder
+    // needs WITHOUT depending on the frontend sending a map:
+    //   1. The delivered HTML is authoritative — it carries an absolute Dropbox URL
+    //      for every image the email references. We localise straight from it.
+    //   2. As a supplement we pull the durable map + generation id + compiler
+    //      certificate from maveloper_jobs (matched by this order id, or via the
+    //      os_queue.order_id → os_queue.job_id → maveloper_jobs.id link when the
+    //      generation id differs). All best-effort; the HTML alone is sufficient.
+    const jobMeta = await resolveApproveJobMeta(orderId, req.id);
+
+    // Build the URL → local-filename map. Priority for a filename: an explicit map
+    // entry (the basename generation uploaded under) wins; otherwise derive the
+    // basename from the URL. Deduped by URL; filename collisions get a numeric
+    // suffix so two different URLs never overwrite one images/ file.
+    const urlToFilename = {};
+    const takenNames = new Set();
+    const assignName = (url, preferred, idx) => {
+      let name = preferred || basenameFromUrl(url, idx);
+      if (takenNames.has(name)) {
+        const dot = name.lastIndexOf(".");
+        const stem = dot > 0 ? name.slice(0, dot) : name;
+        const ext = dot > 0 ? name.slice(dot) : "";
+        let n = 2;
+        while (takenNames.has(`${stem}_${n}${ext}`)) n++;
+        name = `${stem}_${n}${ext}`;
+      }
+      takenNames.add(name);
+      urlToFilename[url] = name;
+    };
+    // Explicit maps first (body map, then durable maveloper_jobs map) so their
+    // basenames are preferred, then any remaining URLs discovered in the HTML.
+    let idx = 0;
+    const seedFromMap = (map) => {
+      if (!map || typeof map !== "object") return;
+      for (const [filename, url] of Object.entries(map)) {
+        if (typeof url !== "string" || !/^https?:\/\//i.test(url)) continue;
+        if (urlToFilename[url]) continue;
+        assignName(url, filename, idx++);
+      }
+    };
+    seedFromMap(bodyImageUrlMap);
+    seedFromMap(jobMeta.imageUrlMap);
+    for (const url of collectReferencedUrls(html)) {
+      if (urlToFilename[url]) continue;
+      assignName(url, null, idx++);
     }
 
-    log("info", "Building delivery ZIP", { requestId: req.id, orderId });
+    const urlList = Object.keys(urlToFilename);
+    if (urlList.length === 0) {
+      log("warn", "Approve: no referenced image URLs found (html + maps empty) — folder will have html only", { requestId: req.id, orderId });
+    }
+    log("info", "Building delivery FOLDER", { requestId: req.id, orderId, folderPath, referencedImages: urlList.length });
 
-    // v5.5.0: parallel image downloads with bounded concurrency + per-fetch
-    // AbortController timeout. Sequential awaits previously caused the ZIP step
-    // to drag past Anthropic timeout on emails with 20+ images.
-    const images = [];
-    if (imageUrlMap && Object.keys(imageUrlMap).length > 0) {
-      const entries = Object.entries(imageUrlMap);
-      const downloaded = await mapWithConcurrency(entries, IMAGE_DOWNLOAD_CONCURRENCY, async ([filename, url]) => {
-        try {
-          const response = await fetchWithTimeout(url, IMAGE_DOWNLOAD_TIMEOUT_MS);
-          if (response.ok) {
-            const arrayBuffer = await response.arrayBuffer();
-            return { filename, buffer: Buffer.from(arrayBuffer) };
-          }
-          log("warn", `Failed to download image: ${filename}`, {
-            requestId: req.id,
-            status: response.status,
-            url: redactUrl(url),
-          });
-        } catch (dlErr) {
-          log("warn", `Failed to download image: ${filename}`, {
-            requestId: req.id,
-            error: dlErr.message,
-            aborted: dlErr.name === "AbortError",
-            url: redactUrl(url),
-          });
+    // Download every referenced image (bounded concurrency, per-fetch timeout).
+    const downloaded = await mapWithConcurrency(urlList, IMAGE_DOWNLOAD_CONCURRENCY, async (url) => {
+      const filename = urlToFilename[url];
+      try {
+        const response = await fetchWithTimeout(url, IMAGE_DOWNLOAD_TIMEOUT_MS);
+        if (response.ok) {
+          const arrayBuffer = await response.arrayBuffer();
+          return { filename, url, buffer: Buffer.from(arrayBuffer) };
         }
-        return null;
-      });
-      for (const item of downloaded) {
-        if (item) images.push(item);
+        log("warn", `Approve: failed to download image ${filename}`, { requestId: req.id, status: response.status, url: redactUrl(url) });
+      } catch (dlErr) {
+        log("warn", `Approve: failed to download image ${filename}`, { requestId: req.id, error: dlErr.message, aborted: dlErr.name === "AbortError", url: redactUrl(url) });
+      }
+      return null;
+    });
+    const images = downloaded.filter(Boolean);
+
+    // Localise ONLY the URLs we actually downloaded (a failed download stays an
+    // absolute URL rather than a dead local ref). This never mutates the caller's
+    // `html`; the delivered EMAIL keeps its absolute Dropbox URLs (two-copy split).
+    const localMap = {};
+    for (const img of images) localMap[img.url] = img.filename;
+    const localHtml = localizeHtml(html, localMap);
+
+    // ── Assemble delivery-notes.txt + certificate.txt from the DELIVERED bytes ──
+    // generatedBy: a stored compiler certificate is AUTHORITATIVE (only the compiler
+    // path forwards one). Fall back to the delivered-html marker (compiler additive
+    // pass comment) when no cert reached us — so a compiler order still reads as
+    // "compiler" (with an honest "certificate not located" note) even if the comment
+    // survived post-processing but the cert did not. No signal → LLM.
+    const generatedBy = (jobMeta.certificate || looksCompilerAuthored(html)) ? "compiler" : "llm";
+    const esp = jobMeta.esp || req.body.espPlatform || "none";
+    const darkMode = detectDarkMode(html) || jobMeta.darkMode === true;
+    const fonts = collectFonts(html);
+    const ledger = deriveWordFatalLedger(html);
+    const deliveryNotes = buildDeliveryNotes({
+      orderId, esp, darkMode, fonts, ledger, generatedBy,
+      imageCount: images.length, generatedAt: new Date().toISOString(),
+    });
+    const certificateText = buildCertificateText({ generatedBy, certificate: jobMeta.certificate, orderId });
+
+    // ── Write the LOOSE folder (no zip — Dropbox zips folders on download) ──────
+    await uploadFileToDropboxRaw(`${folderPath}/${orderId}.html`, Buffer.from(localHtml, "utf-8"));
+    for (const img of images) {
+      await uploadFileToDropboxRaw(`${folderPath}/images/${img.filename}`, img.buffer);
+    }
+    await uploadFileToDropboxRaw(`${folderPath}/delivery-notes.txt`, Buffer.from(deliveryNotes, "utf-8"));
+    await uploadFileToDropboxRaw(`${folderPath}/certificate.txt`, Buffer.from(certificateText, "utf-8"));
+
+    // preview.png: generation uploaded it to <genFolder>/preview.png. When the
+    // generation id equals this owner id (the reconciled path) it is ALREADY in
+    // this folder. Otherwise best-effort copy it across from the generation folder
+    // resolved via the job link; if neither works, note the absence (never fake it).
+    let previewStatus = "present";
+    const previewDest = `${folderPath}/preview.png`;
+    if (!(await dropboxPathExists(previewDest))) {
+      let copied = false;
+      if (jobMeta.genOrderId && jobMeta.genOrderId !== orderId) {
+        const genPreview = `${getDropboxFolderPath(jobMeta.genOrderId)}/preview.png`;
+        copied = await dropboxCopyFile(genPreview, previewDest);
+      }
+      previewStatus = copied ? "copied-from-generation-folder" : "absent";
+      if (!copied) {
+        log("warn", "Approve: preview.png not co-located and could not be resolved from the generation folder", {
+          requestId: req.id, orderId, genOrderId: jobMeta.genOrderId || null,
+        });
       }
     }
 
-    // Build ZIP
-    const zipBuffer = buildDeliveryZip(orderId, html, imageUrlMap, images);
+    // One public share link for the FOLDER (Dropbox zips it for the recipient on
+    // download — the loose-folder delivery the owner asked for).
+    const dropboxUrl = await createFolderShareLink(folderPath);
 
-    log("info", "ZIP built", {
-      requestId: req.id,
-      orderId,
-      zipSizeKB: Math.round(zipBuffer.length / 1024),
-      imageCount: images.length,
-    });
-
-    // Upload ZIP to Dropbox
-    const dropboxUrl = await uploadZipToDropbox(orderId, zipBuffer, log);
-
-    log("info", "ZIP uploaded to Dropbox", {
-      requestId: req.id,
-      orderId,
-      durationMs: Date.now() - startTime,
+    log("info", "Delivery folder uploaded to Dropbox", {
+      requestId: req.id, orderId, folderPath,
+      imageCount: images.length, previewStatus, generatedBy, durationMs: Date.now() - startTime,
     });
 
     // v9.6.0 (spec §9) — PERSIST the Dropbox link onto the os_queue row so the
@@ -6963,7 +7269,10 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     res.json({
       dropboxUrl,
       orderId,
-      zipSizeKB: Math.round(zipBuffer.length / 1024),
+      folderPath,
+      imageCount: images.length,
+      previewStatus,
+      generatedBy,
       requestId: req.id,
     });
 
