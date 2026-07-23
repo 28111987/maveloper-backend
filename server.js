@@ -19,6 +19,7 @@ import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
+import { persistSliceMapToDrafts } from "./drafts-persist.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -6058,6 +6059,21 @@ ${specs.join("\n\n")}
     // URLs and fixImageUrls (below) skips http(s): src, so only the ZIP copy differs.
     imageUrlMap = mergeCompilerSlices(imageUrlMap, compilerAssetSink.compilerImageUrlMap);
 
+    // COMPILER ZIP FIX v2 (drafts persist): the /approve ZIP is built from the
+    // imageUrlMap the FRONTEND loads from the `drafts` table (drafts.image_url_map,
+    // keyed by order_id) — NOT from result.body/maveloper_jobs, and NOT from os_queue
+    // (which has no image_url_map column). Threading the merged map through res.json
+    // alone therefore never reaches the table /approve reads. Persist it to `drafts`
+    // here on the in-memory (non-restart) delivery route. GATED on a non-empty compiler
+    // slice map → a no-op on every LLM/figma-only order (the frontend owns those draft
+    // rows, which persist byte-for-byte as today). Non-fatal: helper only logs on error.
+    if (
+      compilerAssetSink.compilerImageUrlMap &&
+      Object.keys(compilerAssetSink.compilerImageUrlMap).length > 0
+    ) {
+      await persistSliceMapToDrafts(supabaseAdmin, log, orderId, imageUrlMap, req.id);
+    }
+
     // --- Post-processing: most rules are no-ops on Figma path, but HTML
     //     hygiene rules (font stacks, malformed self-closing img, Google
     //     Fonts link conversion) still apply.
@@ -6618,6 +6634,10 @@ app.post("/bridge-callback", async (req, res) => {
   // durable write and the settle below are byte-for-byte identical to today.
   let deliverHtml = html;
   let compilerImageUrlMap = null;
+  // COMPILER ZIP FIX v2: the REAL order_id (never the bridgeJobId fallback), hoisted so
+  // the durable-write branch below can persist the slice map to the `drafts` row that
+  // /approve reads. Stays null on the LLM path and on compiler jobs with no order_id row.
+  let compilerOrderId = null;
   if (html && compilerAssets && typeof compilerAssets === "object" && Object.keys(compilerAssets).length > 0) {
     const assetCount = Object.keys(compilerAssets).length;
     if (!dropboxConfigured) {
@@ -6634,7 +6654,10 @@ app.post("/bridge-callback", async (req, res) => {
           try {
             const { data: orows } = await supabaseAdmin
               .from("maveloper_jobs").select("order_id").eq("id", dbJobId).limit(1);
-            if (orows && orows[0] && orows[0].order_id) assetOrderId = orows[0].order_id;
+            if (orows && orows[0] && orows[0].order_id) {
+              assetOrderId = orows[0].order_id;
+              compilerOrderId = orows[0].order_id; // real order_id for the drafts write
+            }
           } catch { /* keep bridgeJobId */ }
         }
         // Build the image list EXACTLY like the LLM path: [{ filename, buffer }].
@@ -6732,10 +6755,11 @@ app.post("/bridge-callback", async (req, res) => {
           .update({
             status: "completed",
             result_html: finalHtml,
-            // COMPILER ZIP FIX: on the restart/durable path the in-memory figma
-            // handler is gone, so this is the ONLY place the slice map can be
-            // persisted for a later /approve ZIP (read via /job-status). Spread is
-            // {} on every LLM-path callback (compilerImageUrlMap null), so the
+            // COMPILER ZIP FIX: mirror the slice map onto maveloper_jobs.image_url_map
+            // so /job-status (the Lovable poller) also sees it. NOTE: /approve does NOT
+            // read this column — it reads the `drafts` row (persisted just below). This
+            // maveloper_jobs write is kept for /job-status parity, not for the ZIP. Spread
+            // is {} on every LLM-path callback (compilerImageUrlMap null), so the
             // image_url_map column is left untouched — byte-identical to today.
             ...(compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0
               ? { image_url_map: compilerImageUrlMap }
@@ -6746,6 +6770,16 @@ app.post("/bridge-callback", async (req, res) => {
             updated_at: new Date().toISOString(),
           })
           .eq("id", dbJobId);
+
+        // COMPILER ZIP FIX v2 (drafts persist): the maveloper_jobs write above feeds
+        // /job-status; the /approve ZIP instead reads the map the frontend loads from
+        // the `drafts` table. On the restart/durable route the in-memory figma handler
+        // is gone, so this is the ONLY place the slice map can reach `drafts` for a later
+        // /approve. Same guard → inert on every LLM-path callback (compilerImageUrlMap
+        // null). Uses the REAL order_id only (compilerOrderId; null → helper no-ops).
+        if (compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0) {
+          await persistSliceMapToDrafts(supabaseAdmin, log, compilerOrderId, compilerImageUrlMap, req.id);
+        }
       }
       log("info", "/bridge-callback wrote result to Supabase", {
         requestId: req.id,
