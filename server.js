@@ -6572,7 +6572,7 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId } = req.body || {};
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets } = req.body || {};
 
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
@@ -6599,6 +6599,78 @@ app.post("/bridge-callback", async (req, res) => {
         bridgeJobId,
         error: e.message,
       });
+    }
+  }
+
+  // ── COMPILER slice-image upload (additive; INERT on the LLM path) ─────────
+  // On the deterministic-compiler path the bridge forwards `compilerAssets`: a
+  // { relativeSrc: base64PNG } map of the slice images that exist only on the
+  // laptop. Upload them with the SAME uploadImagesToDropbox() the PDF/Figma image
+  // path uses, then rewrite the delivered HTML's relative <img src> to the returned
+  // Dropbox URLs with the SAME fixImageUrls() postProcessHtml() uses. Doing it ONCE
+  // here — BEFORE both the durable Supabase write and the in-memory promise settle —
+  // makes BOTH delivery paths (the /generate-from-figma handler that awaits the
+  // promise, and the restart-fallback durable write) emit absolute, working URLs.
+  //
+  // When `compilerAssets` is absent (EVERY LLM-path callback) the block is skipped,
+  // `deliverHtml` stays === `html`, and `compilerImageUrlMap` stays null, so the
+  // durable write and the settle below are byte-for-byte identical to today.
+  let deliverHtml = html;
+  let compilerImageUrlMap = null;
+  if (html && compilerAssets && typeof compilerAssets === "object" && Object.keys(compilerAssets).length > 0) {
+    const assetCount = Object.keys(compilerAssets).length;
+    if (!dropboxConfigured) {
+      log("error", "/bridge-callback compiler assets present but Dropbox is not configured — delivered images will be broken", {
+        requestId: req.id, bridgeJobId, assetCount,
+      });
+    } else {
+      try {
+        // Derive an orderId for the Dropbox folder (best-effort; the folder is
+        // cosmetic — uploadToDropbox returns a self-contained direct URL regardless).
+        // Prefer the job row's order_id; fall back to the bridgeJobId.
+        let assetOrderId = bridgeJobId;
+        if (dbJobId && supabaseAdmin) {
+          try {
+            const { data: orows } = await supabaseAdmin
+              .from("maveloper_jobs").select("order_id").eq("id", dbJobId).limit(1);
+            if (orows && orows[0] && orows[0].order_id) assetOrderId = orows[0].order_id;
+          } catch { /* keep bridgeJobId */ }
+        }
+        // Build the image list EXACTLY like the LLM path: [{ filename, buffer }].
+        // Key by BASENAME — that is what fixImageUrls() matches (src.split('/').pop()).
+        // Dedupe by basename (unique within one design's slice set).
+        const byBase = new Map();
+        for (const [relSrc, b64] of Object.entries(compilerAssets)) {
+          if (typeof b64 !== "string") continue;
+          const filename = String(relSrc).split("/").pop();
+          if (!filename || byBase.has(filename)) continue;
+          byBase.set(filename, { filename, buffer: Buffer.from(b64, "base64") });
+        }
+        const images = [...byBase.values()];
+        compilerImageUrlMap = await uploadImagesToDropbox(assetOrderId, images, log);
+        const uploaded = Object.keys(compilerImageUrlMap).length;
+        // Rewrite the relative slice src → absolute Dropbox URL with the existing
+        // helper (skipPositionalFallback = the Figma-safe exact-basename match; it
+        // never touches http/https/data srcs, so it is idempotent downstream).
+        const rewrite = fixImageUrls(html, compilerImageUrlMap, null, { skipPositionalFallback: true });
+        deliverHtml = rewrite.html;
+        log("info", "/bridge-callback uploaded compiler slice images and rewrote src", {
+          requestId: req.id, bridgeJobId, orderId: assetOrderId,
+          assetCount, uploaded, srcReplaced: rewrite.replaced,
+          unmatched: rewrite.unmatched,
+        });
+        if (uploaded < images.length) {
+          log("warn", "/bridge-callback partial compiler-slice upload — some delivered images may be broken", {
+            requestId: req.id, bridgeJobId, uploaded, total: images.length,
+          });
+        }
+      } catch (e) {
+        log("error", "/bridge-callback compiler-slice upload failed — shipping HTML with relative paths (non-fatal)", {
+          requestId: req.id, bridgeJobId, error: e.message,
+        });
+        deliverHtml = html;
+        compilerImageUrlMap = null;
+      }
     }
   }
 
@@ -6639,17 +6711,20 @@ app.post("/bridge-callback", async (req, res) => {
         // brand-font assertion is skipped (no designSpec → no brand_font to check);
         // the count/size/img/anchor assertions still run for observability.
         // Non-fatal: if post-processing throws, we store the raw html.
-        let finalHtml = html;
+        // deliverHtml === html on the LLM path (compiler block above was skipped),
+        // so passing it + a null imageUrlMap is byte-identical to today; on the
+        // compiler path it is the slice-rewritten HTML with absolute Dropbox URLs.
+        let finalHtml = deliverHtml;
         try {
-          finalHtml = postProcessHtml(html, { mode: "figma", requestId: req.id }).html;
-          assertFigmaPostProcess(html, finalHtml, null, { requestId: req.id, source: "bridge-callback" });
+          finalHtml = postProcessHtml(deliverHtml, { imageUrlMap: compilerImageUrlMap || undefined, mode: "figma", requestId: req.id }).html;
+          assertFigmaPostProcess(deliverHtml, finalHtml, null, { requestId: req.id, source: "bridge-callback" });
         } catch (ppErr) {
           log("warn", "/bridge-callback post-process failed; storing raw html (non-fatal)", {
             requestId: req.id,
             bridgeJobId,
             error: ppErr.message,
           });
-          finalHtml = html;
+          finalHtml = deliverHtml;
         }
         await supabaseAdmin
           .from("maveloper_jobs")
@@ -6697,9 +6772,12 @@ app.post("/bridge-callback", async (req, res) => {
       log("info", "/bridge-callback settling in-memory promise (resolved)", {
         requestId: req.id,
         bridgeJobId,
-        bytesGenerated: bytesGenerated || html.length,
+        bytesGenerated: bytesGenerated || deliverHtml.length,
       });
-      settleBridgeJob(bridgeJobId, { html, bytesGenerated: bytesGenerated || html.length, elapsedSeconds });
+      // deliverHtml === html on the LLM path → identical to today; on the compiler
+      // path it is the slice-rewritten HTML the awaiting /generate-from-figma handler
+      // then post-processes (its fixImageUrls no-ops on the now-absolute slice URLs).
+      settleBridgeJob(bridgeJobId, { html: deliverHtml, bytesGenerated: bytesGenerated || deliverHtml.length, elapsedSeconds });
     } else {
       settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
     }
