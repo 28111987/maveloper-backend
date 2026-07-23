@@ -18,6 +18,7 @@ import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
+import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -710,31 +711,8 @@ async function extractImagesFromZip(zipBase64) {
 // ZIP PACKAGING
 // =====================================================================
 
-/**
- * Build the final deliverable ZIP containing:
- * - ORDER_ID.html (with relative image paths)
- * - images/ folder with all image files
- */
-function buildDeliveryZip(orderId, htmlWithDropboxUrls, imageUrlMap, images) {
-  const zip = new AdmZip();
-
-  // Swap Dropbox URLs back to relative paths in the HTML
-  let localHtml = htmlWithDropboxUrls;
-  for (const [filename, dropboxUrl] of Object.entries(imageUrlMap)) {
-    // Replace all occurrences of the Dropbox URL with relative path
-    localHtml = localHtml.split(dropboxUrl).join(`images/${filename}`);
-  }
-
-  // Add HTML file
-  zip.addFile(`${orderId}.html`, Buffer.from(localHtml, "utf-8"));
-
-  // Add images
-  for (const img of images) {
-    zip.addFile(`images/${img.filename}`, img.buffer);
-  }
-
-  return zip.toBuffer();
-}
+// buildDeliveryZip moved to ./zip-delivery.js (imported above) so it can be
+// unit-tested without booting the Express app. Same logic, same call site.
 
 // =====================================================================
 // ORDER ID EXTRACTION
@@ -3901,7 +3879,7 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, log }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, log, assetSink }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
   }
@@ -4054,6 +4032,15 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     bytesGenerated: result.bytesGenerated,
     elapsedSeconds: result.elapsedSeconds,
   });
+
+  // COMPILER ZIP FIX: hand the caller the slice-image map the /bridge-callback
+  // uploaded to Dropbox (compiler path only), via the optional out-param sink.
+  // The figma handler folds it into its imageUrlMap so the /approve ZIP localises
+  // the slice PNGs. Inert on the LLM path: result.compilerImageUrlMap is null
+  // there, so the sink is never touched and the return value is unchanged.
+  if (assetSink && result.compilerImageUrlMap && typeof result.compilerImageUrlMap === "object") {
+    assetSink.compilerImageUrlMap = result.compilerImageUrlMap;
+  }
 
   return result.html;
 }
@@ -5963,6 +5950,10 @@ ${specs.join("\n\n")}
 
     let html_raw;
     let engineUsed = requestedEngine;
+    // COMPILER ZIP FIX: out-param sink callClaudeCodeBridge fills with the slice
+    // map when the deterministic compiler ran (the bridge uploaded the slice PNGs
+    // to Dropbox in /bridge-callback). Stays empty on the LLM/fallback path.
+    const compilerAssetSink = {};
 
     if (requestedEngine === "claude-code") {
       // ─── Claude Code path (Mac bridge, Max 20× subscription) ───
@@ -5987,6 +5978,7 @@ ${specs.join("\n\n")}
           figmaNodeId: nodeId,
           figmaDesignWidth: finalWidth,
           log,
+          assetSink: compilerAssetSink,
         });
       } catch (err) {
         // v9.0.3: AI_ENGINE_NO_FALLBACK protects against silent Anthropic billing
@@ -6056,6 +6048,15 @@ ${specs.join("\n\n")}
 
       html_raw = stage2TextBlock.text;
     }
+
+    // COMPILER ZIP FIX: fold the compiler slice map (if the compiler ran) into
+    // imageUrlMap so it reaches result.body.imageUrlMap → /approve, whose ZIP then
+    // localises the slice PNGs into images/ exactly like the LLM node exports.
+    // INERT on the LLM/fallback path: compilerAssetSink is empty, so mergeCompilerSlices
+    // returns the SAME imageUrlMap object by reference (no new keys, byte-identical).
+    // The delivered EMAIL html is unaffected — html_raw already carries absolute slice
+    // URLs and fixImageUrls (below) skips http(s): src, so only the ZIP copy differs.
+    imageUrlMap = mergeCompilerSlices(imageUrlMap, compilerAssetSink.compilerImageUrlMap);
 
     // --- Post-processing: most rules are no-ops on Figma path, but HTML
     //     hygiene rules (font stacks, malformed self-closing img, Google
@@ -6731,6 +6732,14 @@ app.post("/bridge-callback", async (req, res) => {
           .update({
             status: "completed",
             result_html: finalHtml,
+            // COMPILER ZIP FIX: on the restart/durable path the in-memory figma
+            // handler is gone, so this is the ONLY place the slice map can be
+            // persisted for a later /approve ZIP (read via /job-status). Spread is
+            // {} on every LLM-path callback (compilerImageUrlMap null), so the
+            // image_url_map column is left untouched — byte-identical to today.
+            ...(compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0
+              ? { image_url_map: compilerImageUrlMap }
+              : {}),
             error_message: null, // clear the __BRIDGE__ tag
             progress_message: `Generation complete (${finalHtml.length} bytes, ${elapsedSeconds}s)`,
             completed_at: new Date().toISOString(),
@@ -6777,7 +6786,10 @@ app.post("/bridge-callback", async (req, res) => {
       // deliverHtml === html on the LLM path → identical to today; on the compiler
       // path it is the slice-rewritten HTML the awaiting /generate-from-figma handler
       // then post-processes (its fixImageUrls no-ops on the now-absolute slice URLs).
-      settleBridgeJob(bridgeJobId, { html: deliverHtml, bytesGenerated: bytesGenerated || deliverHtml.length, elapsedSeconds });
+      // COMPILER ZIP FIX: also hand back the slice map so the figma handler can fold
+      // it into result.body.imageUrlMap (→ /approve ZIP localises the slices). Null on
+      // the LLM path, so callClaudeCodeBridge leaves its assetSink untouched there.
+      settleBridgeJob(bridgeJobId, { html: deliverHtml, compilerImageUrlMap, bytesGenerated: bytesGenerated || deliverHtml.length, elapsedSeconds });
     } else {
       settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
     }
