@@ -69,7 +69,15 @@ export async function persistSliceMapToDrafts(supabaseAdmin, log, orderId, slice
 
     const rows = Array.isArray(data) ? data.length : 0;
     if (rows === 0) {
-      log("warn", "Approve-ZIP: no drafts row for order_id at write time — slice map NOT persisted (draft row not created yet?)", {
+      // DOWNGRADED warn -> info (TASK-6c): /approve now resolves the delivery folder
+      // SERVER-SIDE from the delivered HTML (the authority) and reads
+      // maveloper_jobs.image_url_map — it does NOT read drafts.image_url_map. Compiler
+      // orders are created via os_queue/maveloper_jobs and typically have NO drafts row,
+      // so a 0-row match here is EXPECTED, not a fault: the delivery is unaffected (the
+      // drafts map is only a redundant preferred-filename hint the frontend may load).
+      // Logged at info so it stops burying real problems (the ERROR branch above still
+      // fires loudly on a genuine schema-drift write failure).
+      log("info", "Approve: drafts.image_url_map not persisted (no drafts row for this order) — expected for compiler orders; /approve resolves from the delivered HTML server-side, so this is not a fault", {
         requestId, orderId, keys: Object.keys(sliceMap).length,
       });
       return { ok: false, reason: "no-row", rows: 0 };

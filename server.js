@@ -25,6 +25,7 @@ import {
   sanitizeOrderId,
   collectReferencedUrls,
   basenameFromUrl,
+  assignLocalFilenames,
   localizeHtml,
   planDeliveredImagesFolder,
   detectDarkMode,
@@ -7229,27 +7230,10 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     addMapPreferredNames(jobMeta.imageUrlMap);
 
     // Deduped by URL; filename collisions get a numeric suffix so two different
-    // URLs never overwrite one images/ file.
-    const urlToFilename = {};
-    const takenNames = new Set();
-    const assignName = (url, preferred, idx) => {
-      let name = preferred || basenameFromUrl(url, idx);
-      if (takenNames.has(name)) {
-        const dot = name.lastIndexOf(".");
-        const stem = dot > 0 ? name.slice(0, dot) : name;
-        const ext = dot > 0 ? name.slice(dot) : "";
-        let n = 2;
-        while (takenNames.has(`${stem}_${n}${ext}`)) n++;
-        name = `${stem}_${n}${ext}`;
-      }
-      takenNames.add(name);
-      urlToFilename[url] = name;
-    };
-    let idx = 0;
-    for (const url of collectReferencedUrls(html)) {
-      if (urlToFilename[url]) continue;
-      assignName(url, preferredName[url] || null, idx++);
-    }
+    // URLs never overwrite one images/ file. The assignment algorithm now lives in
+    // delivery-folder.js (assignLocalFilenames) so the REAL code — the one both the
+    // compiler AND the LLM path depend on — is unit-tested, not a test mirror.
+    const urlToFilename = assignLocalFilenames(collectReferencedUrls(html), preferredName);
 
     const urlList = Object.keys(urlToFilename);
     if (urlList.length === 0) {

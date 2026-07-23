@@ -4,6 +4,7 @@ import {
   sanitizeOrderId,
   collectReferencedUrls,
   basenameFromUrl,
+  assignLocalFilenames,
   localizeHtml,
   collectLocalImageNames,
   planDeliveredImagesFolder,
@@ -184,6 +185,98 @@ ok(reApprovePlan.remove.length === 1 && reApprovePlan.remove[0] === "leftover.pn
 
 // --- empty folder / no images → no removals, no throw ---
 ok(planDeliveredImagesFolder("<p>no images</p>", {}, []).remove.length === 0, "empty folder → nothing to remove");
+
+// ── assignLocalFilenames — the REAL /approve url→filename assignment ───
+// This function was inline in server.js (untested). It is now the ONE code path
+// both the compiler and the LLM delivery use to name images/ files. These tests
+// lock its contract: preferred name wins, url basename is the fallback, and two
+// DIFFERENT urls sharing a basename get a numeric suffix so neither is lost.
+{
+  // preferred name wins over the url basename
+  const a = assignLocalFilenames([`${dl}/x.png?rlkey=1&raw=1`], { [`${dl}/x.png?rlkey=1&raw=1`]: "hero-banner.png" });
+  ok(a[`${dl}/x.png?rlkey=1&raw=1`] === "hero-banner.png", "assign: preferred name wins");
+
+  // no preferred → url basename (query stripped)
+  const b = assignLocalFilenames([`${dl}/slice_1_5@2x.png?rlkey=z&raw=1`]);
+  ok(b[`${dl}/slice_1_5@2x.png?rlkey=z&raw=1`] === "slice_1_5@2x.png", "assign: falls back to url basename, query stripped");
+
+  // COLLISION: two different urls, same basename → second gets _2 (neither lost)
+  const u1 = `${dl}/AAA/logo.png?rlkey=a&raw=1`;
+  const u2 = `${dl}/BBB/logo.png?rlkey=b&raw=1`;
+  const c = assignLocalFilenames([u1, u2]);
+  ok(c[u1] === "logo.png" && c[u2] === "logo_2.png", "assign: colliding basenames get unique suffixes (_2)");
+  ok(new Set(Object.values(c)).size === 2, "assign: every url maps to a DISTINCT filename (no silent overwrite)");
+
+  // triple collision → _2, _3
+  const t = assignLocalFilenames([`${dl}/1/a.png`, `${dl}/2/a.png`, `${dl}/3/a.png`]);
+  ok(JSON.stringify(Object.values(t)) === JSON.stringify(["a.png", "a_2.png", "a_3.png"]), "assign: third collision → _3");
+
+  // preferred collides with an already-taken basename → still suffixed
+  const p = assignLocalFilenames([u1, u2], { [u2]: "logo.png" });
+  ok(p[u1] === "logo.png" && p[u2] === "logo_2.png", "assign: preferred that collides is still made unique");
+}
+
+// ── FULL LLM /approve PURE-PIPELINE ROUND-TRIP ────────────────────────
+// Rule-F guard: unit-passing functions coexisting with a broken integration is
+// exactly what shipped defects tonight. This replays the EXACT sequence /approve
+// runs (server.js POST /approve) for an LLM-shaped order — the delivered html
+// carries only ABSOLUTE Dropbox URLs (verified: the LLM path rewrites relatives to
+// absolute before delivery via fixImageUrls) — and asserts the delivered FOLDER is
+// coherent end-to-end: images all materialise, the localised html has NO dead refs
+// and NO absolute URLs left, the trim removes nothing (node exports ARE the
+// referenced files), the certificate is the honest "no certificate", and the notes
+// declare generatedBy=llm. If ANY single function drifts and breaks the LLM
+// round-trip, this goes RED even though its own unit test still passes.
+{
+  const EXPORTS = ["hero.png", "logo.png", "cta.png", "footer.png", "logo.png"]; // note dup basename from 2 frames
+  const urlOf = (n, i) => `${dl}/frame${i}/${n}?rlkey=k${i}&raw=1`;
+  let llmHtml = `<html><head><meta name="color-scheme" content="light dark">
+<style>@media (prefers-color-scheme: dark){.x{color:#fff}}</style></head><body>\n`;
+  const urls = EXPORTS.map((n, i) => urlOf(n, i));
+  for (const u of urls) llmHtml += `<img src="${u}" alt="">\n`;
+  llmHtml += "</body></html>";
+
+  // 1) server: build url→filename off the DELIVERED HTML (the authority)
+  const refUrls = collectReferencedUrls(llmHtml);
+  ok(refUrls.length === 5, `LLM e2e: 5 distinct referenced urls (got ${refUrls.length})`);
+  const urlToFilename = assignLocalFilenames(refUrls, {}); // LLM path: no durable map
+  // the two "logo.png" frames must not collide
+  ok(new Set(Object.values(urlToFilename)).size === 5, "LLM e2e: 5 distinct local filenames (dup basename disambiguated)");
+
+  // 2) server: materialise all → localMap == urlToFilename (assume all succeed)
+  const localHtml = localizeHtml(llmHtml, urlToFilename);
+  ok(!/https?:\/\//i.test(localHtml.replace(/googleapis/g, "")) || !localHtml.includes("dropboxusercontent"),
+    "LLM e2e: no absolute Dropbox URL remains in the delivered folder html");
+  // every referenced image resolves to a LOCAL images/<name> that is in the keep-set
+  const localNames = collectLocalImageNames(localHtml);
+  ok(localNames.length === 5, `LLM e2e: localised html references 5 local images (got ${localNames.length})`);
+  ok(localNames.every((n) => Object.values(urlToFilename).includes(n)),
+    "LLM e2e: every local ref in the html is a file we assigned (NO dead ref)");
+
+  // 3) server: trim images/ — generation uploaded exactly these node exports
+  const onDisk = Object.values(urlToFilename);
+  const plan = planDeliveredImagesFolder(llmHtml, urlToFilename, onDisk);
+  ok(plan.remove.length === 0, `LLM e2e: trim removes NOTHING (node exports ARE referenced) (got ${plan.remove.length})`);
+  ok(plan.keep.length === 5 && plan.keep.every((n) => onDisk.includes(n)), "LLM e2e: keep-set == every on-disk export");
+
+  // 4) server: generatedBy derived the SAME way as server.js — no cert, no marker → llm
+  const generatedBy = (null /* jobMeta.certificate */ || looksCompilerAuthored(llmHtml)) ? "compiler" : "llm";
+  ok(generatedBy === "llm", "LLM e2e: generatedBy resolves to 'llm' (no cert, no compiler marker)");
+
+  // 5) certificate.txt is the HONEST no-certificate note — never fabricated numbers
+  const cert = buildCertificateText({ generatedBy, certificate: null, orderId: "LEAD-0001" });
+  ok(/No certificate exists/i.test(cert), "LLM e2e: certificate.txt states no certificate exists");
+  ok(!/PROVEN|\d+\s*%|checks matched|SPEC-CONFORMANT/i.test(cert), "LLM e2e: certificate.txt fabricates NOTHING");
+
+  // 6) delivery-notes.txt generated, declares the LLM engine + real dark-mode read
+  const notes = buildDeliveryNotes({
+    orderId: "LEAD-0001", esp: "none", darkMode: detectDarkMode(llmHtml),
+    fonts: collectFonts(llmHtml), ledger: deriveWordFatalLedger(llmHtml),
+    generatedBy, imageCount: 5, generatedAt: "2026-07-24T00:00:00Z",
+  });
+  ok(notes.includes("Generated by:  llm"), "LLM e2e: delivery-notes declares generatedBy=llm");
+  ok(notes.includes("Dark-mode support:          YES"), "LLM e2e: delivery-notes reflects the html's real dark-mode block");
+}
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

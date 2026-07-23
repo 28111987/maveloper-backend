@@ -99,6 +99,41 @@ export function collectLocalImageNames(html) {
   return [...names];
 }
 
+// ── url → local-filename assignment ───────────────────────────────────
+// Assign each referenced URL a UNIQUE local images/<filename>. This is the exact
+// algorithm /approve used inline (server.js): prefer the caller-supplied name
+// (the basename generation uploaded under, which may carry meaningful casing),
+// else the basename derived from the URL; on a collision between two DIFFERENT
+// URLs that map to the same name, suffix the later one `_2`, `_3`, … so one
+// images/ file is never silently overwritten by a second URL. Extracted here so
+// the REAL assignment (not a test mirror) is unit-tested — the LLM path relies on
+// it just as much as the compiler path (two node exports from different frames
+// can share a basename). Deterministic + order-stable for a given URL list.
+//   `urls`          ordered, de-duplicated referenced URLs (collectReferencedUrls)
+//   `preferredName` { url -> preferred basename } from the frontend/durable maps
+// Returns { url -> assigned local filename }.
+export function assignLocalFilenames(urls, preferredName = {}) {
+  const urlToFilename = {};
+  const taken = new Set();
+  let idx = 0;
+  for (const url of urls || []) {
+    if (urlToFilename[url]) continue; // belt-and-suspenders (urls is deduped)
+    let name = (preferredName && preferredName[url]) || basenameFromUrl(url, idx);
+    if (taken.has(name)) {
+      const dot = name.lastIndexOf(".");
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : "";
+      let n = 2;
+      while (taken.has(`${stem}_${n}${ext}`)) n++;
+      name = `${stem}_${n}${ext}`;
+    }
+    taken.add(name);
+    urlToFilename[url] = name;
+    idx++;
+  }
+  return urlToFilename;
+}
+
 // ── images/ folder plan: the DELIVERED HTML is the sole authority ─────
 // Given the delivered html, the url→local-filename map used to localise it, and
 // the list of files CURRENTLY present in the delivery `images/` folder, decide
@@ -360,6 +395,7 @@ export default {
   sanitizeOrderId,
   collectReferencedUrls,
   basenameFromUrl,
+  assignLocalFilenames,
   localizeHtml,
   collectLocalImageNames,
   planDeliveredImagesFolder,
