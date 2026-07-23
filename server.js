@@ -20,6 +20,7 @@ import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
+import { pruneImages } from "./dropbox-prune.js";
 import {
   sanitizeOrderId,
   collectReferencedUrls,
@@ -156,6 +157,14 @@ const STAGE1_RETRY_INITIAL_BACKOFF_MS = 3000;
 const DROPBOX_BATCH_SIZE = 3;
 const DROPBOX_BATCH_RETRY_DELAY_MS = 2000;
 const DROPBOX_RETRY_INTERVAL_MS = 500;
+// images/ prune (dropbox-prune.js): how hard to retry a rate-limited delete, and
+// how long to poll a filesDeleteBatch async job before giving up (best-effort).
+const DROPBOX_DELETE_MAX_ATTEMPTS = 5;
+const DROPBOX_DELETE_POLL_INTERVAL_MS = 1000;
+const DROPBOX_DELETE_POLL_TIMEOUT_MS = 60 * 1000;
+// small pacing gap so the delete phase does not start while the API is still hot
+// from the ~25 shared-link metadata calls the materialisation loop just fired.
+const DROPBOX_PRUNE_PACING_MS = 750;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 30 * 1000;
 const IMAGE_DOWNLOAD_CONCURRENCY = 5;
 const STAGE1_RETRY_API_TIMEOUT_MS = 240 * 1000;     // 4 min for clean-regenerate retry
@@ -7381,23 +7390,36 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     // Best-effort: any list/delete failure is logged and skipped â€” the delivered
     // html still resolves every image (nothing referenced is ever a delete target),
     // the folder just keeps a few extra files. Never fatal to delivery.
+    //
+    // RATE-LIMIT DISCIPLINE (dropbox-prune.js): the first cut fired N concurrent
+    // filesDeleteV2 calls right after the ~25 shared-link metadata calls of the
+    // materialisation loop â€” Dropbox 429'd the whole burst and every delete was
+    // abandoned, so the folder kept its unreferenced files. Now we (1) pace a
+    // short gap so the delete phase does not start while the API is hot, then
+    // (2) delete ALL unreferenced files in ONE filesDeleteBatch call (polling its
+    // async job to completion), with 429 retry + Retry-After-honouring backoff
+    // around the batch, its poll, and the serialised per-file fallback. A per-entry
+    // failure is a skipped file, never fatal.
     try {
       const imagesFolder = `${folderPath}/images`;
       const existingNames = await dropboxListFolderNames(imagesFolder);
       const { remove } = planDeliveredImagesFolder(html, urlToFilename, existingNames);
       if (remove.length > 0) {
-        let nPruned = 0;
-        await mapWithConcurrency(remove, DROPBOX_BATCH_SIZE, async (name) => {
-          try {
-            await dbx.filesDeleteV2({ path: `${imagesFolder}/${name}` });
-            nPruned++;
-          } catch (delErr) {
-            log("warn", `Approve: could not prune unreferenced image ${name}`, { requestId: req.id, error: delErr?.message });
-          }
+        // pacing gap â€” let the API cool down after the metadata/copy burst
+        await sleepMs(DROPBOX_PRUNE_PACING_MS);
+        const { pruned, failed, mode } = await pruneImages(dbx, imagesFolder, remove, {
+          sleep: sleepMs,
+          log: (level, msg, meta) => log(level, msg, { requestId: req.id, orderId, ...(meta || {}) }),
+          maxAttempts: DROPBOX_DELETE_MAX_ATTEMPTS,
+          baseDelayMs: DROPBOX_BATCH_RETRY_DELAY_MS,
+          interFileMs: DROPBOX_RETRY_INTERVAL_MS,
+          pollIntervalMs: DROPBOX_DELETE_POLL_INTERVAL_MS,
+          pollTimeoutMs: DROPBOX_DELETE_POLL_TIMEOUT_MS,
         });
-        log("info", "Approve images/ trimmed to delivered-html reference set", {
-          requestId: req.id, orderId,
-          existing: existingNames.length, kept: existingNames.length - nPruned, pruned: nPruned,
+        log(failed > 0 ? "warn" : "info", "Approve images/ trimmed to delivered-html reference set", {
+          requestId: req.id, orderId, mode,
+          existing: existingNames.length, kept: existingNames.length - pruned, pruned,
+          failed, // > 0 means some unreferenced files survived the retries â€” folder still delivers
         });
       }
     } catch (pruneErr) {
