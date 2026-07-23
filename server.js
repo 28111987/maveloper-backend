@@ -25,6 +25,7 @@ import {
   collectReferencedUrls,
   basenameFromUrl,
   localizeHtml,
+  planDeliveredImagesFolder,
   detectDarkMode,
   looksCompilerAuthored,
   collectFonts,
@@ -568,6 +569,26 @@ async function dropboxPathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+/**
+ * List the FILE names (not subfolders) directly inside a Dropbox folder. Used by
+ * /approve to trim images/ to exactly the delivered-html reference set. Paginates
+ * so a large folder is fully enumerated. Throws on a hard failure (e.g. the folder
+ * does not exist) so the caller can decide to skip the trim (never fatal to
+ * delivery). Returns an array of bare filenames.
+ */
+async function dropboxListFolderNames(folderPath) {
+  const names = [];
+  let resp = await dbx.filesListFolder({ path: folderPath });
+  for (;;) {
+    for (const e of resp.result.entries) {
+      if (e[".tag"] === "file") names.push(e.name);
+    }
+    if (!resp.result.has_more) break;
+    resp = await dbx.filesListFolderContinue({ cursor: resp.result.cursor });
+  }
+  return names;
 }
 
 /**
@@ -7172,10 +7193,34 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     //      generation id differs). All best-effort; the HTML alone is sufficient.
     const jobMeta = await resolveApproveJobMeta(orderId, req.id);
 
-    // Build the URL â†’ local-filename map. Priority for a filename: an explicit map
-    // entry (the basename generation uploaded under) wins; otherwise derive the
-    // basename from the URL. Deduped by URL; filename collisions get a numeric
-    // suffix so two different URLs never overwrite one images/ file.
+    // Build the URL â†’ local-filename map. THE DELIVERED HTML IS THE AUTHORITY for
+    // WHICH images belong in the folder: only URLs the html actually references
+    // (collectReferencedUrls) are materialised. The explicit maps (frontend body
+    // map, durable maveloper_jobs map) supply only a PREFERRED filename for a
+    // referenced URL â€” the basename generation uploaded under â€” they never inject
+    // an image the html does not reference.
+    //
+    // Why "preferred filename only" and not "seed URLs from the map": for a
+    // COMPILER order the drafts/body map is the MERGED node-export+slice map
+    // (mergeCompilerSlices), so seeding URLs straight from it would drag the ~32
+    // unreferenced Figma NODE EXPORTS into images/ next to the 25 referenced
+    // slices â€” exactly the clutter the owner found. Driving the set off the
+    // delivered html keeps images/ to the referenced files and halves the
+    // materialisation work (no node-export round trips for a compiler order).
+    const preferredName = {};
+    const addMapPreferredNames = (map) => {
+      if (!map || typeof map !== "object") return;
+      for (const [filename, url] of Object.entries(map)) {
+        if (typeof url === "string" && /^https?:\/\//i.test(url) && !(url in preferredName)) {
+          preferredName[url] = filename;
+        }
+      }
+    };
+    addMapPreferredNames(bodyImageUrlMap);
+    addMapPreferredNames(jobMeta.imageUrlMap);
+
+    // Deduped by URL; filename collisions get a numeric suffix so two different
+    // URLs never overwrite one images/ file.
     const urlToFilename = {};
     const takenNames = new Set();
     const assignName = (url, preferred, idx) => {
@@ -7191,22 +7236,10 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       takenNames.add(name);
       urlToFilename[url] = name;
     };
-    // Explicit maps first (body map, then durable maveloper_jobs map) so their
-    // basenames are preferred, then any remaining URLs discovered in the HTML.
     let idx = 0;
-    const seedFromMap = (map) => {
-      if (!map || typeof map !== "object") return;
-      for (const [filename, url] of Object.entries(map)) {
-        if (typeof url !== "string" || !/^https?:\/\//i.test(url)) continue;
-        if (urlToFilename[url]) continue;
-        assignName(url, filename, idx++);
-      }
-    };
-    seedFromMap(bodyImageUrlMap);
-    seedFromMap(jobMeta.imageUrlMap);
     for (const url of collectReferencedUrls(html)) {
       if (urlToFilename[url]) continue;
-      assignName(url, null, idx++);
+      assignName(url, preferredName[url] || null, idx++);
     }
 
     const urlList = Object.keys(urlToFilename);
@@ -7329,6 +7362,48 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
           requestId: req.id, orderId, genOrderId: jobMeta.genOrderId || null,
         });
       }
+    }
+
+    // â”€â”€ TRIM images/ to EXACTLY the delivered-html reference set â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Generation Phase B uploaded THIS order's Figma NODE EXPORTS (layer-1.png,
+    // group-3.png, vector-2.png, blank-gif.png, â€¦) into <folder>/images/ BEFORE
+    // the html existed â€” they had to be reachable as absolute URLs for generation
+    // and the /bridge-callback src rewrite. For a COMPILER order the delivered html
+    // references ONLY the slice_*@2x.png files, so those node exports are now
+    // UNREFERENCED clutter (57 files where the html uses 25) and roughly double the
+    // lead's download. The DELIVERED HTML IS THE AUTHORITY: images/ must hold
+    // exactly what it references. We could not skip placing them (generation runs
+    // before the html), so we remove the unreferenced remainder now â€” after the
+    // referenced set is fully materialised and BEFORE the folder share link is made.
+    //   â€¢ COMPILER path: node exports pruned â†’ images/ == the referenced slices.
+    //   â€¢ LLM path: the node exports ARE the referenced files â†’ keep-set == every
+    //     file â†’ nothing removed (folder byte-identical to today).
+    // Best-effort: any list/delete failure is logged and skipped â€” the delivered
+    // html still resolves every image (nothing referenced is ever a delete target),
+    // the folder just keeps a few extra files. Never fatal to delivery.
+    try {
+      const imagesFolder = `${folderPath}/images`;
+      const existingNames = await dropboxListFolderNames(imagesFolder);
+      const { remove } = planDeliveredImagesFolder(html, urlToFilename, existingNames);
+      if (remove.length > 0) {
+        let nPruned = 0;
+        await mapWithConcurrency(remove, DROPBOX_BATCH_SIZE, async (name) => {
+          try {
+            await dbx.filesDeleteV2({ path: `${imagesFolder}/${name}` });
+            nPruned++;
+          } catch (delErr) {
+            log("warn", `Approve: could not prune unreferenced image ${name}`, { requestId: req.id, error: delErr?.message });
+          }
+        });
+        log("info", "Approve images/ trimmed to delivered-html reference set", {
+          requestId: req.id, orderId,
+          existing: existingNames.length, kept: existingNames.length - nPruned, pruned: nPruned,
+        });
+      }
+    } catch (pruneErr) {
+      log("warn", "Approve: images/ trim skipped (folder list failed) â€” delivered html still resolves, folder may carry extra files", {
+        requestId: req.id, orderId, error: pruneErr?.message,
+      });
     }
 
     // One public share link for the FOLDER (Dropbox zips it for the recipient on

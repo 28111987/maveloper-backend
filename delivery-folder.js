@@ -75,6 +75,66 @@ function safeDecode(s) {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 
+// ── already-local image references ────────────────────────────────────
+// The basenames the html references as LOCAL files (src="images/foo.png" /
+// url(images/foo.png)) rather than absolute URLs. Normally a freshly delivered
+// html carries only absolute URLs (localisation happens at /approve), so this is
+// [] — but a re-approve of an ALREADY-localised html, or a hand-edited delivery,
+// can carry local refs. Collected so the images/ trim NEVER deletes a file the
+// delivered html still points at, whichever form the reference takes.
+export function collectLocalImageNames(html) {
+  if (!html || typeof html !== "string") return [];
+  const names = new Set();
+  const add = (raw) => {
+    const u = String(raw || "").trim();
+    if (!u || /^https?:\/\//i.test(u) || /^data:/i.test(u)) return;
+    const m = /(?:^|\/)images\/([^/?#"')\s]+)/i.exec(u);
+    if (m && m[1]) names.add(safeDecode(m[1]));
+  };
+  const srcRe = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)')/gi;
+  let m;
+  while ((m = srcRe.exec(html)) !== null) add(m[1] || m[2]);
+  const urlRe = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+))\s*\)/gi;
+  while ((m = urlRe.exec(html)) !== null) add(m[1] || m[2] || m[3]);
+  return [...names];
+}
+
+// ── images/ folder plan: the DELIVERED HTML is the sole authority ─────
+// Given the delivered html, the url→local-filename map used to localise it, and
+// the list of files CURRENTLY present in the delivery `images/` folder, decide
+// which files must REMAIN (exactly the set the html references) and which are
+// UNREFERENCED and must be removed. This is the same "delivered html is the
+// authority" principle /approve already uses to build its local map — extended to
+// the folder on disk so images/ holds exactly what the html references, no more
+// and no fewer.
+//
+// Why it matters: generation uploads a compiler order's Figma NODE EXPORTS
+// (layer-1.png, group-3.png, vector-2.png, …) into the SAME order folder before
+// the html exists, but the delivered COMPILER html references ONLY the
+// slice_*@2x.png files. Those node exports are unreferenced clutter and must be
+// trimmed. On the LLM path the node exports ARE the referenced files → keep-set
+// == every file → `remove` is empty (folder byte-identical).
+//
+// Pure: no I/O. server.js lists the folder + performs the deletes; this decides.
+export function planDeliveredImagesFolder(html, urlToFilename, existingImageNames) {
+  const keep = new Set();
+  // (a) every absolute URL the delivered html references → its local basename.
+  //     Prefer the caller's assigned filename (carries collision suffixes); fall
+  //     back to the basename derived straight from the URL.
+  for (const url of collectReferencedUrls(html)) {
+    const name = (urlToFilename && urlToFilename[url]) || basenameFromUrl(url);
+    if (name) keep.add(name);
+  }
+  // (b) any already-local images/<name> ref in the html (re-approve / hand-edit).
+  for (const name of collectLocalImageNames(html)) keep.add(name);
+
+  const remove = [];
+  for (const name of existingImageNames || []) {
+    if (!keep.has(name)) remove.push(name);
+  }
+  return { keep: [...keep], remove };
+}
+
 // ── HTML localisation ─────────────────────────────────────────────────
 // Swap each absolute URL for its local `images/<filename>` path so the folder's
 // html references the co-located files (owner requirement). NEVER mutates the
@@ -301,6 +361,8 @@ export default {
   collectReferencedUrls,
   basenameFromUrl,
   localizeHtml,
+  collectLocalImageNames,
+  planDeliveredImagesFolder,
   detectDarkMode,
   looksCompilerAuthored,
   collectFonts,

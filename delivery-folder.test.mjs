@@ -5,6 +5,8 @@ import {
   collectReferencedUrls,
   basenameFromUrl,
   localizeHtml,
+  collectLocalImageNames,
+  planDeliveredImagesFolder,
   detectDarkMode,
   looksCompilerAuthored,
   collectFonts,
@@ -110,6 +112,78 @@ ok(compCert.includes("PASSED"), "compiler cert shows delivered-file verification
 const compNoNums = buildCertificateText({ generatedBy: "compiler", certificate: null });
 ok(/could not be located/i.test(compNoNums), "compiler w/o cert → honest 'could not be located'");
 ok(!/100\.00%|accuracy/i.test(compNoNums), "compiler w/o cert does not fabricate accuracy");
+
+// ── images/ trim: the DELIVERED HTML is the authority ─────────────────
+// Property under test: given a delivered html referencing a KNOWN SUBSET, only
+// that subset survives in images/ — for both a compiler-style and an LLM-style
+// html. Mirrors exactly what /approve does: build url→filename from the html,
+// then planDeliveredImagesFolder(html, map, <what is on disk>) → { keep, remove }.
+
+// helper: build the url→filename map the html-authoritative /approve builds
+const mapFromHtml = (h, preferred = {}) => {
+  const out = {};
+  for (const u of collectReferencedUrls(h)) out[u] = preferred[u] || basenameFromUrl(u);
+  return out;
+};
+
+// --- COMPILER-style: html references ONLY 25 slices; folder also holds 32 node
+//     exports uploaded by generation. Trim must drop the 32, keep the 25. ---
+const NODE_EXPORTS = [
+  "layer-1.png", "group-3.png", "vector-2.png", "ellipse-1.png", "frame-5.png",
+  "blank-gif.png", "bg-hero.png", "logo.png", "icon-1.png", "icon-2.png",
+  "shape-7.png", "shape-8.png", "rect-9.png", "rect-10.png", "star-11.png",
+  "path-12.png", "path-13.png", "img-14.png", "img-15.png", "img-16.png",
+  "img-17.png", "img-18.png", "img-19.png", "img-20.png", "img-21.png",
+  "img-22.png", "img-23.png", "img-24.png", "img-25.png", "img-26.png",
+  "img-27.png", "img-28.png",
+]; // 32 node exports
+const SLICES = Array.from({ length: 25 }, (_, i) => `slice_1_${i + 1}@2x.png`); // 25 slices
+
+let compilerHtmlTrim = "<html><body>\n";
+for (const s of SLICES) compilerHtmlTrim += `<img src="${dl}/${s}?rlkey=k${s}&raw=1" alt="">\n`;
+compilerHtmlTrim += "</body></html>";
+
+const compilerMap = mapFromHtml(compilerHtmlTrim);
+const onDiskCompiler = [...NODE_EXPORTS, ...SLICES]; // 57 files generation + bridge left behind
+const compilerPlan = planDeliveredImagesFolder(compilerHtmlTrim, compilerMap, onDiskCompiler);
+
+ok(compilerPlan.keep.length === 25, `compiler: keep-set is the 25 referenced slices (got ${compilerPlan.keep.length})`);
+ok(SLICES.every((s) => compilerPlan.keep.includes(s)), "compiler: every referenced slice is kept");
+ok(compilerPlan.remove.length === 32, `compiler: removes the 32 unreferenced node exports (got ${compilerPlan.remove.length})`);
+ok(NODE_EXPORTS.every((n) => compilerPlan.remove.includes(n)), "compiler: every node export is a delete target");
+ok(!compilerPlan.remove.some((n) => SLICES.includes(n)), "compiler: NO referenced slice is ever a delete target");
+// the surviving set == exactly the referenced subset (no more, no fewer)
+const survivingCompiler = onDiskCompiler.filter((n) => !compilerPlan.remove.includes(n)).sort();
+ok(JSON.stringify(survivingCompiler) === JSON.stringify([...SLICES].sort()), "compiler: images/ ends up == exactly the delivered subset");
+// and the localised html resolves every one of those survivors (nothing dead)
+const compilerLocal = localizeHtml(compilerHtmlTrim, compilerMap);
+ok(!compilerLocal.includes("dl.dropboxusercontent.com"), "compiler: localised html has no absolute image URLs left");
+ok(SLICES.every((s) => compilerLocal.includes(`images/${s}`)), "compiler: localised html references every surviving slice locally");
+
+// --- LLM-style: html references the node exports themselves. Trim must keep ALL
+//     of them and remove NOTHING (byte-identical folder). ---
+let llmHtmlTrim = "<html><body>\n";
+for (const n of NODE_EXPORTS) llmHtmlTrim += `<img src="${dl}/${n}?rlkey=k${n}&raw=1" alt="">\n`;
+llmHtmlTrim += "</body></html>";
+
+const llmMap = mapFromHtml(llmHtmlTrim);
+const onDiskLlm = [...NODE_EXPORTS]; // generation uploaded exactly what the html uses
+const llmPlan = planDeliveredImagesFolder(llmHtmlTrim, llmMap, onDiskLlm);
+ok(llmPlan.remove.length === 0, `LLM: nothing removed — node exports ARE referenced (got ${llmPlan.remove.length})`);
+ok(llmPlan.keep.length === 32 && NODE_EXPORTS.every((n) => llmPlan.keep.includes(n)), "LLM: keep-set is every node export");
+
+// --- guards: never delete a referenced file even when the folder is a superset ---
+const llmPlusStray = planDeliveredImagesFolder(llmHtmlTrim, llmMap, [...NODE_EXPORTS, "stray-orphan.png"]);
+ok(llmPlusStray.remove.length === 1 && llmPlusStray.remove[0] === "stray-orphan.png", "LLM: an unreferenced stray is removed, referenced exports kept");
+
+// --- re-approve: an ALREADY-localised html (images/<name> local refs) must not
+//     have its local files deleted (collectLocalImageNames keeps them). ---
+ok(JSON.stringify(collectLocalImageNames(compilerLocal).sort()) === JSON.stringify([...SLICES].sort()), "collectLocalImageNames finds images/<name> refs");
+const reApprovePlan = planDeliveredImagesFolder(compilerLocal, {}, [...SLICES, "leftover.png"]);
+ok(reApprovePlan.remove.length === 1 && reApprovePlan.remove[0] === "leftover.png", "re-approve: local image refs kept, only true orphan removed");
+
+// --- empty folder / no images → no removals, no throw ---
+ok(planDeliveredImagesFolder("<p>no images</p>", {}, []).remove.length === 0, "empty folder → nothing to remove");
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
