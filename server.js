@@ -571,15 +571,74 @@ async function dropboxPathExists(filePath) {
 }
 
 /**
+ * SERVER-SIDE copy of one Dropbox file to another path IN THE SAME ACCOUNT, with
+ * overwrite semantics. The bytes never leave Dropbox (no Railway download/upload).
+ * filesCopyV2 refuses to overwrite (throws to/conflict/file), so on a dest conflict
+ * (a re-approve) we delete the stale destination and re-copy â€” idempotent, and the
+ * delivered bytes always match the source. Throws if the copy cannot be done
+ * server-side (e.g. the source path is not in this account); callers decide the
+ * fallback. Returns "copied" | "overwritten" on success.
+ */
+async function dbxServerCopyOverwrite(fromPath, toPath) {
+  try {
+    await dbx.filesCopyV2({ from_path: fromPath, to_path: toPath, autorename: false });
+    return "copied";
+  } catch (e) {
+    const summary = e?.error?.error_summary || e?.error_summary || "";
+    if (/to\/conflict/.test(summary)) {
+      try { await dbx.filesDeleteV2({ path: toPath }); } catch {}
+      await dbx.filesCopyV2({ from_path: fromPath, to_path: toPath, autorename: false });
+      return "overwritten";
+    }
+    throw e;
+  }
+}
+
+/**
+ * Resolve a Dropbox SHARE URL (as embedded in delivered html:
+ *   https://dl.dropboxusercontent.com/scl/fi/HASH/name?rlkey=KEY&raw=1)
+ * back to its PATH in THIS Dropbox account, so it can be server-side-copied
+ * instead of downloaded+re-uploaded. Uses sharingGetSharedLinkMetadata, whose
+ * `path_lower` is populated ONLY when the linked file lives in the authenticated
+ * account â€” which is exactly the "is this our file?" test we need. Returns the
+ * path string, or null for any non-Dropbox URL, a link we do NOT own, or any
+ * error (caller then falls back to download+upload â€” no image is ever dropped).
+ */
+async function resolveDropboxPathFromShareUrl(url) {
+  if (typeof url !== "string" || !/dropbox(usercontent)?\.com/i.test(url)) return null;
+  // Normalise the direct-download variant back to the canonical share form the
+  // metadata API expects: dl.dropboxusercontent.com -> www.dropbox.com, raw/dl=1 -> dl=0.
+  let shareUrl = url.replace("dl.dropboxusercontent.com", "www.dropbox.com");
+  if (shareUrl.includes("raw=1")) shareUrl = shareUrl.replace("raw=1", "dl=0");
+  else if (shareUrl.includes("dl=1")) shareUrl = shareUrl.replace("dl=1", "dl=0");
+  try {
+    const md = await dbx.sharingGetSharedLinkMetadata({ url: shareUrl });
+    const res = md?.result;
+    if (res && res[".tag"] === "file") return res.path_lower || res.path_display || null;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Copy a Dropbox file from one path to another (overwrite dest). Best-effort:
- * returns true on success, false on any failure. Used to pull a generation-time
- * preview.png into the owner-named delivery folder when the two ended up keyed
- * differently (the id-space fallback).
+ * returns true on success, false on any failure. Prefers a SERVER-SIDE copy (no
+ * Railway bandwidth); only if that is impossible does it fall back to the original
+ * download + re-upload. Used to pull a generation-time preview.png into the
+ * owner-named delivery folder when the two ended up keyed differently.
  */
 async function dropboxCopyFile(fromPath, toPath) {
   try {
-    // filesDownload then re-upload â€” filesCopyV2 fails if dest exists; download/
-    // upload-overwrite is idempotent and avoids that edge.
+    await dbxServerCopyOverwrite(fromPath, toPath);
+    return true;
+  } catch (copyErr) {
+    log("warn", "dropboxCopyFile: server-side copy failed, falling back to download+upload", {
+      fromPath, toPath, error: copyErr?.message,
+    });
+  }
+  try {
+    // filesDownload then re-upload â€” the pre-existing fallback path.
     const dl = await dbx.filesDownload({ path: fromPath });
     const buf = dl?.result?.fileBinary
       ? Buffer.from(dl.result.fileBinary)
@@ -7156,24 +7215,69 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     }
     log("info", "Building delivery FOLDER", { requestId: req.id, orderId, folderPath, referencedImages: urlList.length });
 
-    // Download every referenced image (bounded concurrency, per-fetch timeout).
-    const downloaded = await mapWithConcurrency(urlList, IMAGE_DOWNLOAD_CONCURRENCY, async (url) => {
+    // â”€â”€ MATERIALISE images/ â€” server-side COPY first, download only as fallback â”€â”€
+    // For every referenced URL, place the file at <folder>/images/<basename>:
+    //   â€¢ in-place  â€” the URL already resolves to that exact path (the reconciled
+    //                 owner-folder case): nothing to do, zero round trips.
+    //   â€¢ copy      â€” the URL is a file in THIS Dropbox account at a DIFFERENT path
+    //                 (a FIGMA-<ts> / previous-month generation folder): SERVER-SIDE
+    //                 filesCopyV2 places it directly; the bytes never touch Railway.
+    //   â€¢ download  â€” genuinely external, or a link we do not own / cannot resolve:
+    //                 the pre-existing download+upload path, so NO image is dropped.
+    // This is what turned ~50 Railway round trips (25 down + 25 up) into 0 for a
+    // normal all-in-account order. Per-file route + total time are logged so the
+    // owner can SEE the win.
+    // Concurrency = DROPBOX_BATCH_SIZE: the copy/metadata calls hit the Dropbox API
+    // (stricter limits than the CDN download endpoint), so we keep the SAME batch
+    // discipline generation already uses, not the larger CDN-download concurrency.
+    const imagesStart = Date.now();
+    let nInPlace = 0, nCopy = 0, nDownload = 0, nFailed = 0;
+    const materialized = await mapWithConcurrency(urlList, DROPBOX_BATCH_SIZE, async (url) => {
       const filename = urlToFilename[url];
+      const destPath = `${folderPath}/images/${filename}`;
+      // 1) Zero-bandwidth path: is this URL a file we own? Resolve its account path.
+      const srcPath = await resolveDropboxPathFromShareUrl(url);
+      if (srcPath) {
+        if (srcPath.toLowerCase() === destPath.toLowerCase()) {
+          nInPlace++;
+          log("info", `Approve image [in-place] ${filename}`, { requestId: req.id, path: destPath });
+          return { url, filename, route: "in-place" };
+        }
+        try {
+          const how = await dbxServerCopyOverwrite(srcPath, destPath);
+          nCopy++;
+          log("info", `Approve image [copy:${how}] ${filename}`, { requestId: req.id, from: srcPath, to: destPath });
+          return { url, filename, route: "copy" };
+        } catch (copyErr) {
+          log("warn", `Approve image copy failed, falling back to download ${filename}`, { requestId: req.id, from: srcPath, error: copyErr?.message });
+          // fall through to the download route
+        }
+      }
+      // 2) Fallback: download to Railway, then re-upload (external, or copy failed).
       try {
         const response = await fetchWithTimeout(url, IMAGE_DOWNLOAD_TIMEOUT_MS);
         if (response.ok) {
           const arrayBuffer = await response.arrayBuffer();
-          return { filename, url, buffer: Buffer.from(arrayBuffer) };
+          await uploadFileToDropboxRaw(destPath, Buffer.from(arrayBuffer));
+          nDownload++;
+          log("info", `Approve image [download] ${filename}`, { requestId: req.id, url: redactUrl(url) });
+          return { url, filename, route: "download" };
         }
         log("warn", `Approve: failed to download image ${filename}`, { requestId: req.id, status: response.status, url: redactUrl(url) });
       } catch (dlErr) {
         log("warn", `Approve: failed to download image ${filename}`, { requestId: req.id, error: dlErr.message, aborted: dlErr.name === "AbortError", url: redactUrl(url) });
       }
-      return null;
+      nFailed++;
+      return null; // dropped â†’ stays an absolute URL in the html (never a dead local ref)
     });
-    const images = downloaded.filter(Boolean);
+    const images = materialized.filter(Boolean);
+    log("info", "Approve images step complete", {
+      requestId: req.id, orderId,
+      referenced: urlList.length, inPlace: nInPlace, copied: nCopy, downloaded: nDownload, failed: nFailed,
+      imagesMs: Date.now() - imagesStart,
+    });
 
-    // Localise ONLY the URLs we actually downloaded (a failed download stays an
+    // Localise ONLY the URLs we actually materialised (a failed one stays an
     // absolute URL rather than a dead local ref). This never mutates the caller's
     // `html`; the delivered EMAIL keeps its absolute Dropbox URLs (two-copy split).
     const localMap = {};
@@ -7198,12 +7302,14 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     const certificateText = buildCertificateText({ generatedBy, certificate: jobMeta.certificate, orderId });
 
     // â”€â”€ Write the LOOSE folder (no zip â€” Dropbox zips folders on download) â”€â”€â”€â”€â”€â”€
-    await uploadFileToDropboxRaw(`${folderPath}/${orderId}.html`, Buffer.from(localHtml, "utf-8"));
-    for (const img of images) {
-      await uploadFileToDropboxRaw(`${folderPath}/images/${img.filename}`, img.buffer);
-    }
-    await uploadFileToDropboxRaw(`${folderPath}/delivery-notes.txt`, Buffer.from(deliveryNotes, "utf-8"));
-    await uploadFileToDropboxRaw(`${folderPath}/certificate.txt`, Buffer.from(certificateText, "utf-8"));
+    // The images/ files are ALREADY in place (copied server-side or downloaded above).
+    // The remaining three writes are independent paths, so upload them in parallel â€”
+    // three small files, well under any Dropbox rate limit.
+    await Promise.all([
+      uploadFileToDropboxRaw(`${folderPath}/${orderId}.html`, Buffer.from(localHtml, "utf-8")),
+      uploadFileToDropboxRaw(`${folderPath}/delivery-notes.txt`, Buffer.from(deliveryNotes, "utf-8")),
+      uploadFileToDropboxRaw(`${folderPath}/certificate.txt`, Buffer.from(certificateText, "utf-8")),
+    ]);
 
     // preview.png: generation uploaded it to <genFolder>/preview.png. When the
     // generation id equals this owner id (the reconciled path) it is ALREADY in
