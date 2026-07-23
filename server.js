@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -35,7 +35,7 @@ import {
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
-// but Node's fetch reads the response body lazily — closing the Agent before
+// but Node's fetch reads the response body lazily â€” closing the Agent before
 // .json() reads the body kills the in-flight read. Global dispatcher avoids
 // this entirely; the agent stays alive for the process lifetime.
 const BRIDGE_LONG_TIMEOUT_MS = 45 * 60 * 1000;
@@ -69,7 +69,7 @@ if (!dropboxConfigured) {
 }
 
 // v6.0.0: Figma API token for the /generate-from-figma endpoint.
-// Optional — if not set, only the PDF /generate endpoint is available.
+// Optional â€” if not set, only the PDF /generate endpoint is available.
 const FIGMA_API_TOKEN = process.env.FIGMA_API_TOKEN;
 const figmaConfigured = Boolean(FIGMA_API_TOKEN);
 if (!figmaConfigured) {
@@ -83,11 +83,11 @@ const PORT = process.env.PORT || 3000;
 // v7.0.0: Default to Claude Opus 4.7 for stronger layout reasoning from
 // the multimodal Stage 2 input (JSON spec + Figma render image). To switch
 // back to Sonnet without redeploy: set CLAUDE_MODEL=claude-sonnet-4-5 in
-// Railway env vars and restart. Cost trade-off: Opus is ~10× per generation
+// Railway env vars and restart. Cost trade-off: Opus is ~10Ã— per generation
 // but materially better at multi-step layout reasoning.
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
 
-// Charter §1.1 — bridge path defaults to Opus. Env override allows Sonnet
+// Charter Â§1.1 â€” bridge path defaults to Opus. Env override allows Sonnet
 // experimentation without redeploy. Short-token form ("opus"/"sonnet"/"haiku")
 // to match the bridge resolver's allowlist (bridge-server.mjs ALLOWED_MODELS).
 // Distinct from CLAUDE_MODEL above: CLAUDE_MODEL is the full Anthropic ID for
@@ -95,18 +95,18 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-7";
 // over to the Mac bridge's cc-runner CLI.
 const BRIDGE_DEFAULT_MODEL = process.env.BRIDGE_DEFAULT_MODEL || "opus";
 
-// v9.6.0 — server-side queue runner master switch. SHIPPED DARK: with this
+// v9.6.0 â€” server-side queue runner master switch. SHIPPED DARK: with this
 // unset or "false", the runner never starts and no runner-driven writes occur,
 // so backend behaviour is unchanged. Flip to "true" only AFTER the /os client
-// runner is disabled (never run both — they would double-dispatch). This flag
-// also gates the /approve dropbox_url write-back (spec §9) so the dark build is
+// runner is disabled (never run both â€” they would double-dispatch). This flag
+// also gates the /approve dropbox_url write-back (spec Â§9) so the dark build is
 // byte-for-byte unchanged; see the note there.
 const RUNNER_ENABLED = process.env.RUNNER_ENABLED === "true";
 
 // =====================================================================
-// v8.0.0 — REFERENCE HTML LIBRARY
+// v8.0.0 â€” REFERENCE HTML LIBRARY
 //
-// Map Figma fileKey → human-coded HTML reference path. When a request
+// Map Figma fileKey â†’ human-coded HTML reference path. When a request
 // arrives for one of these files, Stage 2 receives the human-coded
 // HTML as a few-shot example, instructed to MATCH ITS STYLISTIC
 // PATTERNS (bordered cards, capsule pills, vertical-line dividers,
@@ -120,7 +120,7 @@ const RUNNER_ENABLED = process.env.RUNNER_ENABLED === "true";
 // =====================================================================
 const __dirname_v8 = path.dirname(fileURLToPath(import.meta.url));
 const REFERENCE_LIBRARY = {
-  // Arsenal Pulse — Candidate Intelligence Report
+  // Arsenal Pulse â€” Candidate Intelligence Report
   "GPBtdVIKA5RMOHK3TITYvZ": path.join(__dirname_v8, "references", "arsenal-pulse.html"),
   // Add more entries as human-coded references become available
 };
@@ -144,12 +144,12 @@ const MAX_PDF_BYTES = 5 * 1024 * 1024;        // 5 MB
 const MAX_ZIP_BYTES = 25 * 1024 * 1024;        // 25 MB for image assets ZIP
 const MAX_PAGES = 10;
 const RASTERIZE_TIMEOUT_MS = 60 * 1000;
-const ANTHROPIC_TIMEOUT_MS = 480 * 1000;   // 8 min — complex emails with 32K max_tokens need more time
-const SERVER_TIMEOUT_MS = 600 * 1000;      // 10 min — must exceed Anthropic timeout + Dropbox upload time
+const ANTHROPIC_TIMEOUT_MS = 480 * 1000;   // 8 min â€” complex emails with 32K max_tokens need more time
+const SERVER_TIMEOUT_MS = 600 * 1000;      // 10 min â€” must exceed Anthropic timeout + Dropbox upload time
 const RASTERIZE_SCALE = 1.6;
 const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
-// v5.5.0 tunables — extracted from inline magic numbers
+// v5.5.0 tunables â€” extracted from inline magic numbers
 const STAGE1_MAX_RETRIES = 3;
 const STAGE1_RETRY_INITIAL_BACKOFF_MS = 3000;
 const DROPBOX_BATCH_SIZE = 3;
@@ -158,7 +158,7 @@ const DROPBOX_RETRY_INTERVAL_MS = 500;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 30 * 1000;
 const IMAGE_DOWNLOAD_CONCURRENCY = 5;
 const STAGE1_RETRY_API_TIMEOUT_MS = 240 * 1000;     // 4 min for clean-regenerate retry
-const SHUTDOWN_DRAIN_TIMEOUT_MS = 180 * 1000;       // 3 min — must allow in-flight Stage 2 to finish
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 180 * 1000;       // 3 min â€” must allow in-flight Stage 2 to finish
 
 const ALLOWED_ORIGINS = [
   "https://maveloper.vercel.app",
@@ -294,12 +294,12 @@ const supabaseConfigured = Boolean(
 
 if (!supabaseConfigured) {
   console.warn(
-    "WARNING: Supabase env vars missing — auth middleware will reject all protected requests. " +
+    "WARNING: Supabase env vars missing â€” auth middleware will reject all protected requests. " +
     "Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_JWT_SECRET in Railway Variables."
   );
 }
 
-// Admin Supabase client — used server-side for writes that bypass RLS.
+// Admin Supabase client â€” used server-side for writes that bypass RLS.
 // Only reach for this when necessary (audit logs, orchestrated multi-table writes).
 // Prefer user-scoped queries from the frontend whenever possible.
 const supabaseAdmin = supabaseConfigured
@@ -372,7 +372,7 @@ function optionalAuth(req, res, next) {
     });
     req.user = { id: decoded.sub, email: decoded.email, role: decoded.role };
   } catch {
-    // Ignore — treat as anonymous.
+    // Ignore â€” treat as anonymous.
   }
   next();
 }
@@ -386,8 +386,8 @@ function optionalAuth(req, res, next) {
  * Format: /maveloper/<YYYY>/<MM-YYYY>/<ORDER ID>   (Mavlers human-coded layout)
  *
  * The NEW <YYYY> level sits above the existing month folder so the year rolls
- * over (a 2027 order lands under /maveloper/2027/01-2027/…) and the month keeps
- * auto-rolling (08-2026 when August arrives) — both derived from `new Date()`.
+ * over (a 2027 order lands under /maveloper/2027/01-2027/â€¦) and the month keeps
+ * auto-rolling (08-2026 when August arrives) â€” both derived from `new Date()`.
  * ALL Dropbox writes (generation images, preview, and the /approve delivery
  * folder) go through this one function, so image/preview/html always share a
  * folder keyed by the same order id.
@@ -396,7 +396,7 @@ function getDropboxFolderPath(orderId) {
   const now = new Date();
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const yyyy = now.getFullYear();
-  return `/maveloper/${yyyy}/${mm}-${yyyy}/${orderId}`;
+  return `/${yyyy}/${mm}-${yyyy}/${orderId}`;
 }
 
 /**
@@ -544,7 +544,7 @@ async function uploadZipToDropbox(orderId, zipBuffer, logFn) {
  * Upload one file into a delivery FOLDER (no per-file shared link). Folder-
  * internal files (the html, images/, preview.png, the two .txt files) are
  * referenced by the html as LOCAL relative paths, so they never need their own
- * public link — only the folder gets one (createFolderShareLink). Overwrite mode
+ * public link â€” only the folder gets one (createFolderShareLink). Overwrite mode
  * so a re-approve replaces cleanly. Returns nothing; throws on hard failure.
  */
 async function uploadFileToDropboxRaw(filePath, fileBuffer) {
@@ -559,7 +559,7 @@ async function uploadFileToDropboxRaw(filePath, fileBuffer) {
 /**
  * Does a Dropbox path already exist? Used to avoid clobbering a preview.png /
  * certificate.txt that generation (or /bridge-callback) already co-located.
- * Any error (incl. not_found) → false.
+ * Any error (incl. not_found) â†’ false.
  */
 async function dropboxPathExists(filePath) {
   try {
@@ -578,7 +578,7 @@ async function dropboxPathExists(filePath) {
  */
 async function dropboxCopyFile(fromPath, toPath) {
   try {
-    // filesDownload then re-upload — filesCopyV2 fails if dest exists; download/
+    // filesDownload then re-upload â€” filesCopyV2 fails if dest exists; download/
     // upload-overwrite is idempotent and avoids that edge.
     const dl = await dbx.filesDownload({ path: fromPath });
     const buf = dl?.result?.fileBinary
@@ -595,7 +595,7 @@ async function dropboxCopyFile(fromPath, toPath) {
 /**
  * Create (or retrieve) a public shared link for a delivery FOLDER and return the
  * regular Dropbox share URL (nicer UX than a direct-download link; Dropbox zips
- * the folder for the recipient on download — exactly the "loose folder" the owner
+ * the folder for the recipient on download â€” exactly the "loose folder" the owner
  * wants). Mirrors the ZIP link logic in uploadZipToDropbox.
  */
 async function createFolderShareLink(folderPath) {
@@ -775,9 +775,9 @@ async function extractImagesFromZip(zipBase64) {
     const buffer = entry.getData();
     if (buffer.length === 0) continue;
 
-    // Read true pixel dimensions via sharp metadata. This is authoritative —
+    // Read true pixel dimensions via sharp metadata. This is authoritative â€”
     // the developer receives image assets that match the design proportions,
-    // but their exact pixel dimensions may be 2× (retina) or different from
+    // but their exact pixel dimensions may be 2Ã— (retina) or different from
     // the placeholder size in the design PDF. v5.2.2 post-processor uses these
     // to clamp <img width> to min(placeholder, original).
     let originalWidth = null;
@@ -787,7 +787,7 @@ async function extractImagesFromZip(zipBase64) {
       originalWidth = meta.width || null;
       originalHeight = meta.height || null;
     } catch (err) {
-      // GIF or corrupted — fall through; image will still be uploaded but
+      // GIF or corrupted â€” fall through; image will still be uploaded but
       // without dimension metadata. fixImageDimensions will skip it.
     }
 
@@ -814,7 +814,7 @@ async function extractImagesFromZip(zipBase64) {
 
 /**
  * Extract Order ID from the uploaded PDF filename.
- * Expected format: "OID9924641912.pdf" → "OID9924641912"
+ * Expected format: "OID9924641912.pdf" â†’ "OID9924641912"
  * Also accepts: "OID9924641912" (without extension)
  */
 function extractOrderId(filename) {
@@ -832,7 +832,7 @@ function extractOrderId(filename) {
 
 
 // =====================================================================
-// POST-PROCESSING PIPELINE (v5.1.0) — Deterministic fix-ups after Stage 2
+// POST-PROCESSING PIPELINE (v5.1.0) â€” Deterministic fix-ups after Stage 2
 // =====================================================================
 // These fix failures that prompt rules alone cannot reliably solve:
 //  1. Image URL replacement (local paths -> Dropbox URLs)
@@ -933,15 +933,15 @@ function fixImageUrls(html, imageUrlMap, imageDimensionsMap, options = {}) {
       return `src="${dropboxUrl}"`;
     }
 
-    // No exact match — leave for second pass to handle
+    // No exact match â€” leave for second pass to handle
     return match;
   });
 
-  // v9.7.0 (Figma gate §3): on the Figma/bridge path the spec already carries
+  // v9.7.0 (Figma gate Â§3): on the Figma/bridge path the spec already carries
   // absolute Dropbox URLs, so any relative src left after pass 1 is an ANOMALY,
   // not something to guess at. The positional fallback below can silently bind
   // the WRONG image, so we skip it here and instead RETURN the leftover names
-  // (the caller logs a WARN). PDF path passes no options → fallback runs as before.
+  // (the caller logs a WARN). PDF path passes no options â†’ fallback runs as before.
   if (options.skipPositionalFallback) {
     const leftover = [];
     const scanRe = /\bsrc\s*=\s*["']([^"']+)["']/gi;
@@ -956,7 +956,7 @@ function fixImageUrls(html, imageUrlMap, imageDimensionsMap, options = {}) {
     return { html: output, replaced, sequentialFallbacks: 0, fallbackUsed: [], unmatched: leftover };
   }
 
-  // v5.4.2: Second pass — sequential positional fallback.
+  // v5.4.2: Second pass â€” sequential positional fallback.
   // For any remaining relative-path images, replace with images from the
   // ORDERED list in order of appearance in the HTML. This guarantees real
   // working URLs even when Stage 2 invented filenames that don't match the ZIP.
@@ -1108,7 +1108,7 @@ function fixActivityFeed(html) {
       if (dayRegex.test(text) || timeRegex.test(text)) matches++;
     }
 
-    // If majority of items match, treat as activity feed — unwrap
+    // If majority of items match, treat as activity feed â€” unwrap
     if (matches / liMatches.length < 0.5) return ulBlock;
 
     fixes++;
@@ -1151,7 +1151,7 @@ function fixThinBands(html, palette, bandMap) {
   //
   // v5.4.0: Also reject bands flagged as "is_likely_artifact" by the band
   // detector (thin + low coverage + low saturation). These are JPEG compression
-  // artifacts at section boundaries, not real design elements — even if their
+  // artifacts at section boundaries, not real design elements â€” even if their
   // color happens to overlap with a real palette color.
   //
   // This avoids the nested <tr> regex problem entirely.
@@ -1229,7 +1229,7 @@ function fixThinBands(html, palette, bandMap) {
       if (dist < 20) return block;
     }
 
-    // Drop it — hallucinated thin band
+    // Drop it â€” hallucinated thin band
     removed++;
     return "";
   });
@@ -1242,7 +1242,7 @@ function fixThinBands(html, palette, bandMap) {
  *
  * Every section comment emitted by Stage 2 contains y=Y1-Y2 (e.g. "Section_8_alert_bar y=345-380").
  * We parse that y-range, look up the DOMINANT band color covering that range, and override
- * the section's bgcolor attribute. This is fully deterministic — no Claude guessing.
+ * the section's bgcolor attribute. This is fully deterministic â€” no Claude guessing.
  *
  * Why this exists: Stage 1 Claude sometimes collapses distinct design colors into a
  * single palette color (e.g. cream off-white shades rendered as pure white). Stage 2 then uses
@@ -1301,7 +1301,7 @@ function rebindSectionColors(html, bandMap, palette) {
     }
     if (coverage.size === 0) return match;
 
-    // Skip the content color if the section is a CONTENT-heavy band pattern — thin-colored-bands
+    // Skip the content color if the section is a CONTENT-heavy band pattern â€” thin-colored-bands
     // already have their bg correctly set by type semantics; don't rebind them.
     if (stype === "thin_colored_band") return match;
 
@@ -1351,7 +1351,7 @@ function rebindSectionColors(html, bandMap, palette) {
     // Don't rebind if Stage 2's choice is already correct
     if (currentBg === domHex) return match;
 
-    // Don't rebind when dominant is pure white and current is pure white — no-op
+    // Don't rebind when dominant is pure white and current is pure white â€” no-op
     if (currentBg === "#FFFFFF" && domHex === "#FFFFFF") return match;
 
     // Replace the FIRST bgcolor and background-color occurrence in the section body
@@ -1417,7 +1417,7 @@ function forceAlertBarWarmBg(html, palette) {
     const rgb = hexToRgbTriplet(currentBg);
     if (!rgb) return match;
     const avg = (rgb[0] + rgb[1] + rgb[2]) / 3;
-    if (avg < 220) return match; // current bg is not light — don't touch
+    if (avg < 220) return match; // current bg is not light â€” don't touch
 
     let newBody = body.replace(
       /bgcolor\s*=\s*["']?#[0-9A-Fa-f]{6}["']?/,
@@ -1450,7 +1450,7 @@ function universalTextContrast(html) {
     /(<!--\s*Section_(\d+)_([a-zA-Z_]+)(?:\s+y=\d+-\d+)?\s*-->)([\s\S]*?)(<!--\s*\/\/\s*Section_\2(?:_\3)?\s*-->)/g;
 
   const output = html.replace(sectionRegex, (match, openTag, n, stype, body, closeTag) => {
-    // Skip thin bands and spacers — no text
+    // Skip thin bands and spacers â€” no text
     if (stype === "thin_colored_band" || stype === "spacer" || stype === "divider") {
       return match;
     }
@@ -1485,7 +1485,7 @@ function universalTextContrast(html) {
           if (!isDarkBg && !isDarkColor) {
             return `${prefix}color: #000000`;
           }
-          // Acceptable contrast — keep as-is. This preserves spec colors like
+          // Acceptable contrast â€” keep as-is. This preserves spec colors like
           // brand-green accent text on white bg (green is mid-luminance but
           // intentional). Only fix when both are same-luminance-band.
           return colorMatch;
@@ -1495,7 +1495,7 @@ function universalTextContrast(html) {
     });
 
     // Also fix color attributes on <font> tags (rare, but some devs use them)
-    // skipped — master framework forbids <font>
+    // skipped â€” master framework forbids <font>
 
     if (newBody !== body) fixes++;
     return openTag + newBody + closeTag;
@@ -1513,7 +1513,7 @@ function universalTextContrast(html) {
  * Fix 10 (NEW in v5.2.2): CTA auto-contrast.
  *
  * When Stage 2 emits CTAs without a valid cta_color, it often defaults to #000000
- * on a dark brand bgcolor — producing illegible black-on-dark buttons.
+ * on a dark brand bgcolor â€” producing illegible black-on-dark buttons.
  * This deterministic post-processor finds every CTA table (em_cta or matching the
  * CTA pattern) and forces readable contrast based on luminance of the CTA bg.
  *
@@ -1523,7 +1523,7 @@ function fixCtaContrast(html) {
   let fixes = 0;
 
   // CTAs in Mavlers framework always have bgcolor AND border-radius on the SAME
-  // opening <table> tag. We match only these — prevents matching outer wrapper
+  // opening <table> tag. We match only these â€” prevents matching outer wrapper
   // tables which also have bgcolor but no border-radius.
   //
   // Non-greedy regex means we match the INNERMOST such table, which is always
@@ -1564,7 +1564,7 @@ function fixCtaContrast(html) {
  *
  * When the developer-input secondary font field contains a comma-separated list
  * (e.g. "Arial, Helvetica, sans-serif"), Stage 2 sometimes wraps the WHOLE thing
- * in single quotes: 'Arial, Helvetica, sans-serif' — one malformed font name.
+ * in single quotes: 'Arial, Helvetica, sans-serif' â€” one malformed font name.
  * This function detects that pattern and splits into proper comma-separated stack.
  *
  * Universal. Handles any font fallback string.
@@ -1655,18 +1655,18 @@ function fixFontStackQuotes(html) {
  *
  * Tesseract frequently misreads capital I as lowercase l in font glyphs where
  * they're visually similar (Inter, Helvetica, Arial at certain sizes).
- * Example: "AI Integration" → "Al Integration".
+ * Example: "AI Integration" â†’ "Al Integration".
  *
- * Strategy: scan visible text in HTML for tokens matching /\b[A-Z]l(?=[\s.,;:!?]|$)/ — a capital
+ * Strategy: scan visible text in HTML for tokens matching /\b[A-Z]l(?=[\s.,;:!?]|$)/ â€” a capital
  * letter followed by lowercase l ending the word. Replace with the capital-I
  * equivalent UNLESS the token is a valid English word on an exclusion list.
  *
  * Universal. Works on any content; does NOT modify attribute values or URLs.
  */
 function fixOcrCapitalI(html) {
-  // Exclusion list — real English words that legitimately start with capital + lowercase L
+  // Exclusion list â€” real English words that legitimately start with capital + lowercase L
   const exclusions = new Set([
-    "Al", // valid as name (e.g. "Al Pacino") — but in pharma/tech contexts usually wrong
+    "Al", // valid as name (e.g. "Al Pacino") â€” but in pharma/tech contexts usually wrong
     // We leave "Al" in because context-aware logic is hard. Instead, we only fix when
     // followed by another capitalized word (suggests acronym usage)
   ]);
@@ -1684,11 +1684,11 @@ function fixOcrCapitalI(html) {
     if (textBuffer.length === 0) return;
     // Apply regex to this text chunk
     // Match: "Al" followed by space and capital letter (indicating acronym followed by word)
-    //   e.g., "Al Integration" → "AI Integration"
-    //         "Al plugs"       → "AI plugs"
-    //         "Al can"         → "AI can"
-    //         "Al-driven"      → "AI-driven"
-    //         "Al boosts"      → "AI boosts"
+    //   e.g., "Al Integration" â†’ "AI Integration"
+    //         "Al plugs"       â†’ "AI plugs"
+    //         "Al can"         â†’ "AI can"
+    //         "Al-driven"      â†’ "AI-driven"
+    //         "Al boosts"      â†’ "AI boosts"
     // Criteria: "Al" standalone as acronym (start of sentence or after space) AND next non-space char is lowercase letter (word start) OR capital letter (proper noun / another acronym) OR a hyphen/apostrophe
     const fixed = textBuffer.replace(
       /\bAl(?=[\s\-'][A-Za-z])/g,
@@ -1734,7 +1734,7 @@ function fixOcrCapitalI(html) {
  * white text instead of brand-dark text (e.g. white text on a brand accent bg instead of
  * dark-green on green).
  *
- * Universal — uses palette to find darkest non-black brand color.
+ * Universal â€” uses palette to find darkest non-black brand color.
  */
 function fixAccentBgText(html, palette) {
   let fixes = 0;
@@ -1822,7 +1822,7 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
   if (Object.keys(imageUrlMap || {}).length > 0) return html;
   if (!hadRelativePaths) return html;
 
-  const warning = `\n<!-- ⚠ MAVELOPER WARNING: No image ZIP was uploaded. Image paths in this HTML are placeholders. Re-run generation with the image ZIP to get working Dropbox URLs. -->\n`;
+  const warning = `\n<!-- âš  MAVELOPER WARNING: No image ZIP was uploaded. Image paths in this HTML are placeholders. Re-run generation with the image ZIP to get working Dropbox URLs. -->\n`;
   // Insert right after <body ...>
   return html.replace(/(<body[^>]*>)/i, `$1${warning}`);
 }
@@ -1831,30 +1831,30 @@ function addMissingZipWarning(html, imageUrlMap, hadRelativePaths) {
  * Runs all deterministic fixes in order and returns the fixed HTML + a report.
  *
  * Order matters:
- *  1. fixImageUrls — replace local image paths with Dropbox URLs
- *  2. rebindSectionColors — fix section bgcolors using band_map y-ranges (must run BEFORE fixNearWhite)
- *  3. fixNearWhite — normalize JPEG-shifted near-whites to pure #FFFFFF
- *  4. forceAlertBarWarmBg — ensure alert bars use warm palette color if available
- *  5. fixAlertBarContrast — alert bar text contrast (black on warm, white on dark)
- *  6. fixAccentBgText — use brand-dark text on saturated brand-accent bgs (v5.2.2)
- *  7. universalTextContrast — fix all text-on-bg contrast globally
- *  8. fixCtaContrast — auto-invert CTA text color based on CTA bg luminance (v5.2.2)
- *  9. fixFontStackQuotes — un-nest malformed single-quoted font stacks (v5.2.2)
- *  10. fixOcrCapitalI — repair "Al" OCR misread back to "AI" in content text (v5.2.2)
- *  11. fixActivityFeed — unwrap day+time bullet lists to plain rows
- *  12. fixThinBands — drop hallucinated thin stripes whose color isn't used elsewhere
- *  13. addMissingZipWarning — visible comment if no image ZIP was uploaded
+ *  1. fixImageUrls â€” replace local image paths with Dropbox URLs
+ *  2. rebindSectionColors â€” fix section bgcolors using band_map y-ranges (must run BEFORE fixNearWhite)
+ *  3. fixNearWhite â€” normalize JPEG-shifted near-whites to pure #FFFFFF
+ *  4. forceAlertBarWarmBg â€” ensure alert bars use warm palette color if available
+ *  5. fixAlertBarContrast â€” alert bar text contrast (black on warm, white on dark)
+ *  6. fixAccentBgText â€” use brand-dark text on saturated brand-accent bgs (v5.2.2)
+ *  7. universalTextContrast â€” fix all text-on-bg contrast globally
+ *  8. fixCtaContrast â€” auto-invert CTA text color based on CTA bg luminance (v5.2.2)
+ *  9. fixFontStackQuotes â€” un-nest malformed single-quoted font stacks (v5.2.2)
+ *  10. fixOcrCapitalI â€” repair "Al" OCR misread back to "AI" in content text (v5.2.2)
+ *  11. fixActivityFeed â€” unwrap day+time bullet lists to plain rows
+ *  12. fixThinBands â€” drop hallucinated thin stripes whose color isn't used elsewhere
+ *  13. addMissingZipWarning â€” visible comment if no image ZIP was uploaded
  */
 /**
  * Fix 14 (NEW in v5.2.2): Strip inline SVG/data-URL backgrounds from styles.
  *
  * When Stage 2 generates bullet icons using `background: url('data:image/svg+xml;utf8,<svg ...>')`,
  * the inner double-quote characters inside the SVG break the HTML style attribute
- * parsing — browsers show raw SVG code as visible text. This is a CRITICAL bug.
+ * parsing â€” browsers show raw SVG code as visible text. This is a CRITICAL bug.
  *
  * Fix: detect `background: url('data:image/svg...` or similar inside style attributes,
  * strip the entire background declaration, and add a `list-style-type: disc` fallback.
- * This is safe universally — bullets just render with default disc markers.
+ * This is safe universally â€” bullets just render with default disc markers.
  */
 function fixInlineSvgDataUrl(html) {
   let fixes = 0;
@@ -1863,9 +1863,9 @@ function fixInlineSvgDataUrl(html) {
   // Step 1: Directly strip any `background: url('data:...')` or `background-image: url('data:...')`
   // declaration and everything up to the next `;` or the end of the style attr's closing quote.
   // This works even when the inner double-quotes of the SVG have already broken the style
-  // attribute parsing — we just remove the toxic substring by pattern match, not by attr parsing.
+  // attribute parsing â€” we just remove the toxic substring by pattern match, not by attr parsing.
   //
-  // The data URL ends at the first `)` after the `url(` — even though the SVG contains internal
+  // The data URL ends at the first `)` after the `url(` â€” even though the SVG contains internal
   // quotes, it does NOT contain literal `)` characters (the closing `/>` is not a paren).
   //
   // After stripping the url(...) part, also consume any trailing "no-repeat left 8px" style
@@ -1901,7 +1901,7 @@ function fixInlineSvgDataUrl(html) {
  * Fix 15 (NEW in v5.2.2): Clamp image widths to min(placeholder, original).
  *
  * Every <img> has a `width="N"` attribute and `max-width: Npx` in its inline
- * style — that's the placeholder width Stage 2 emitted from the spec. The ZIP
+ * style â€” that's the placeholder width Stage 2 emitted from the spec. The ZIP
  * contains the actual source image at its original pixel dimensions. If the
  * original is SMALLER than the placeholder, we downsize the placeholder to the
  * original (upscaling a small source looks bad). If original is LARGER, we
@@ -2008,7 +2008,7 @@ function fixImageDimensions(html, imageDimensionsMap) {
  * When Stage 1 over-fragments a continuous body copy block into multiple
  * body_text sections, each becomes its own em_wrapper with redundant padding.
  * This post-processor detects adjacent sections with the SAME bgcolor AND
- * similar padding, and collapses them into one wrapper — the content rows
+ * similar padding, and collapses them into one wrapper â€” the content rows
  * flow into a single table, reducing cumulative padding and matching dev
  * patterns.
  */
@@ -2083,7 +2083,7 @@ function mergeAdjacentSameBgSections(html) {
       if (innerMatch) innerRows.push(innerMatch[1].trim());
     }
 
-    if (innerRows.length !== group.length) continue; // couldn't parse all — skip this group safely
+    if (innerRows.length !== group.length) continue; // couldn't parse all â€” skip this group safely
 
     // Use the FIRST section's wrapper as the canonical wrapper
     const firstSection = group[0];
@@ -2113,12 +2113,12 @@ function addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUpl
   if (Object.keys(imageUrlMap || {}).length > 0) return html;
   if (!hadRelativePaths) return html;
 
-  const warningComment = `\n<!-- ============================================================\n⚠⚠⚠ MAVELOPER CRITICAL WARNING ⚠⚠⚠\nZIP file was uploaded but Dropbox image-URL map is EMPTY.\nThe Dropbox upload pipeline failed silently.\nAll image paths in this HTML are broken placeholders.\nACTION: Check Railway logs for \"uploadImagesToDropbox\" errors,\nverify DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN in Railway env,\nand confirm the Dropbox app has files.content.write permission.\n============================================================ -->\n`;
+  const warningComment = `\n<!-- ============================================================\nâš âš âš  MAVELOPER CRITICAL WARNING âš âš âš \nZIP file was uploaded but Dropbox image-URL map is EMPTY.\nThe Dropbox upload pipeline failed silently.\nAll image paths in this HTML are broken placeholders.\nACTION: Check Railway logs for \"uploadImagesToDropbox\" errors,\nverify DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN in Railway env,\nand confirm the Dropbox app has files.content.write permission.\n============================================================ -->\n`;
 
   const warningBanner = `
 <tr>
   <td align="center" valign="top" bgcolor="#FF0000" style="background-color: #FF0000; padding: 20px; font-family: Arial, sans-serif; font-size: 14px; color: #FFFFFF; text-align: center; font-weight: bold;">
-    ⚠ MAVELOPER: Image upload pipeline failed. Image paths in this HTML are broken. Re-generate after checking Dropbox credentials and Railway logs.
+    âš  MAVELOPER: Image upload pipeline failed. Image paths in this HTML are broken. Re-generate after checking Dropbox credentials and Railway logs.
   </td>
 </tr>`;
 
@@ -2134,7 +2134,7 @@ function addDropboxFailureWarning(html, imageUrlMap, hadRelativePaths, zipWasUpl
 }
 
 // =====================================================================
-// v5.4.2 — DETERMINISTIC POST-PROCESSORS (preserved into v5.5.0)
+// v5.4.2 â€” DETERMINISTIC POST-PROCESSORS (preserved into v5.5.0)
 // =====================================================================
 // These run on the generated HTML after Stage 2. They fix bugs that no
 // amount of prompt rules can reliably eliminate, by acting on the actual
@@ -2328,16 +2328,16 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
   const report = {};
   const hadRelativePaths = /src="images\//i.test(html);
 
-  // v9.7.0 — path mode gate. 'pdf' (default) runs the FULL deterministic pipeline
+  // v9.7.0 â€” path mode gate. 'pdf' (default) runs the FULL deterministic pipeline
   // exactly as before (byte-for-byte). 'figma' runs ONLY the HTML-hygiene subset,
-  // because the bridge output is already VALIDATED — the PDF/OCR/Stage-2-era
+  // because the bridge output is already VALIDATED â€” the PDF/OCR/Stage-2-era
   // colour/text/structure correctors must never override a validated design
   // decision. See MAVELOPER_POSTPROCESS_GATE_SPEC.
   const FIGMA_SAFE = mode === "figma";
 
-  // [RUN on both] Image URL fix — pass 1 (filename match). On Figma the positional
+  // [RUN on both] Image URL fix â€” pass 1 (filename match). On Figma the positional
   // fallback (pass 2) is DISABLED (it can silently mis-bind images); any leftover
-  // relative src is logged as a WARN instead of guessed at (§3).
+  // relative src is logged as a WARN instead of guessed at (Â§3).
   const r1 = fixImageUrls(html, imageUrlMap, imageDimensionsMap, FIGMA_SAFE ? { skipPositionalFallback: true } : {});
   html = r1.html;
   report.imageUrls = {
@@ -2347,24 +2347,24 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
     unmatched: r1.unmatched,
   };
   if (FIGMA_SAFE && r1.unmatched && r1.unmatched.length > 0) {
-    log("warn", "postProcess(figma): relative/non-http image src(s) left after filename match — NOT guessing (positional fallback disabled)", {
+    log("warn", "postProcess(figma): relative/non-http image src(s) left after filename match â€” NOT guessing (positional fallback disabled)", {
       requestId,
       leftover: r1.unmatched,
     });
   }
 
-  // [RUN on both] Convert Google Fonts @import to <link> in <head> — font-loading mechanics
+  // [RUN on both] Convert Google Fonts @import to <link> in <head> â€” font-loading mechanics
   const rGFont = convertGoogleFontImportToLink(html);
   html = rGFont.html;
   report.googleFontLinkConvert = { fixes: rGFont.fixes };
 
-  // [RUN on both] Repair malformed self-closing img tags — malformed syntax
+  // [RUN on both] Repair malformed self-closing img tags â€” malformed syntax
   const rImgMal = fixMalformedSelfClosingImg(html);
   html = rImgMal.html;
   report.malformedImgFix = { fixes: rImgMal.fixes };
 
   if (!FIGMA_SAFE) {
-    // ── PDF/OCR/Stage-2-era transforms — SKIPPED on the Figma/bridge path (§2). ──
+    // â”€â”€ PDF/OCR/Stage-2-era transforms â€” SKIPPED on the Figma/bridge path (Â§2). â”€â”€
     // Each can silently override a validated design decision. They run ONLY for
     // the PDF pipeline (mode='pdf'), unchanged. Functions themselves are untouched.
 
@@ -2409,7 +2409,7 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
     report.ctaContrast = { fixes: r6b.fixes };
   }
 
-  // [RUN on both] Font-stack quote sanitizer — de-nest/de-dupe, PRESERVES first-seen order
+  // [RUN on both] Font-stack quote sanitizer â€” de-nest/de-dupe, PRESERVES first-seen order
   const r6c = fixFontStackQuotes(html);
   html = r6c.html;
   report.fontStackQuotes = { fixes: r6c.fixes };
@@ -2452,11 +2452,11 @@ function postProcessHtml(html, { imageUrlMap, palette, bandMap, imageDimensionsM
 }
 
 // =====================================================================
-// v9.7.0 — POST-POST-PROCESS ASSERTION (Figma path)
+// v9.7.0 â€” POST-POST-PROCESS ASSERTION (Figma path)
 //
-// The font bug survived because the validator is NOT the last gate — Railway
+// The font bug survived because the validator is NOT the last gate â€” Railway
 // mutated the HTML after it passed. This asserts that the hygiene pass did not
-// break a validator guarantee. It NEVER hard-fails delivery — it logs an ERROR
+// break a validator guarantee. It NEVER hard-fails delivery â€” it logs an ERROR
 // and returns the violations so the caller can surface them (make it observable).
 //
 //   brandFont : every font-family that led with designSpec.brand_font BEFORE must
@@ -2484,13 +2484,13 @@ function assertFigmaPostProcess(before, after, designSpec, { requestId, source =
     return n;
   };
 
-  // brandFont — count must not drop
+  // brandFont â€” count must not drop
   const brand = designSpec && designSpec.brand_font;
   if (brand) {
     const leadBefore = leadCountWith(before, brand);
     const leadAfter = leadCountWith(after, brand);
     if (leadAfter < leadBefore) {
-      violations.push(`brandFont: declarations leading with '${brand}' dropped ${leadBefore}→${leadAfter}`);
+      violations.push(`brandFont: declarations leading with '${brand}' dropped ${leadBefore}â†’${leadAfter}`);
     }
   }
 
@@ -2498,14 +2498,14 @@ function assertFigmaPostProcess(before, after, designSpec, { requestId, source =
   const ffBefore = countOf(before, /font-family\s*:/gi);
   const ffAfter = countOf(after, /font-family\s*:/gi);
   if (ffBefore !== ffAfter) {
-    violations.push(`fontCount: font-family declarations changed ${ffBefore}→${ffAfter}`);
+    violations.push(`fontCount: font-family declarations changed ${ffBefore}â†’${ffAfter}`);
   }
 
   // size (>2% drop)
   if (before.length > 0) {
     const dropPct = ((before.length - after.length) / before.length) * 100;
     if (dropPct > 2) {
-      violations.push(`size: byte count dropped ${dropPct.toFixed(1)}% (${before.length}→${after.length})`);
+      violations.push(`size: byte count dropped ${dropPct.toFixed(1)}% (${before.length}â†’${after.length})`);
     }
   }
 
@@ -2513,18 +2513,18 @@ function assertFigmaPostProcess(before, after, designSpec, { requestId, source =
   const imgBefore = countOf(before, /<img\b/gi);
   const imgAfter = countOf(after, /<img\b/gi);
   if (imgBefore !== imgAfter) {
-    violations.push(`imgCount: <img> count changed ${imgBefore}→${imgAfter}`);
+    violations.push(`imgCount: <img> count changed ${imgBefore}â†’${imgAfter}`);
   }
 
   // anchorCount
   const aBefore = countOf(before, /<a\b/gi);
   const aAfter = countOf(after, /<a\b/gi);
   if (aBefore !== aAfter) {
-    violations.push(`anchorCount: <a> count changed ${aBefore}→${aAfter}`);
+    violations.push(`anchorCount: <a> count changed ${aBefore}â†’${aAfter}`);
   }
 
   if (violations.length > 0) {
-    log("error", "POST-PROCESS ASSERTION FAILED — post-processing altered validated HTML", {
+    log("error", "POST-PROCESS ASSERTION FAILED â€” post-processing altered validated HTML", {
       requestId,
       source,
       violations,
@@ -2536,18 +2536,18 @@ function assertFigmaPostProcess(before, after, designSpec, { requestId, source =
 
 
 // =====================================================================
-// STAGE 1 PROMPT (v5.0.0) — Full-design analysis with pixel palette
+// STAGE 1 PROMPT (v5.0.0) â€” Full-design analysis with pixel palette
 // Replaces v4.0.1's per-band classification. Claude now sees the full design
 // once, with pixel-exact colors and OCR text provided as authoritative data.
 // =====================================================================
 const STAGE1_PROMPT = `You are analyzing an email design PDF to produce a structured JSON specification. You will receive:
 
-1. ONE OR MORE TILE IMAGES showing the email design. Email designs are tall so they are split into overlapping horizontal tiles. Each tile is preceded by a text label like "--- TILE N of M — y_range=<y_start>-<y_end> ---" that tells you the tile's vertical position in the full design. Tiles overlap by ~300px so you can see continuity across boundaries. Treat the tiles as ONE continuous design.
-2. A pixel-sampled COLOR PALETTE — these are the exact hex values that appear in the design's pixels. Use these VERBATIM for any color field in your JSON output. Do NOT round, approximate, or substitute colors. A dark-charcoal hex like #2A2623 is different from pure black #000000. A specific brand green like #1FC23D is different from neon green #00FF00. A cream off-white like #F7F3E4 is different from generic #F5F5F5. Match the exact palette hex, never a common default.
-3. OCR-EXTRACTED TEXT — every piece of text visible in the design. Use this text VERBATIM for every "text" field. NEVER paraphrase, rewrite, or invent text. If you cannot match a piece of OCR text to a visible section, include it where it logically belongs.
-4. A BAND MAP — pixel-exact positions (y_start, y_end, height, bg_hex) of every horizontal band detected in the design. Coordinates are in the FULL design's pixel space, not per-tile. Use this to verify you don't miss thin elements (colored stripes, narrow alert bars, divider lines).
-5. An IMAGE ASSETS LIST — uploaded image files with filenames, dimensions, and Dropbox URLs. Match each visible image in the design to one of these files by content matching, and include the exact Dropbox URL in your output.
-6. Developer-specified values (email width, fonts, ESP merge-tag style) — these are authoritative overrides.
+1. ONE OR MORE TILE IMAGES showing the email design. Email designs are tall so they are split into overlapping horizontal tiles. Each tile is preceded by a text label like "--- TILE N of M â€” y_range=<y_start>-<y_end> ---" that tells you the tile's vertical position in the full design. Tiles overlap by ~300px so you can see continuity across boundaries. Treat the tiles as ONE continuous design.
+2. A pixel-sampled COLOR PALETTE â€” these are the exact hex values that appear in the design's pixels. Use these VERBATIM for any color field in your JSON output. Do NOT round, approximate, or substitute colors. A dark-charcoal hex like #2A2623 is different from pure black #000000. A specific brand green like #1FC23D is different from neon green #00FF00. A cream off-white like #F7F3E4 is different from generic #F5F5F5. Match the exact palette hex, never a common default.
+3. OCR-EXTRACTED TEXT â€” every piece of text visible in the design. Use this text VERBATIM for every "text" field. NEVER paraphrase, rewrite, or invent text. If you cannot match a piece of OCR text to a visible section, include it where it logically belongs.
+4. A BAND MAP â€” pixel-exact positions (y_start, y_end, height, bg_hex) of every horizontal band detected in the design. Coordinates are in the FULL design's pixel space, not per-tile. Use this to verify you don't miss thin elements (colored stripes, narrow alert bars, divider lines).
+5. An IMAGE ASSETS LIST â€” uploaded image files with filenames, dimensions, and Dropbox URLs. Match each visible image in the design to one of these files by content matching, and include the exact Dropbox URL in your output.
+6. Developer-specified values (email width, fonts, ESP merge-tag style) â€” these are authoritative overrides.
 
 Output ONLY a JSON object. No markdown fences. No explanation. Start with { end with }.
 
@@ -2598,39 +2598,39 @@ G. ALIGNMENT
 H. REPEATED VARIANTS
    If the design shows the same content twice (e.g., dark-variant preheader + light-variant preheader, intentional), output both as separate sections.
 
-I. TYPOGRAPHY MEASUREMENT (v5.4.0 — pixel-grounded measurement, not estimation)
+I. TYPOGRAPHY MEASUREMENT (v5.4.0 â€” pixel-grounded measurement, not estimation)
    When you assign a "size" (font-size) to a text element, measure it from the actual pixel rendering in the tile, not from intuition. Use this method:
    - Identify a representative uppercase letter (or "x" for lowercase-only words) in the text
    - Visually measure its CAP-HEIGHT (top of capital letter to baseline) in pixels
-   - font-size ≈ cap-height ÷ 0.7 (cap-height is roughly 70% of font-size for most fonts)
+   - font-size â‰ˆ cap-height Ã· 0.7 (cap-height is roughly 70% of font-size for most fonts)
    - For line-height ("lh"): measure the vertical distance from baseline to baseline of two consecutive lines
    COMMON BENCHMARKS to ground your measurements:
-   - Body copy at 14px ≈ 10px cap-height
-   - Body copy at 16px ≈ 11-12px cap-height
-   - Body copy at 18px ≈ 13px cap-height
-   - Section heading at 24px ≈ 17px cap-height
-   - Section heading at 28px ≈ 20px cap-height
-   - Hero heading at 36px ≈ 25px cap-height
-   - Hero heading at 46px ≈ 32px cap-height
+   - Body copy at 14px â‰ˆ 10px cap-height
+   - Body copy at 16px â‰ˆ 11-12px cap-height
+   - Body copy at 18px â‰ˆ 13px cap-height
+   - Section heading at 24px â‰ˆ 17px cap-height
+   - Section heading at 28px â‰ˆ 20px cap-height
+   - Hero heading at 36px â‰ˆ 25px cap-height
+   - Hero heading at 46px â‰ˆ 32px cap-height
    IF YOU ARE UNSURE BETWEEN TWO SIZES, PICK THE LARGER. Designers rarely use tiny text. Hero headlines are commonly 32-50px, NOT 24-28px. Section headings are commonly 24-32px, NOT 18-20px. Body copy is commonly 14-18px.
    NEVER default a hero headline to 28px without measuring. NEVER default body copy to 14px without measuring.
 
-J. BODY TEXT COLOR — never pure black unless explicitly black
+J. BODY TEXT COLOR â€” never pure black unless explicitly black
    Body copy and paragraph text in modern email designs is RARELY pure #000000. It's usually a dark gray.
    When extracting "color" for body text or paragraphs, scan the palette for the darkest non-pure-black gray that exists, and use THAT instead of defaulting to #000000.
    Pure #000000 is acceptable ONLY for: section headings if the design clearly uses pure black, footer copyright text on a colored bg, or text-on-light backgrounds where the palette has pure black.
-   If the palette contains a near-black tint, that IS the body text color — use it verbatim, do not collapse to #000000.
+   If the palette contains a near-black tint, that IS the body text color â€” use it verbatim, do not collapse to #000000.
 
-K. BORDER-RADIUS DETECTION (v5.4.0 — measure, don't default to pill)
+K. BORDER-RADIUS DETECTION (v5.4.0 â€” measure, don't default to pill)
    For every CTA button and card container, measure the corner radius visually.
    COMMON RADII in modern email design: 4px, 6px, 8px, 12px, 16px, 24px, 30px (pill).
-   "Pill" radius (≥ 20px) only when the corner curvature visibly equals or exceeds half the button height — i.e., the corners are fully rounded and the sides are straight semicircles.
-   Slightly-rounded buttons (where you can clearly see straight edges in the corners) are typically 4px–12px, NOT 30px.
+   "Pill" radius (â‰¥ 20px) only when the corner curvature visibly equals or exceeds half the button height â€” i.e., the corners are fully rounded and the sides are straight semicircles.
+   Slightly-rounded buttons (where you can clearly see straight edges in the corners) are typically 4pxâ€“12px, NOT 30px.
    When unsure, measure the visible curvature: a corner that consumes less than 1/4 of the button height is a small radius (4-8px), not pill.
    DO NOT default to "cta_radius": 30. Inspect every button and pick the actual radius.
-   Apply the same logic to card containers (testimonial cards, feature cards, closing CTA cards, etc.) — they typically use 8px radii, occasionally 12-16px.
+   Apply the same logic to card containers (testimonial cards, feature cards, closing CTA cards, etc.) â€” they typically use 8px radii, occasionally 12-16px.
 
-L. CARD CONTAINERS (v5.4.0 — detect bordered/colored sub-containers)
+L. CARD CONTAINERS (v5.4.0 â€” detect bordered/colored sub-containers)
    When a section's content is visually contained inside a SUB-CONTAINER that has its own border, background color, or rounded corners (e.g., a testimonial inside a bordered rounded card, or a "ready to add Flows?" CTA inside a light-purple rounded card), this is a CARD CONTAINER and must be represented in the spec.
    Use the "card" property on a content element OR add a "container" object on the content array level. Recommended schema: add a "card" object to the content element that visually contains the card's children:
    {
@@ -2657,15 +2657,15 @@ M. FOOTER MULTI-COLUMN DETECTION (v5.4.0)
    - Footer body text on a brand-colored bg is typically a light tint of that brand color, NOT pure white.
 
 N. THIN BAND CAUTION (v5.4.0)
-   The BAND MAP may contain entries for very thin (≤ 4px) bands of unique colors that DO NOT appear elsewhere in the design. These are likely JPEG compression artifacts at section transitions, NOT intentional design elements.
+   The BAND MAP may contain entries for very thin (â‰¤ 4px) bands of unique colors that DO NOT appear elsewhere in the design. These are likely JPEG compression artifacts at section transitions, NOT intentional design elements.
    Before adding a "thin_colored_band" section, verify visually in the tile image:
    - Does the thin band appear as a clear, intentional horizontal stripe in the design?
    - Is the band's color repeated elsewhere in the design (in headings, CTAs, accents)? If yes, it's likely real.
-   - Is the band's color a unique tint that appears nowhere else? If yes, it's likely a JPEG artifact — DO NOT include it as a section.
+   - Is the band's color a unique tint that appears nowhere else? If yes, it's likely a JPEG artifact â€” DO NOT include it as a section.
    When in doubt, OMIT the thin band rather than fabricate one.
 
 ========================================
-SCHEMA — output a JSON object with these fields. ALL fields are OPTIONAL except "width", "sections" (with at least one section). Use the keys you need; omit ones that don't apply. NEVER output placeholder strings like "<exact hex>" or "<number>" — always output real values OR omit the key.
+SCHEMA â€” output a JSON object with these fields. ALL fields are OPTIONAL except "width", "sections" (with at least one section). Use the keys you need; omit ones that don't apply. NEVER output placeholder strings like "<exact hex>" or "<number>" â€” always output real values OR omit the key.
 
 EXAMPLE STRUCTURE (substitute real measured values for the design you are analyzing):
 
@@ -2720,11 +2720,11 @@ NOTE on cta_h: there is NO default. Common heights: 38, 40, 44, 46, 48, 50.
 CRITICAL JSON FORMATTING RULES:
 - Output a SINGLE valid JSON object. No comments. No trailing commas.
 - Every string value must be properly quoted with " and have its closing quote.
-- Every URL value must NOT contain unescaped quotes — escape them with \".
+- Every URL value must NOT contain unescaped quotes â€” escape them with \".
 - All hex colors are 6-character with # prefix: "#1A2B3C" not "1A2B3C" or "#1A2".
 - Numbers do NOT have units: "size": 16 not "size": "16px".
 - Boolean values: true or false (lowercase, no quotes).
-- Validate your JSON mentally before outputting — count opening { vs closing }, opening [ vs closing ].
+- Validate your JSON mentally before outputting â€” count opening { vs closing }, opening [ vs closing ].
 
 ========================================
 FINAL CHECKLIST (run before outputting)
@@ -2737,30 +2737,30 @@ FINAL CHECKLIST (run before outputting)
 - Multi-color inline headings use "spans" (not duplicated rows)?
 - Colored stripes >= 5px in the band map have a thin_colored_band section (skip thinner ones unless clearly visible AND color used elsewhere)?
 - No fake hallucinated sections not visible in the design image?
-- SECTION GROUPING: Adjacent paragraphs of body copy or headings on the SAME background color MUST be grouped into a SINGLE section with multiple content[] entries. Create a NEW section boundary ONLY when one of these changes: (a) background color, (b) section semantic type (e.g. body→cta, heading→image), or (c) a visible horizontal divider in the design. NEVER split a continuous body copy paragraph group into separate body_text sections.
+- SECTION GROUPING: Adjacent paragraphs of body copy or headings on the SAME background color MUST be grouped into a SINGLE section with multiple content[] entries. Create a NEW section boundary ONLY when one of these changes: (a) background color, (b) section semantic type (e.g. bodyâ†’cta, headingâ†’image), or (c) a visible horizontal divider in the design. NEVER split a continuous body copy paragraph group into separate body_text sections.
 - TYPOGRAPHY: did you measure cap-heights against the benchmarks (rule I)? If a hero heading visually fills 30+ pixels of cap-height, it's at least 40px font-size, NOT 28px.
 - BODY COLOR: did you pick the darkest non-pure-black gray from the palette (rule J)? If palette has a near-black tint, body text is THAT, not #000000.
-- BORDER-RADIUS: did you measure each CTA's corner curvature (rule K)? Default of 30 is FORBIDDEN — measure each one.
+- BORDER-RADIUS: did you measure each CTA's corner curvature (rule K)? Default of 30 is FORBIDDEN â€” measure each one.
 - CARDS: did you check for bordered/colored sub-containers (rule L) and add card properties?
 - FOOTER: if 2-column layout (rule M), use "columns" content with cols, not stacked rows.
 - THIN BANDS: did you verify each thin band is real (rule N) and not a JPEG artifact?
 `;
 
 // =====================================================================
-// STAGE 2 PROMPT — Code Generation (JSON spec → HTML)
+// STAGE 2 PROMPT â€” Code Generation (JSON spec â†’ HTML)
 // Contains the full Master Framework + GOLD STANDARD CODE EXAMPLES
 // extracted from real developer-coded Mavlers emails.
 // =====================================================================
 const STAGE2_PROMPT = `## IDENTITY
-You are the senior email developer at Mavlers. You receive a JSON design specification and produce production-ready HTML email code. The JSON spec contains analyzed design data — section structure, verbatim text, colors, spacing, image descriptions. Your job: convert this spec into Mavlers-grade HTML. Trust the spec. Generate HTML from it, not from guesswork.
+You are the senior email developer at Mavlers. You receive a JSON design specification and produce production-ready HTML email code. The JSON spec contains analyzed design data â€” section structure, verbatim text, colors, spacing, image descriptions. Your job: convert this spec into Mavlers-grade HTML. Trust the spec. Generate HTML from it, not from guesswork.
 
-## IMPORTANT — PIXEL-EXACT COLORS IN SPEC (v5.0.0)
-The spec's section "bg" fields and all hex values in element "color", "cta_bg", "cta_color", and "spans[].color" fields are sampled DIRECTLY from the design image's pixels — NOT guessed from a compressed preview. Use these hex values VERBATIM. Do NOT round, substitute, or approximate. Do NOT change one brand color to another similar-looking color. Whatever hex the spec contains IS the correct color. The spec also includes a "_palette" array — only use colors from that palette for any color field.
+## IMPORTANT â€” PIXEL-EXACT COLORS IN SPEC (v5.0.0)
+The spec's section "bg" fields and all hex values in element "color", "cta_bg", "cta_color", and "spans[].color" fields are sampled DIRECTLY from the design image's pixels â€” NOT guessed from a compressed preview. Use these hex values VERBATIM. Do NOT round, substitute, or approximate. Do NOT change one brand color to another similar-looking color. Whatever hex the spec contains IS the correct color. The spec also includes a "_palette" array â€” only use colors from that palette for any color field.
 
-## IMPORTANT — IMAGE URLs ARE EMBEDDED IN THE SPEC (v5.0.0)
+## IMPORTANT â€” IMAGE URLs ARE EMBEDDED IN THE SPEC (v5.0.0)
 Every image content element carries an "src" field with a full Dropbox URL. Use that URL VERBATIM as the img src attribute. NEVER substitute relative paths like "images/hero.jpg" when the spec has a URL. NEVER fabricate image URLs. If spec's src is empty string, use a descriptive alt and omit the src (do not invent a filename).
 
-## IMPORTANT — MULTI-COLOR HEADINGS USE SPANS (v5.0.0)
+## IMPORTANT â€” MULTI-COLOR HEADINGS USE SPANS (v5.0.0)
 When a text content element has a "spans" array, it means the visible heading in the design has multiple colors INLINE on the same line. Render as a SINGLE <td> containing multiple <span> elements:
 
 Example spec content:
@@ -2773,12 +2773,12 @@ Example spec content:
   "size": 28, "weight": 700, "lh": 34, "align": "center"
 }
 
-Correct HTML output — ONE td, TWO spans:
+Correct HTML output â€” ONE td, TWO spans:
 <td align="center" valign="top" style="font-family: 'FONT_STACK'; font-size: 28px; line-height: 34px; font-weight: 700; text-align: center;">
   <span style="color: #COLOR_A;">[FIRST PART]</span><span style="color: #COLOR_B;"> [SECOND PART].</span>
 </td>
 
-NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the heading text as two entirely-colored rows. This is the #1 failure of prior versions — the developer's reference code always uses inline spans, never stacked rows.
+NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the heading text as two entirely-colored rows. This is the #1 failure of prior versions â€” the developer's reference code always uses inline spans, never stacked rows.
 
 ## ABSOLUTE OUTPUT RULES
 1. Output ONLY the final HTML. Begin with <!DOCTYPE. End with </html>. Nothing else.
@@ -2789,16 +2789,16 @@ NEVER split a "spans" element into two separate <td> rows. NEVER duplicate the h
 ## ABSOLUTE FIDELITY RULES
 1. Use ALL text from the spec VERBATIM. Copy every word exactly. NEVER rewrite or paraphrase.
 2. Use EXACT hex colors from the spec. Match every hex value as-is.
-3. Use EXACT spacing from the spec. 33px ≠ 30px. NEVER round.
+3. Use EXACT spacing from the spec. 33px â‰  30px. NEVER round.
 4. Output sections in the EXACT order from the spec. Do NOT rearrange, merge, or skip sections.
 5. Every element goes in a <td> with inline styles. NEVER use <p>, <h1>-<h6>, or <div> (except the hidden preheader div and <ul>/<li> inside bullet_list sections).
-6. TEXT ALIGNMENT — RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. NEVER default to "left" when the spec says otherwise.
-7. CTA BORDER-RADIUS — Use spec.content[].cta_radius VERBATIM. Do NOT default to 30px (pill). Common values: 4, 6, 8, 12, 16, 24, 30. If spec says cta_radius is 8, output 8px. NEVER substitute 30px when the spec says otherwise.
-8. CARD CONTAINERS (v5.4.0) — When a content element has "card_bg", "card_border", "card_radius", or "card_pad", OR when a content element has el="card", OR when section.container is set, render those properties as a wrapping <td> with bgcolor + border + border-radius + padding. See "GOLD STANDARD: CARD CONTAINER" below.
-9. FONT STACK HYGIENE — Use spec.font_body as primary font followed by Arial as fallback in the form: font-family: 'PRIMARY_FONT', Arial, sans-serif. Do NOT include spec.font_heading (the secondary font) in the body stack unless the spec EXPLICITLY uses it for that element. Secondary fonts should ONLY be loaded via Google Fonts <link> tag and used in elements that explicitly call for them.
+6. TEXT ALIGNMENT â€” RESPECT THE SPEC'S "align" FIELD FOR EVERY ELEMENT: For every text element, set the <td>'s align attribute AND the inline style's text-align to match the spec's "align" value. If spec says align="center", the <td> must be align="center" with text-align:center in the style. NEVER default to "left" when the spec says otherwise.
+7. CTA BORDER-RADIUS â€” Use spec.content[].cta_radius VERBATIM. Do NOT default to 30px (pill). Common values: 4, 6, 8, 12, 16, 24, 30. If spec says cta_radius is 8, output 8px. NEVER substitute 30px when the spec says otherwise.
+8. CARD CONTAINERS (v5.4.0) â€” When a content element has "card_bg", "card_border", "card_radius", or "card_pad", OR when a content element has el="card", OR when section.container is set, render those properties as a wrapping <td> with bgcolor + border + border-radius + padding. See "GOLD STANDARD: CARD CONTAINER" below.
+9. FONT STACK HYGIENE â€” Use spec.font_body as primary font followed by Arial as fallback in the form: font-family: 'PRIMARY_FONT', Arial, sans-serif. Do NOT include spec.font_heading (the secondary font) in the body stack unless the spec EXPLICITLY uses it for that element. Secondary fonts should ONLY be loaded via Google Fonts <link> tag and used in elements that explicitly call for them.
 
 ## GOLD STANDARD: SECTION WRAPPER PATTERN
-Every section MUST follow this exact wrapper pattern — each section is an independent table block:
+Every section MUST follow this exact wrapper pattern â€” each section is an independent table block:
 
 <!-- Section_N_type y=Y1-Y2 -->
 <tr>
@@ -2840,14 +2840,14 @@ When spec.content[].cta_border_color is set, the button has a visible outlined b
   </tr>
 </table>
 
-MANDATORY CTA PROPERTIES — ALL values come from the spec, never from defaults:
-- bgcolor + background-color: EXACT value from spec.cta_bg — NEVER substitute #000000 or a guess
-- color (text): EXACT value from spec.cta_color — usually #FFFFFF on filled, often dark on outlined
-- border-radius: spec.cta_radius value VERBATIM — NEVER default to 30px. Common values: 4, 6, 8, 12, 16, 24, 30. If spec says 8, output 8px. PILL (30px) is ONLY when spec says 30 AND the design clearly shows full-pill curvature.
-- height: spec.cta_h value — commonly 38px, 40px, 44px, 46px, 48px, 50px
-- font-size: spec.cta_size value — commonly 13px, 14px, 15px, 16px, 18px
-- font-weight: spec.cta_weight value — commonly 400, 500, 600, or 700 (do NOT default to 700)
-- padding: spec.cta_pad value — horizontal padding varies widely
+MANDATORY CTA PROPERTIES â€” ALL values come from the spec, never from defaults:
+- bgcolor + background-color: EXACT value from spec.cta_bg â€” NEVER substitute #000000 or a guess
+- color (text): EXACT value from spec.cta_color â€” usually #FFFFFF on filled, often dark on outlined
+- border-radius: spec.cta_radius value VERBATIM â€” NEVER default to 30px. Common values: 4, 6, 8, 12, 16, 24, 30. If spec says 8, output 8px. PILL (30px) is ONLY when spec says 30 AND the design clearly shows full-pill curvature.
+- height: spec.cta_h value â€” commonly 38px, 40px, 44px, 46px, 48px, 50px
+- font-size: spec.cta_size value â€” commonly 13px, 14px, 15px, 16px, 18px
+- font-weight: spec.cta_weight value â€” commonly 400, 500, 600, or 700 (do NOT default to 700)
+- padding: spec.cta_pad value â€” horizontal padding varies widely
 - border (outlined buttons only): from spec.cta_border_color + spec.cta_border_width
 - class="em_border" on the table (for dark mode border)
 - class="em_defaultlink" on the td
@@ -2906,7 +2906,7 @@ Testimonial cards with rounded corners and bg color from spec:
     </tbody>
   </table></td>
 
-## GOLD STANDARD: CARD CONTAINER (v5.4.0 — for card_bg / card_border / card_radius)
+## GOLD STANDARD: CARD CONTAINER (v5.4.0 â€” for card_bg / card_border / card_radius)
 When the spec has card properties (either at section.container OR on a content[] element with el="card" OR with card_bg/card_border/card_radius set), wrap the inner content in a <td> that carries the card properties. The card sits INSIDE the section's outer wrapper, NOT replacing it.
 
 Pattern for a content[].card or el="card":
@@ -2924,13 +2924,13 @@ Pattern when section.container is set (entire section is a card):
 The same pattern, where the OUTER em_wrapper td has the card border + radius + bg.
 
 CRITICAL CARD RULES:
-- If the spec has card_bg, card_border, card_radius, or card_pad — these MUST be rendered. NEVER drop card properties.
+- If the spec has card_bg, card_border, card_radius, or card_pad â€” these MUST be rendered. NEVER drop card properties.
 - The bordered/rounded/colored card structure is what visually distinguishes testimonial cards, "Ready to..." closing-CTA cards, feature cards, etc.
 - The card's inner padding is SEPARATE from the section's outer padding. Apply both.
 - When card_border is null but card_bg is set, render bgcolor + border-radius without border.
 - When card_border is set but card_bg is null, render border + border-radius on transparent/white bg.
 
-EXAMPLE — Testimonial card (accent-bordered rounded white card):
+EXAMPLE â€” Testimonial card (accent-bordered rounded white card):
 spec.section.content[0] = {
   "el": "card",
   "card_bg": "#FFFFFF",
@@ -2958,15 +2958,15 @@ Output (substitute spec values verbatim):
     </table></td>
 </tr>
 
-EXAMPLE — Closing CTA card (light-tinted bg rounded):
+EXAMPLE â€” Closing CTA card (light-tinted bg rounded):
 spec.section.container = { "card_bg": "#CARD_BG_HEX", "card_border": null, "card_radius": 8, "card_pad": "30 25 30 25" }
 This renders the entire section as a card with the spec'd light-tint bg + 8px radius.
 
-## GOLD STANDARD: FOOTER (v5.4.0 — supports 2-column layouts)
+## GOLD STANDARD: FOOTER (v5.4.0 â€” supports 2-column layouts)
 
 When the spec's footer section uses a "columns" content element, render with the Mavlers dir="rtl" two-column trick. The dir-rtl trick swaps display order on small screens for proper stacking.
 
-PATTERN — Two-column footer (logo+social on LEFT, contact on RIGHT):
+PATTERN â€” Two-column footer (logo+social on LEFT, contact on RIGHT):
 <table dir="rtl" width="100%" border="0" cellspacing="0" cellpadding="0">
   <tbody>
     <tr>
@@ -3004,7 +3004,7 @@ PATTERN — Two-column footer (logo+social on LEFT, contact on RIGHT):
   </tbody>
 </table>
 
-PATTERN — Single-column footer (centered):
+PATTERN â€” Single-column footer (centered):
 Footer has logo-left + social-icons-right in ONE row, then links row, then copyright bar:
 
 <!-- Footer row 1: Logo + Social Icons -->
@@ -3044,7 +3044,7 @@ Footer has logo-left + social-icons-right in ONE row, then links row, then copyr
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
 
-Note: Use xmlns WITHOUT lang="en" on the <html> tag — matching developer pattern.
+Note: Use xmlns WITHOUT lang="en" on the <html> tag â€” matching developer pattern.
 
 ## MANDATORY HEAD BLOCK
 <head>
@@ -3136,12 +3136,12 @@ NOTE: The em_main_table directly contains section <tr> blocks. There is NO third
 
 ## IMAGE URL HANDLING (v5.0.0)
 Every image element in the spec's content arrays has an "src" field populated with the exact Dropbox URL to use. You must:
-1. Use spec.content[].src VERBATIM as the img src attribute — never modify, never substitute with relative paths, never shorten.
+1. Use spec.content[].src VERBATIM as the img src attribute â€” never modify, never substitute with relative paths, never shorten.
 2. Never invent image filenames like "images/hero.jpg" or "images/logo_img1.png".
-3. If spec's src field is an empty string "", it means no matching uploaded asset exists — render the img tag with src="" and the descriptive alt from the spec. Do NOT fabricate a filename.
-4. Width and height attributes come from spec.content[].width and spec.content[].height — use those values as numbers without "px" suffix.
+3. If spec's src field is an empty string "", it means no matching uploaded asset exists â€” render the img tag with src="" and the descriptive alt from the spec. Do NOT fabricate a filename.
+4. Width and height attributes come from spec.content[].width and spec.content[].height â€” use those values as numbers without "px" suffix.
 5. Always include alt text from spec.content[].alt.
-6. NEVER output img src values like "images/anything.png" — those are relative paths which break in every email client.
+6. NEVER output img src values like "images/anything.png" â€” those are relative paths which break in every email client.
 
 ## SPECIAL SECTION TYPES (new in v3.3.0)
 
@@ -3149,12 +3149,12 @@ Every image element in the spec's content arrays has an "src" field populated wi
 A narrow horizontal bar, typically 2-10px tall, in any brand/accent color. Appears at the top, bottom, or between major sections. Render as a spacer-based divider using the bg color from the spec:
 <td height="5" style="height: 5px; line-height: 0px; font-size: 0px;" bgcolor="#SPEC_BG_HEX"><img src="images/spacer.gif" width="1" height="1" alt="" border="0" style="display: block; max-width: 1px;"/></td>
 
-Use whatever bg color the spec provides — could be any accent color (green, orange, red, blue, brand color, etc.). Height can be 2px, 5px, 8px, or 10px based on the spec's height_hint.
+Use whatever bg color the spec provides â€” could be any accent color (green, orange, red, blue, brand color, etc.). Height can be 2px, 5px, 8px, or 10px based on the spec's height_hint.
 
 ### alert_bar (orange/red/yellow notification strip)
 A narrow bar with a bright background color and uppercase text:
 <td align="center" valign="top" style="font-size: 10px; line-height: 14px; color: #000000; font-family:'FONT_STACK'; text-transform: uppercase; padding: 13px 15px;">ALERT TEXT HERE</td>
-Use the bgcolor from the spec — alert bars use any bright accent color (orange, red, yellow, amber, teal, etc. — whatever the design shows).
+Use the bgcolor from the spec â€” alert bars use any bright accent color (orange, red, yellow, amber, teal, etc. â€” whatever the design shows).
 
 ### phone_bar (phone number in its own band, usually above footer)
 <td align="center" valign="top" style="padding: 20px 40px;" bgcolor="#SPEC_BG_HEX">
@@ -3162,7 +3162,7 @@ Use the bgcolor from the spec — alert bars use any bright accent color (orange
 </td>
 
 ### closing_cta (prominent final call-to-action block before footer)
-A high-emphasis closing section with large heading + CTA, often with a full-width colored background. Use the heading text, colors, and styling from the spec — do NOT hard-code any specific wording:
+A high-emphasis closing section with large heading + CTA, often with a full-width colored background. Use the heading text, colors, and styling from the spec â€” do NOT hard-code any specific wording:
 <td align="center" valign="top" style="padding: 50px 40px;" bgcolor="#SPEC_BG_HEX">
   <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
     <tr>
@@ -3197,32 +3197,32 @@ Used for activity feeds, booking lists, etc. Each entry has name (bold), timesta
 </table>
 
 ### DARK/LIGHT DUPLICATE SECTIONS
-Some designs show the SAME section twice — once styled for dark mode preview, once for light mode. When the spec shows two adjacent sections with similar content but different bg colors (e.g., black bg then white bg for the same logo/preheader), output BOTH sections. Tag them with classes:
+Some designs show the SAME section twice â€” once styled for dark mode preview, once for light mode. When the spec shows two adjacent sections with similar content but different bg colors (e.g., black bg then white bg for the same logo/preheader), output BOTH sections. Tag them with classes:
 - Dark version: bgcolor="#000000" with class="em_dark"
 - Light version: bgcolor="#ffffff" with class="em_white1" or "em_white2"
 
-## ANTI-PATTERNS — NEVER OUTPUT
-1. <p> tags — use <td>
-2. <h1>-<h6> tags — use <td> with inline font-size/weight
+## ANTI-PATTERNS â€” NEVER OUTPUT
+1. <p> tags â€” use <td>
+2. <h1>-<h6> tags â€” use <td> with inline font-size/weight
 3. <div> tags (except hidden preheader)
 4. <button> elements
-5. CSS border-top/border-bottom for dividers — use spacer.gif + bgcolor
+5. CSS border-top/border-bottom for dividers â€” use spacer.gif + bgcolor
 6. role="presentation" on layout tables (developer doesn't use it in this codebase)
-7. Substituting common defaults (#000000, #FFFFFF, #00FF00, etc.) when the spec provides specific brand hex values — always use the exact hex from the spec
-8. Neon/pure/saturated colors (like #00FF00, #FF0000, #0000FF) when spec shows a brand variant. Match the exact hex from spec — brand colors are almost always slightly off-pure (#1FC23D not #00FF00, #E41525 not #FF0000, #0A36A8 not #0000FF).
+7. Substituting common defaults (#000000, #FFFFFF, #00FF00, etc.) when the spec provides specific brand hex values â€” always use the exact hex from the spec
+8. Neon/pure/saturated colors (like #00FF00, #FF0000, #0000FF) when spec shows a brand variant. Match the exact hex from spec â€” brand colors are almost always slightly off-pure (#1FC23D not #00FF00, #E41525 not #FF0000, #0A36A8 not #0000FF).
 9. border-radius: 4px on CTAs (should be 6px or 30px based on spec)
 10. @import for fonts (use <link> tag)
 11. One giant em_wrapper nesting all sections (each section gets its own)
-12. SKIPPING any section from the spec — if spec has N sections, output N sections
-13. DEDUPLICATING sections — if spec shows the same content twice (dark+light, two variants), output both
-14. Collapsing similar adjacent sections into one — preserve every section from the spec
-15. **Splitting a "spans" element into two <td> rows** — the developer's reference code always renders multi-color headings as ONE <td> with multiple inline <span> elements. If spec content has a "spans" array, output ONE td with multiple spans. NEVER duplicate the heading text across multiple colored rows.
-16. **Relative image paths** — img src="images/anything.png" is always wrong in v5. If spec has a URL, use it; if spec has empty src, use empty src. NEVER make up a filename.
-17. **Inventing sections not in the spec** — if the spec has 23 sections, output exactly 23 sections. Do not add a "dark logo" or "decorative banner" that isn't in the spec.
-18. **INLINE SVG OR DATA-URL IN STYLE ATTRIBUTES** — NEVER output any inline SVG, any "background: url('data:image/svg...')" declaration, any "background-image: url('data:...')" declaration, or any data URI inside an inline style attribute. The inner quote characters inside the data URI break HTML parsing and cause raw CSS to appear as visible text on the page. For bullets, use <ul>/<li> with list-style-type: disc OR render an icon as an <img> tag inside a 4-column table. NEVER embed SVG markup anywhere in the output.
-19. **Background-image declarations on list items** — a <li> with style="background: url(...)" is always wrong. If an icon bullet is required, render it as a table with 4 columns: one cell for the icon img, one spacer cell, one text cell.
+12. SKIPPING any section from the spec â€” if spec has N sections, output N sections
+13. DEDUPLICATING sections â€” if spec shows the same content twice (dark+light, two variants), output both
+14. Collapsing similar adjacent sections into one â€” preserve every section from the spec
+15. **Splitting a "spans" element into two <td> rows** â€” the developer's reference code always renders multi-color headings as ONE <td> with multiple inline <span> elements. If spec content has a "spans" array, output ONE td with multiple spans. NEVER duplicate the heading text across multiple colored rows.
+16. **Relative image paths** â€” img src="images/anything.png" is always wrong in v5. If spec has a URL, use it; if spec has empty src, use empty src. NEVER make up a filename.
+17. **Inventing sections not in the spec** â€” if the spec has 23 sections, output exactly 23 sections. Do not add a "dark logo" or "decorative banner" that isn't in the spec.
+18. **INLINE SVG OR DATA-URL IN STYLE ATTRIBUTES** â€” NEVER output any inline SVG, any "background: url('data:image/svg...')" declaration, any "background-image: url('data:...')" declaration, or any data URI inside an inline style attribute. The inner quote characters inside the data URI break HTML parsing and cause raw CSS to appear as visible text on the page. For bullets, use <ul>/<li> with list-style-type: disc OR render an icon as an <img> tag inside a 4-column table. NEVER embed SVG markup anywhere in the output.
+19. **Background-image declarations on list items** â€” a <li> with style="background: url(...)" is always wrong. If an icon bullet is required, render it as a table with 4 columns: one cell for the icon img, one spacer cell, one text cell.
 
-## MAVLERS PATTERN LIBRARY (v8.1.0 — generic patterns from production references)
+## MAVLERS PATTERN LIBRARY (v8.1.0 â€” generic patterns from production references)
 
 These patterns are extracted from human-coded Mavlers production emails. They apply to ANY Mavlers email design, not just one specific file. Use them whenever the spec exhibits the matching characteristics. These patterns take PRECEDENCE over generic "stacked vertical" defaults.
 
@@ -3268,18 +3268,18 @@ For font weight mixing in headings: when the spec's text content has DIFFERENT W
 \`\`\`
 The default weight is the lighter one (400). The heavier weight (600) is applied selectively to specific words via inline span. Determine which words are heavy by examining the visual reference.
 
-Status pill (e.g. "Issue 012 · Live") with red bullet indicator:
+Status pill (e.g. "Issue 012 Â· Live") with red bullet indicator:
 \`\`\`html
 <td align="center" valign="middle" height="27" style="font-family:'FONT_STACK'; font-size:12px; color:#SPEC_TEXT; font-weight:500; border:1px solid #SPEC_BORDER; padding:0 10px; background-color:#SPEC_BG; border-radius:14px; letter-spacing:1.4px;">
   <span style="color:#FF2323; font-size:14px; font-weight:700;">&bull;</span>&nbsp; STATUS TEXT
 </td>
 \`\`\`
-The red bullet (•) is achieved via a colored inline span at the start. Use this pattern for any "Live", "Active", "Now", or status-indicator pill.
+The red bullet (â€¢) is achieved via a colored inline span at the start. Use this pattern for any "Live", "Active", "Now", or status-indicator pill.
 
 ### PATTERN 3: TICKER / CATEGORY BAR (horizontal items with hairline dividers)
 Trigger: spec has 3-8 short uppercase labels arranged horizontally in a single row (e.g. industry sectors, categories, filters, tags).
 
-CRITICAL: separator between items is NOT a bullet dot (•) and NOT a pipe (|). Use a 1-2px wide TD with bgcolor:
+CRITICAL: separator between items is NOT a bullet dot (â€¢) and NOT a pipe (|). Use a 1-2px wide TD with bgcolor:
 
 \`\`\`html
 <td align="center" bgcolor="#SPEC_BAR_BG" style="background-color:#SPEC_BAR_BG;">
@@ -3337,15 +3337,15 @@ Trigger: spec has 3-6 short data points each with a number and a small label (e.
   </table>
 </td>
 \`\`\`
-NEVER render stats as floating inline numbers — always inside the bordered strip with vertical dividers between cells.
+NEVER render stats as floating inline numbers â€” always inside the bordered strip with vertical dividers between cells.
 
 ### PATTERN 5: SECTION LABEL (numbered section heading with horizontal line)
 Trigger: spec has a section labeled "01", "02", "03" (or similar numbering) followed by an uppercase section title. Common in editorial / report-style emails.
 
 This pattern has TWO VARIANTS depending on visual treatment:
 
-**VARIANT A — Muted/secondary section labels (typically used for "01", "02"):**
-3-cell horizontal layout — muted number left + hairline horizontal line middle + muted label right. Used when the section label is secondary navigation:
+**VARIANT A â€” Muted/secondary section labels (typically used for "01", "02"):**
+3-cell horizontal layout â€” muted number left + hairline horizontal line middle + muted label right. Used when the section label is secondary navigation:
 \`\`\`html
 <td align="center" valign="top" bgcolor="#SPEC_BG">
   <table align="center" width="600" border="0" cellspacing="0" cellpadding="0">
@@ -3368,7 +3368,7 @@ This pattern has TWO VARIANTS depending on visual treatment:
 </td>
 \`\`\`
 
-**VARIANT B — Emphasized section labels (typically used for the FINAL numbered section like "03"):**
+**VARIANT B â€” Emphasized section labels (typically used for the FINAL numbered section like "03"):**
 Number sits inside a SMALL BORDERED ROUNDED BOX, label is WHITE and visually heavier. Used when the section deserves more attention:
 \`\`\`html
 <td align="center" valign="top" bgcolor="#SPEC_BG">
@@ -3405,9 +3405,9 @@ Choose variant based on the visual reference. NEVER collapse the number and the 
 
 ### PATTERN 6: CARD GRID (3x2, 3x3, 2x2 grids of similar items)
 Trigger: spec has 4+ similar items (cards) that should be arranged in a grid, not stacked vertically. Look at the visual reference to determine column count:
-- 6+ items → typically 3 columns (3x2, 3x3)
-- 4 items → typically 2 columns (2x2)
-- 2-3 items → side-by-side single row
+- 6+ items â†’ typically 3 columns (3x2, 3x3)
+- 4 items â†’ typically 2 columns (2x2)
+- 2-3 items â†’ side-by-side single row
 
 Use \`<th>\` for column cells with \`class="em_clear"\` so they stack on mobile:
 \`\`\`html
@@ -3475,7 +3475,7 @@ Status label (e.g. "CANDIDATE STATUS", "AVAILABILITY"): uses RED color #FF2323 (
 \`\`\`
 NEVER render status labels in grey. They are red (or whatever brand red the spec uses) by design convention.
 
-Red bullet item (e.g. "• Actively Interviewing", "• open to relocate"):
+Red bullet item (e.g. "â€¢ Actively Interviewing", "â€¢ open to relocate"):
 \`\`\`html
 <table width="100%" align="left" border="0" cellspacing="0" cellpadding="0">
   <tr>
@@ -3487,7 +3487,7 @@ Red bullet item (e.g. "• Actively Interviewing", "• open to relocate"):
 \`\`\`
 The bullet character is colored red via inline style, item text is light grey.
 
-Action link with arrow icon (e.g. "VIEW FULL PROFILE →"):
+Action link with arrow icon (e.g. "VIEW FULL PROFILE â†’"):
 \`\`\`html
 <td style="border-top:1px solid #SPEC_DIVIDER; padding-top:6px;">
   <table align="left" border="0" cellpadding="0" cellspacing="0" width="100%">
@@ -3501,10 +3501,10 @@ Action link with arrow icon (e.g. "VIEW FULL PROFILE →"):
   </table>
 </td>
 \`\`\`
-If no arrow image URL is available, fallback to \`&rarr;\` or \`→\` Unicode character in a colored span.
+If no arrow image URL is available, fallback to \`&rarr;\` or \`â†’\` Unicode character in a colored span.
 
 ### PATTERN 9: FEATURED PROFILE CAPSULE TAGS (bordered rectangles in a row)
-Trigger: spec has 4-8 short attribute labels arranged in 1-2 rows (location, role type, salary, requirements, etc.). These look like "pills" but are BORDERED RECTANGLES WITHOUT border-radius — flat-sided.
+Trigger: spec has 4-8 short attribute labels arranged in 1-2 rows (location, role type, salary, requirements, etc.). These look like "pills" but are BORDERED RECTANGLES WITHOUT border-radius â€” flat-sided.
 
 \`\`\`html
 <table align="left" border="0" cellpadding="0" cellspacing="0">
@@ -3608,7 +3608,7 @@ Critical specifics:
 - Container bgcolor is dark \`#1A1A19\`, border is muted grey \`#5F5F5F\`, border-radius is 14px
 - Top/bottom padding inside container is 19px
 - LEFT column width is 273px, RIGHT column width is 274px (these are FIXED, not percentages)
-- Vertical divider is 1px wide TH with bgcolor \`#878787\` (NOT dark grey — it's a visible mid-grey line)
+- Vertical divider is 1px wide TH with bgcolor \`#878787\` (NOT dark grey â€” it's a visible mid-grey line)
 - Column heading: number in \`#878787\` weight 700 + 18px spacer + label in \`#FFFFFF\` font-weight **600** (NOT 700)
 - Bullets use the red square pattern (Pattern 12) with sqr.png or CSS fallback
 
@@ -3627,7 +3627,7 @@ Trigger: spec has a section with 3-8 bullet points displayed in a single bordere
             <!-- BORDERED CARD: full inner width -->
             <td align="center" valign="top" style="padding:18px 20px 18px 19px; border:1px solid #5F5F5F; border-radius:14px;" bgcolor="#1A1A19" class="em_pad">
               <table align="center" width="100%" border="0" cellspacing="0" cellpadding="0">
-                <!-- First bullet — no padding-top -->
+                <!-- First bullet â€” no padding-top -->
                 <tr>
                   <td valign="top" align="left">
                     <table width="100%" align="left" border="0" cellspacing="0" cellpadding="0">
@@ -3639,7 +3639,7 @@ Trigger: spec has a section with 3-8 bullet points displayed in a single bordere
                     </table>
                   </td>
                 </tr>
-                <!-- Subsequent bullets — padding-top:9px -->
+                <!-- Subsequent bullets â€” padding-top:9px -->
                 <tr>
                   <td valign="top" align="left" style="padding-top:9px;">
                     <!-- same bullet structure -->
@@ -3657,7 +3657,7 @@ Trigger: spec has a section with 3-8 bullet points displayed in a single bordere
 
 Specifics:
 - Outer wrapper padding: \`20px 25px 0px 25px\` (top/sides, no bottom)
-- Card padding: \`18px 20px 18px 19px\` (note slight asymmetry — left is 19px, right is 20px)
+- Card padding: \`18px 20px 18px 19px\` (note slight asymmetry â€” left is 19px, right is 20px)
 - Card border: 1px solid \`#5F5F5F\`, border-radius 14px, bgcolor \`#1A1A19\`
 - Bullets: 5px sqr.png + 10px spacer + text in \`#EBEBEB\` 14px weight 400
 - First bullet has no padding-top; subsequent bullets have \`padding-top:9px\`
@@ -3722,7 +3722,7 @@ Specific structural rules (verified against production reference):
                                 </table>
                               </td>
                             </tr>
-                            <!-- More bullets — padding-top:9px each, same border-bottom -->
+                            <!-- More bullets â€” padding-top:9px each, same border-bottom -->
                           </table>
                         </td>
                       </tr>
@@ -3783,10 +3783,10 @@ Critical specifics:
 - Bullets in LEFT card have \`border-bottom:1px solid #2A2A29\` between each (creates a horizontal divider line under each item)
 - Bullet sqr.png is 4px wide (not 5px), with 9px spacer (not 10px)
 - First bullet has \`padding-top:23px\` (large gap from subtitle), subsequent bullets \`padding-top:9px\`
-- Red pill button has border-radius:24px (NOT 22px — that's different from Pattern 14)
+- Red pill button has border-radius:24px (NOT 22px â€” that's different from Pattern 14)
 - 12px gap between LEFT and RIGHT cards, hides on mobile
 
-NEVER render this as two stacked rows. NEVER omit the right CTA card frame — the red button SITS INSIDE a bordered card, not floating alone.
+NEVER render this as two stacked rows. NEVER omit the right CTA card frame â€” the red button SITS INSIDE a bordered card, not floating alone.
 
 ### PATTERN 14: GRADIENT BANNER CTA (Ready-to-Meet style)
 Trigger: spec has a horizontal closing CTA banner where the left side has text and the right side has a CTA button.
@@ -3840,7 +3840,7 @@ Trigger: spec footer has contact methods (email, website) with small icons + a b
   </table>
 </td>
 \`\`\`
-If mail/web icon URLs aren't in the spec, fallback to Unicode (✉ for mail, 🌐 for web) wrapped in a colored span, or use simple text "Email:" / "Web:" prefixes. Avoid emoji.
+If mail/web icon URLs aren't in the spec, fallback to Unicode (âœ‰ for mail, ðŸŒ for web) wrapped in a colored span, or use simple text "Email:" / "Web:" prefixes. Avoid emoji.
 
 ## PATTERN-MATCHING GUIDANCE
 
@@ -3851,7 +3851,7 @@ When generating an email:
 4. If no pattern matches, fall back to the GOLD STANDARD section templates above
 5. NEVER add visual elements (red borders, capsule rounding, color treatments) that aren't visible in the design reference
 6. NEVER stack vertically when the reference shows horizontal arrangement
-7. NEVER use bullet dots (•) or pipes (|) as ticker separators — always 1-2px bgcolor cells
+7. NEVER use bullet dots (â€¢) or pipes (|) as ticker separators â€” always 1-2px bgcolor cells
 
 The patterns above are the BASELINE for Mavlers-grade output. Match them precisely when the spec exhibits the trigger characteristics.
 
@@ -3866,7 +3866,7 @@ Before outputting, verify:
 - All colors used are from the spec's _palette array (no invented hex values)
 - EVERY text element's align attribute and text-align style matches the spec's "align" value (never default to left)
 - Every img src is the exact Dropbox URL from spec.content[].src (or "" if spec had empty src)
-- NO img tag has a relative path like "images/filename.png" — this is always wrong
+- NO img tag has a relative path like "images/filename.png" â€” this is always wrong
 - Every "spans" array renders as ONE td with multiple inline <span> elements (never two stacked rows)
 - Font loaded via <link> tag, not @import
 - All text from spec used verbatim
@@ -3884,7 +3884,7 @@ Generate the most accurate, production-ready, Mavlers-grade HTML email code poss
 // EXPRESS APP SETUP
 
 // =====================================================================
-// v9.0.0 — CLAUDE CODE BRIDGE (parallel to Anthropic API for Stage 2)
+// v9.0.0 â€” CLAUDE CODE BRIDGE (parallel to Anthropic API for Stage 2)
 // =====================================================================
 //
 // Toggle: header X-AI-Engine OR body.aiEngine = "claude-code" | "console" (default)
@@ -3911,12 +3911,12 @@ async function loadReferenceForFigmaFile(figmaFileKey) {
   return REFERENCE_CACHE.get(figmaFileKey) || null;
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// v9.2.0 — Bridge callback architecture
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// v9.2.0 â€” Bridge callback architecture
 //
 // Why this exists:
 //   We tried streaming responses (v9.1.4 / bridge v1.0.4). ngrok free tier
-//   buffers responses server-side and enforces a 5-minute response wall —
+//   buffers responses server-side and enforces a 5-minute response wall â€”
 //   even with chunked heartbeats. The only architecture that works in all
 //   environments is: bridge accepts the job, immediately returns 202, then
 //   POSTs the result back to Railway when done. No long HTTP connections.
@@ -3931,7 +3931,7 @@ async function loadReferenceForFigmaFile(figmaFileKey) {
 // This map is process-local on Railway. If Railway restarts mid-job, that
 // job is lost (caller times out). Acceptable for now; durable queue
 // would need Supabase persistence and is out of scope for this fix.
-// ────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const PENDING_BRIDGE_JOBS = new Map();
 const BRIDGE_JOB_MAX_WAIT_MS = 45 * 60 * 1000; // 45 min hard ceiling
@@ -3948,8 +3948,8 @@ function settleBridgeJob(bridgeJobId, payload) {
 
 // ESP threading (v9.x): map the coarse Lovable/server `espPlatform` value onto
 // the canonical `spec.esp_target` key that cc-runner consumes (PART I). Single
-// source of truth: C:\maveloper-bridge\esp-registry.md. Unknown / absent →
-// "plain_html" (safe default). The parser never sets esp_target — it is a
+// source of truth: C:\maveloper-bridge\esp-registry.md. Unknown / absent â†’
+// "plain_html" (safe default). The parser never sets esp_target â€” it is a
 // delivery concern applied here, just before dispatch to the bridge.
 function mapEspPlatformToTarget(espPlatform) {
   const ESP_PLATFORM_TO_TARGET = {
@@ -3958,15 +3958,15 @@ function mapEspPlatformToTarget(espPlatform) {
     braze: "liquid_braze",        // canonical platform for the (now-ACTIVE) liquid_braze family; needs a "Braze" UI option to be selectable
     sfmc: "sfmc_content_builder", // CB default; sfmc_ampscript is a separate target
     hubspot: "hubspot_cdn",       // CDN default; hubspot_hubl (dual-output) is separate
-    klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze — distinct tokens)
+    klaviyo: "klaviyo",           // kept as its own canonical family (not folded into liquid_braze â€” distinct tokens)
     pardot: "pardot",             // Pardot / Account Engagement (ACTIVE v2.6.4, substitution-only)
-    dynamics: "ms_dynamics_365",  // ⚠️ CONFIRM the exact espPlatform value the Lovable dropdown sends for Dynamics
+    dynamics: "ms_dynamics_365",  // âš ï¸ CONFIRM the exact espPlatform value the Lovable dropdown sends for Dynamics
     ms_dynamics_365: "ms_dynamics_365", // passthrough in case Lovable sends the canonical key
     sendgrid: "sendgrid",         // SendGrid Marketing Campaigns (ACTIVE v2.6.6, substitution-only)
     customer_io: "customer_io",   // Customer.io (ACTIVE v2.6.6, substitution-only)
-    customerio: "customer_io",    // ⚠️ in case the Lovable dropdown sends "customerio" (no underscore)
+    customerio: "customer_io",    // âš ï¸ in case the Lovable dropdown sends "customerio" (no underscore)
     sparkpost: "sparkpost",       // SparkPost (ACTIVE v2.6.6; data-msys-unsubscribe attribute mechanism)
-    marketo: "marketo",           // Marketo (ACTIVE v2.7.3, substitution + Layer-2 mktoText/mktoModule) — closes the only routing gap
+    marketo: "marketo",           // Marketo (ACTIVE v2.7.3, substitution + Layer-2 mktoText/mktoModule) â€” closes the only routing gap
   };
   if (espPlatform == null) return "plain_html";
   const key = String(espPlatform).trim().toLowerCase();
@@ -3975,7 +3975,7 @@ function mapEspPlatformToTarget(espPlatform) {
 
 async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, log, assetSink }) {
   if (!MAC_BRIDGE_URL) {
-    throw new Error("MAC_BRIDGE_URL not configured — set it to the ngrok URL of your Mac bridge");
+    throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
   }
 
   // Thread the selected ESP onto the spec so cc-runner (PART I) can emit
@@ -4022,12 +4022,12 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     callbackUrl,
   };
 
-  // COMPILER FLIP — STEP 4: thread the Figma coordinates the parser already
+  // COMPILER FLIP â€” STEP 4: thread the Figma coordinates the parser already
   // extracted from the placed design URL as an OPTIONAL nested object. The bridge
   // and cc-runner treat this as additive: only when BOTH fileKey and nodeId are
   // present is the deterministic compiler even eligible (and then only if the
   // bridge's COMPILER_ENABLED flag is on and the pair is allow-listed). A payload
-  // without figma coordinates — e.g. the PDF /generate path — is byte-identical
+  // without figma coordinates â€” e.g. the PDF /generate path â€” is byte-identical
   // to today. designWidth rides along for the compiler's render width.
   if (figmaFileKey && figmaNodeId) {
     payload.figma = {
@@ -4077,7 +4077,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
         "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify(payload),
-      // Short signal — dispatch should be near-instant. If it takes more
+      // Short signal â€” dispatch should be near-instant. If it takes more
       // than 60 sec, something is wrong at the network layer.
       signal: AbortSignal.timeout(60 * 1000),
     });
@@ -4107,7 +4107,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     throw new Error(`Bridge rejected dispatch with status ${dispatchResp.status}: ${errText.substring(0, 500)}`);
   }
 
-  log("info", "Bridge accepted job — waiting for callback", {
+  log("info", "Bridge accepted job â€” waiting for callback", {
     requestId,
     bridgeJobId,
     dispatchStatus: dispatchResp.status,
@@ -4223,7 +4223,7 @@ app.get("/health", (req, res) => {
 });
 
 // -----------------------------------------------------------------
-// POST /generate — Main pipeline
+// POST /generate â€” Main pipeline
 // Accepts: { pdfBase64, pdfFilename, assetsZipBase64? }
 // Returns: { html, orderId, pageCount, pageImages, imageUrlMap, requestId }
 // -----------------------------------------------------------------
@@ -4234,7 +4234,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
       pdfBase64, 
       pdfFilename, 
       assetsZipBase64, 
-      // Developer input fields — only values Claude CANNOT detect from PDF
+      // Developer input fields â€” only values Claude CANNOT detect from PDF
       emailWidth,        // e.g., 600, 640, 650, 680, 700
       primaryFont,       // e.g., "Poppins", "Montserrat", "Lato", "Arial"
       secondaryFont,     // e.g., "Arial", optional
@@ -4378,7 +4378,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
 
       // HARD FAIL if upload produced zero URLs despite having images
       if (Object.keys(imageUrlMap).length === 0) {
-        log("error", "Dropbox upload failed completely — aborting to avoid shipping broken HTML", {
+        log("error", "Dropbox upload failed completely â€” aborting to avoid shipping broken HTML", {
           requestId: req.id,
           imageCount: images.length,
         });
@@ -4391,7 +4391,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
 
       // PARTIAL fail: log but continue (will have some broken images, not all)
       if (Object.keys(imageUrlMap).length < images.length) {
-        log("warn", "Partial Dropbox upload — some images failed", {
+        log("warn", "Partial Dropbox upload â€” some images failed", {
           requestId: req.id,
           uploaded: Object.keys(imageUrlMap).length,
           total: images.length,
@@ -4401,7 +4401,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
     }
 
     // =================================================================
-    // STAGE 1 — Design Analysis (v5.0.0)
+    // STAGE 1 â€” Design Analysis (v5.0.0)
     // Full-design Claude call with pixel-sampled palette + OCR text.
     //
     // v4.x was per-band Claude calls. That fragmented sections and lost
@@ -4565,7 +4565,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
         const tileHeight = y_end - y_start;
 
         // Step-down JPEG quality until under byte cap.
-        // We do NOT resize width — native resolution is preserved so text
+        // We do NOT resize width â€” native resolution is preserved so text
         // and section boundaries stay crisp.
         const qualityAttempts = [82, 75, 68, 60, 52, 45];
         let tileBuffer = null;
@@ -4708,7 +4708,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
     const imageAssetList = Object.entries(imageUrlMap)
       .map(([filename, url]) => {
         const dims = imageDimensions[filename] || {};
-        return `  ${filename}  (${dims.width || "?"}x${dims.height || "?"}px)  →  ${url}`;
+        return `  ${filename}  (${dims.width || "?"}x${dims.height || "?"}px)  â†’  ${url}`;
       })
       .join("\n");
 
@@ -4722,7 +4722,7 @@ app.post("/generate", generateLimiter, optionalAuth, async (req, res) => {
       devOverrides.push(`DARK MODE SUPPORT: ${darkMode ? "required" : "not required"}`);
     const devOverridesText = devOverrides.length
       ? devOverrides.join("\n")
-      : "(none — use your best judgment)";
+      : "(none â€” use your best judgment)";
 
     const stage1UserPrompt = `
 === DEVELOPER-SPECIFIED VALUES (authoritative overrides) ===
@@ -4759,7 +4759,7 @@ Now analyze the attached design image and produce the JSON specification per the
     tiles.forEach((tile, idx) => {
       stage1ImageBlocks.push({
         type: "text",
-        text: `--- TILE ${idx + 1} of ${tiles.length} — y_range=${tile.y_offset}-${tile.y_end} (height ${tile.y_end - tile.y_offset}px) ---`,
+        text: `--- TILE ${idx + 1} of ${tiles.length} â€” y_range=${tile.y_offset}-${tile.y_end} (height ${tile.y_end - tile.y_offset}px) ---`,
       });
       stage1ImageBlocks.push({
         type: "image",
@@ -4900,7 +4900,7 @@ Now analyze the attached design image and produce the JSON specification per the
       const repaired = autoRepairJson(candidateJson);
       try {
         designSpec = JSON.parse(repaired);
-        log("warn", "Stage 1 JSON was truncated — auto-repaired", {
+        log("warn", "Stage 1 JSON was truncated â€” auto-repaired", {
           requestId: req.id,
           stopReason: stage1Message.stop_reason,
           originalLength: rawJson.length,
@@ -4908,7 +4908,7 @@ Now analyze the attached design image and produce the JSON specification per the
           outputTokens: stage1Message.usage?.output_tokens,
         });
       } catch (secondErr) {
-        // v5.4.1: Last-resort retry — ask Claude to regenerate cleanly with the
+        // v5.4.1: Last-resort retry â€” ask Claude to regenerate cleanly with the
         // parse error as context. This catches mid-string syntax errors that
         // truncation-repair cannot fix.
         // v5.5.0: prompt-cached system, temperature=0 for determinism, dedicated
@@ -5066,7 +5066,7 @@ Now analyze the attached design image and produce the JSON specification per the
 
 
     // =================================================================
-    // STAGE 2 — Code Generation (JSON spec + URLs → HTML)
+    // STAGE 2 â€” Code Generation (JSON spec + URLs â†’ HTML)
     // Send the design spec + image URL map + developer overrides
     // to Claude with STAGE2_PROMPT. No PDF images sent.
     // =================================================================
@@ -5074,12 +5074,12 @@ Now analyze the attached design image and produce the JSON specification per the
     // --- Build developer specs (same logic as before, but now for Stage 2) ---
     const specs = [];
 
-    // Width — developer override wins, then fall back to Stage 1 detection
+    // Width â€” developer override wins, then fall back to Stage 1 detection
     const finalWidth = emailWidth || designSpec?.width || 600;
     const breakpoint = finalWidth - 1;
     specs.push(`EMAIL WIDTH: Use exactly ${finalWidth}px for em_main_table and em_wrapper. Set table-layout:fixed. The primary responsive breakpoint is max-width: ${breakpoint}px.`);
 
-    // Fonts — developer override wins, then fall back to Stage 1 detection
+    // Fonts â€” developer override wins, then fall back to Stage 1 detection
     const finalFont = primaryFont || designSpec?.font_body || "Arial";
     const finalSecondaryFont = secondaryFont || designSpec?.font_heading;
     const fontStack = (finalSecondaryFont && finalSecondaryFont !== finalFont)
@@ -5090,7 +5090,7 @@ Now analyze the attached design image and produce the JSON specification per the
     const needsGoogleFont = !systemFonts.includes(finalFont.toLowerCase());
 
     if (needsGoogleFont) {
-      specs.push(`FONT: Load '${finalFont}' via Google Fonts inside <!--[if !mso]><!--><style>@import url('https://fonts.googleapis.com/css2?family=${encodeURIComponent(finalFont)}:wght@100..900&display=swap');</style><!--<![endif]-->. Use font-family: ${fontStack} for ALL text elements throughout the email. NEVER fall back to just 'Arial, sans-serif' — the loaded font MUST be the primary in every font-family declaration.`);
+      specs.push(`FONT: Load '${finalFont}' via Google Fonts inside <!--[if !mso]><!--><style>@import url('https://fonts.googleapis.com/css2?family=${encodeURIComponent(finalFont)}:wght@100..900&display=swap');</style><!--<![endif]-->. Use font-family: ${fontStack} for ALL text elements throughout the email. NEVER fall back to just 'Arial, sans-serif' â€” the loaded font MUST be the primary in every font-family declaration.`);
     } else {
       specs.push(`FONT: Use font-family: ${fontStack} for all text elements. No Google Font loading needed.`);
     }
@@ -5124,13 +5124,13 @@ Now analyze the attached design image and produce the JSON specification per the
       }
     }
 
-    // Dark Mode — v2.7.10: DEVELOPER-CONTROLLED, DEFAULT LIGHT-ONLY (matches the Figma/async path).
+    // Dark Mode â€” v2.7.10: DEVELOPER-CONTROLLED, DEFAULT LIGHT-ONLY (matches the Figma/async path).
     const resolvedDarkMode = (darkMode === true || darkMode === "true");   // default (absent/false) = light-only
     if (designSpec) designSpec.darkMode = resolvedDarkMode;                 // thread into spec.json for the validator
     if (resolvedDarkMode) {
       specs.push(`DARK_MODE: true (emit dark-mode support). Add @media (prefers-color-scheme: dark) rules with design-specific dark colors + em_dark1..em_dark5 on section backgrounds, em_txt_white/em_txt_lightwht on text that inverts, and the color-scheme / supported-color-schemes metas.`);
     } else {
-      specs.push(`DARK_MODE: false (LIGHT-ONLY — OMIT the dark-mode @media block and color-scheme metas entirely). No prefers-color-scheme media query, no em_dark classes.`);
+      specs.push(`DARK_MODE: false (LIGHT-ONLY â€” OMIT the dark-mode @media block and color-scheme metas entirely). No prefers-color-scheme media query, no em_dark classes.`);
     }
 
     // --- Build image URL reference for Stage 2 (v5.0.0) ---
@@ -5155,10 +5155,10 @@ Now analyze the attached design image and produce the JSON specification per the
         })
         .join("\n");
 
-      imageSection = `\n\n=== IMAGE ASSETS REFERENCE (backup — primary URLs are embedded in spec.content[].src) ===
+      imageSection = `\n\n=== IMAGE ASSETS REFERENCE (backup â€” primary URLs are embedded in spec.content[].src) ===
 ${imageListStr}
 
-NOTE: In v5.0.0 the Stage 1 analysis has already matched images and embedded the correct Dropbox URL in each section's content.src field. Use those embedded URLs directly. This list is only a reference — do NOT use it to substitute URLs that Stage 1 already matched.
+NOTE: In v5.0.0 the Stage 1 analysis has already matched images and embedded the correct Dropbox URL in each section's content.src field. Use those embedded URLs directly. This list is only a reference â€” do NOT use it to substitute URLs that Stage 1 already matched.
 === END IMAGE ASSETS REFERENCE ===`;
     }
 
@@ -5169,7 +5169,7 @@ NOTE: In v5.0.0 the Stage 1 analysis has already matched images and embedded the
 ${JSON.stringify(designSpec, null, 2)}
 === END DESIGN SPECIFICATION ===
 
-=== DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
+=== DEVELOPER-SPECIFIED VALUES (MANDATORY â€” these override the spec where they differ) ===
 ${specs.join("\n\n")}
 === END DEVELOPER SPECIFICATIONS ===${imageSection}`;
 
@@ -5190,13 +5190,13 @@ ${specs.join("\n\n")}
 
     const stage2StartTime = Date.now();
 
-    // v9.0.0: Engine routing — Claude Code bridge OR existing Anthropic API
+    // v9.0.0: Engine routing â€” Claude Code bridge OR existing Anthropic API
     const requestedEngine = getRequestedEngine(req);
     log("info", "Stage 2: engine selection", { requestId: req.id, engine: requestedEngine });
 
     let html_raw;
     if (requestedEngine === "claude-code") {
-      // ─── Claude Code path (uses Mac bridge, Max 20× subscription, $0/gen) ───
+      // â”€â”€â”€ Claude Code path (uses Mac bridge, Max 20Ã— subscription, $0/gen) â”€â”€â”€
       try {
         // Best-effort: load reference HTML if available for this Figma file
         let referenceHtmlForCC = null;
@@ -5237,7 +5237,7 @@ ${specs.join("\n\n")}
         html_raw = stage2TextBlock.text;
       }
     } else {
-      // ─── Original Anthropic API path (UNCHANGED from v8.1.1) ───
+      // â”€â”€â”€ Original Anthropic API path (UNCHANGED from v8.1.1) â”€â”€â”€
       const stage2Response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 64000,
@@ -5352,7 +5352,7 @@ ${specs.join("\n\n")}
     });
 
     if (!sectionCountMatch || !bandCountMatch) {
-      log("warn", "SECTION COUNT MISMATCH — HTML has fewer sections than spec", {
+      log("warn", "SECTION COUNT MISMATCH â€” HTML has fewer sections than spec", {
         requestId: req.id,
         htmlSections: htmlOpeningSections.length,
         specSections: specSectionCount,
@@ -5386,7 +5386,7 @@ ${specs.join("\n\n")}
     // --- Step 7: Ensure imageUrlMap is populated ---
     // Fallback: if imageUrlMap is empty but the HTML contains Dropbox URLs, extract them
     if (Object.keys(imageUrlMap).length === 0 && (html.includes("dl.dropboxusercontent.com") || html.includes("www.dropbox.com/scl"))) {
-      log("warn", "imageUrlMap was empty but HTML contains Dropbox URLs — extracting from HTML", { requestId: req.id });
+      log("warn", "imageUrlMap was empty but HTML contains Dropbox URLs â€” extracting from HTML", { requestId: req.id });
       
       // Match both dl.dropboxusercontent.com and www.dropbox.com URLs
       const urlRegex = /https:\/\/(?:dl\.dropboxusercontent\.com|www\.dropbox\.com)\/scl\/fi\/[^\s"'<>]+/g;
@@ -5488,12 +5488,12 @@ ${specs.join("\n\n")}
 });
 
 // =====================================================================
-// POST /generate-from-figma — v6.1.0 (Phase B: auto image export)
+// POST /generate-from-figma â€” v6.1.0 (Phase B: auto image export)
 // Accepts: { figmaUrl, emailWidth?, primaryFont?, secondaryFont?, espPlatform?, darkMode? }
 // Returns: { html, orderId, pageImages, imageUrlMap, designSpec, figmaSource, requestId }
 //
 // Pipeline:
-//   1. Parse Figma URL → fetch node tree from Figma REST API
+//   1. Parse Figma URL â†’ fetch node tree from Figma REST API
 //   2. Convert node tree to designSpec JSON (skips Stage 1 vision entirely)
 //   3. Render every image node + the email frame via Figma /v1/images
 //   4. Upload images to Dropbox; patch designSpec src fields with real URLs
@@ -5501,7 +5501,7 @@ ${specs.join("\n\n")}
 //   6. Run post-processors (HTML hygiene; band-related rules are no-ops)
 //   7. Return HTML + pageImages[0]=preview URL + imageUrlMap
 //
-// Phase B (v6.1.0) — image export is automatic:
+// Phase B (v6.1.0) â€” image export is automatic:
 //   - Every <img> in the generated HTML has a real Dropbox URL.
 //   - The /approve endpoint's ZIP packaging picks up the images via
 //     imageUrlMap (same path the PDF flow uses).
@@ -5511,7 +5511,7 @@ ${specs.join("\n\n")}
 // =====================================================================
 
 // =====================================================================
-// v9.1.0 — ASYNC JOB PATTERN
+// v9.1.0 â€” ASYNC JOB PATTERN
 //
 // PROBLEM:
 //   Railway's HTTP request handler has a ~30s timeout. Claude Code
@@ -5519,9 +5519,9 @@ ${specs.join("\n\n")}
 //   even on success.
 //
 // SOLUTION:
-//   /generate-from-figma-async — returns a jobId in <1s, runs generation
+//   /generate-from-figma-async â€” returns a jobId in <1s, runs generation
 //     in background, writes result to Supabase maveloper_jobs table.
-//   /job-status/:jobId — polls Supabase for status/result/error.
+//   /job-status/:jobId â€” polls Supabase for status/result/error.
 //
 // IMPLEMENTATION:
 //   The async endpoint reuses the existing synchronous /generate-from-figma
@@ -5616,7 +5616,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       userEmail: req.user?.email ?? "anonymous",
     });
 
-    // --- Stage 1 (Figma): parse URL → fetch → produce designSpec ---
+    // --- Stage 1 (Figma): parse URL â†’ fetch â†’ produce designSpec ---
     let figmaResult;
     try {
       figmaResult = await figmaToDesignSpec({
@@ -5695,7 +5695,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     designSpec.darkMode = resolvedDarkMode;
     specs.push(resolvedDarkMode
       ? `DARK_MODE: true (emit dark-mode support: @media prefers-color-scheme:dark block + color-scheme metas + em_dark scaffold)`
-      : `DARK_MODE: false (LIGHT-ONLY — OMIT the dark-mode @media block and color-scheme metas entirely)`);
+      : `DARK_MODE: false (LIGHT-ONLY â€” OMIT the dark-mode @media block and color-scheme metas entirely)`);
 
     // --- v6.2.0 Phase B: render & export images from Figma to Dropbox ---
     // For every image node the parser found (inline images, section bg_images,
@@ -5718,7 +5718,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       // v6.5.0: bg_image collection now also captures imageRef so we can
       // fetch the RAW (uncomposited) image instead of a frame render.
       // Without this fix, frames with image fill + text children render
-      // as PNGs containing the text — which then duplicates when the HTML
+      // as PNGs containing the text â€” which then duplicates when the HTML
       // overlay text is rendered on top of the bg ("double print" bug).
       const bgImageNodes = [];
       for (const s of designSpec.sections || []) {
@@ -5736,11 +5736,11 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
 
       // v6.4.0: dedup imageRefs by renderKey before calling Figma.
       // Multiple INSTANCEs sharing a component master at the same size
-      // render to identical PNGs — render once, reuse URL across all
+      // render to identical PNGs â€” render once, reuse URL across all
       // instances. Cuts ~20% off Arsenal Pulse render count and avoids
       // duplicate Dropbox uploads.
-      const renderKeyToNodeId = new Map();  // renderKey → first nodeId seen
-      const nodeIdToRenderKey = new Map();  // nodeId → renderKey (for patching)
+      const renderKeyToNodeId = new Map();  // renderKey â†’ first nodeId seen
+      const nodeIdToRenderKey = new Map();  // nodeId â†’ renderKey (for patching)
       for (const ref of imageRefs) {
         nodeIdToRenderKey.set(ref.nodeId, ref.renderKey);
         if (!renderKeyToNodeId.has(ref.renderKey)) {
@@ -5750,7 +5750,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       const dedupedInlineIds = Array.from(renderKeyToNodeId.values());
 
       // Collect ALL nodeIds to render via /v1/images (inline + preview).
-      // v6.5.0: bg_images NO LONGER go through /v1/images — they use raw
+      // v6.5.0: bg_images NO LONGER go through /v1/images â€” they use raw
       // image-ref URLs via /v1/files/.../images to avoid double-print.
       const previewNodeId = sourceFrame.id;
       const allNodeIds = [
@@ -5833,7 +5833,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
               nodeIdToFilename.set(ref.nodeId, existingFilename);
               continue;
             }
-            // First time seeing this renderKey — render & upload
+            // First time seeing this renderKey â€” render & upload
             const buf = bufferMap.get(ref.nodeId);
             if (!buf) continue;
             const filename = makeFilename(ref.name, ref.width, ref.height, takenFilenames);
@@ -5841,7 +5841,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
             nodeIdToFilename.set(ref.nodeId, filename);
             dropboxImages.push({ filename, buffer: buf });
           }
-          // Background images (no dedup — heroes are typically unique)
+          // Background images (no dedup â€” heroes are typically unique)
           for (const bg of bgImageNodes) {
             if (nodeIdToFilename.has(bg.nodeId)) continue;
             const buf = bufferMap.get(bg.nodeId);
@@ -5856,7 +5856,7 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
             imageExportReport.uploaded = Object.keys(imageUrlMap).length;
           }
 
-          // Patch designSpec — covers both content[].src and section.bg_image.src
+          // Patch designSpec â€” covers both content[].src and section.bg_image.src
           const patchReport = patchSpecImageSrcs(designSpec, nodeIdToFilename, imageUrlMap);
           imageExportReport.patched = patchReport.patched;
           imageExportReport.missing = patchReport.missing;
@@ -5904,15 +5904,15 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
 
     // Build the image section for the Stage 2 prompt
     const imageUrlList = Object.entries(imageUrlMap)
-      .map(([fn, url]) => `- ${fn} → ${url}`)
+      .map(([fn, url]) => `- ${fn} â†’ ${url}`)
       .join("\n");
     const imageSection = imageUrlList
       ? `
 
 === IMAGE ASSETS REFERENCE ===
-The following images have been uploaded to Dropbox. Each image element in the spec already has a populated src field; sections with image backgrounds have a populated bg_image.src field. Use those URLs verbatim — do NOT alter or invent image paths.
+The following images have been uploaded to Dropbox. Each image element in the spec already has a populated src field; sections with image backgrounds have a populated bg_image.src field. Use those URLs verbatim â€” do NOT alter or invent image paths.
 
-When a section has a "bg_image" object, render it as the section's background using table[background="URL"] + VML <v:image> for Outlook compatibility. Place the section's text/CTA content on top of the background. Do NOT emit an inline <img> for bg_image — it IS the section background.
+When a section has a "bg_image" object, render it as the section's background using table[background="URL"] + VML <v:image> for Outlook compatibility. Place the section's text/CTA content on top of the background. Do NOT emit an inline <img> for bg_image â€” it IS the section background.
 
 ${imageUrlList}
 === END IMAGE ASSETS REFERENCE ===`
@@ -5925,7 +5925,7 @@ No images were exported for this email. Leave src="" on each <img> tag.
     // --- Stage 2 invocation ---
     // v6.6.0: Stage 2 now receives the rendered Figma frame as a visual
     // reference IMAGE input alongside the JSON spec. Claude sees what the
-    // email should look like while writing the HTML — like a human dev
+    // email should look like while writing the HTML â€” like a human dev
     // referencing the design while coding. This is intended to help with
     // layout decisions (grids vs stacks, side-by-side vs vertical) that
     // the JSON spec alone can't fully convey.
@@ -5935,7 +5935,7 @@ No images were exported for this email. Leave src="" on each <img> tag.
 
 === VISUAL REFERENCE (FIGMA RENDER) ===
 An image of the source Figma design is attached. Use it to understand LAYOUT and STRUCTURE:
-- Multi-column layouts (e.g., 2-column profile sections, 3×2 candidate card grids)
+- Multi-column layouts (e.g., 2-column profile sections, 3Ã—2 candidate card grids)
 - Horizontal vs vertical arrangement of related elements
 - Side-by-side CTA banners vs stacked CTA blocks
 - Capsule/pill styling on tags, labels, status badges
@@ -5943,15 +5943,15 @@ An image of the source Figma design is attached. Use it to understand LAYOUT and
 - Section dividers and visual separators
 
 CRITICAL RULES:
-1. The JSON spec is the AUTHORITATIVE source for ALL TEXT CONTENT. Use spec text verbatim — never transcribe text from the image.
+1. The JSON spec is the AUTHORITATIVE source for ALL TEXT CONTENT. Use spec text verbatim â€” never transcribe text from the image.
 2. The JSON spec is the AUTHORITATIVE source for COLORS, IMAGE URLs, FONT SIZES, and explicit dimensions.
-3. The IMAGE is the AUTHORITATIVE source for LAYOUT STRUCTURE — column counts, element grouping, horizontal vs vertical arrangement.
-4. When the spec is ambiguous about layout (e.g., 6 cards in a row — grid or list?), the image resolves it.
-5. Match the image's layout structure precisely. If the image shows 3×2 grid, output a 3×2 grid. If side-by-side CTA, output side-by-side. Do NOT default to vertical stacking.
+3. The IMAGE is the AUTHORITATIVE source for LAYOUT STRUCTURE â€” column counts, element grouping, horizontal vs vertical arrangement.
+4. When the spec is ambiguous about layout (e.g., 6 cards in a row â€” grid or list?), the image resolves it.
+5. Match the image's layout structure precisely. If the image shows 3Ã—2 grid, output a 3Ã—2 grid. If side-by-side CTA, output side-by-side. Do NOT default to vertical stacking.
 === END VISUAL REFERENCE ===`
       : "";
 
-    // v8.0.0: Reference HTML injection — when a human-coded reference exists
+    // v8.0.0: Reference HTML injection â€” when a human-coded reference exists
     // for this Figma file, embed it as a few-shot example so Stage 2 learns
     // the exact Mavlers visual patterns (capsule borders, vertical-line ticker
     // dividers, bordered card containers, red status indicators, two-column
@@ -5968,12 +5968,12 @@ YOUR HTML OUTPUT MUST MATCH THIS REFERENCE in the following dimensions:
 1. CARD STYLING
    - Bordered card containers (border: 1px solid + background-color)
    - Capsule pills with border-radius:50px+ and visible 1px border
-   - Card padding, internal spacing, corner radii — MATCH PRECISELY
+   - Card padding, internal spacing, corner radii â€” MATCH PRECISELY
    - NEVER add visible borders/outlines to elements that don't have them in the reference (e.g., candidate cards in the reference have NO red border outlines)
 
 2. SECTION SEPARATORS & LABELS
    - Section labels like "01 THIS WEEK'S OUTLIERS" use a horizontal-row layout: number left, divider line middle, label right (NOT collapsed together)
-   - Ticker bars use THIN VERTICAL LINE dividers between items (1px wide), NOT bullet dots (•)
+   - Ticker bars use THIN VERTICAL LINE dividers between items (1px wide), NOT bullet dots (â€¢)
    - Stats rows sit inside a bordered horizontal strip with vertical line dividers between each stat
 
 3. COLOR USAGE
@@ -5982,8 +5982,8 @@ YOUR HTML OUTPUT MUST MATCH THIS REFERENCE in the following dimensions:
    - Red CTAs use the exact red from the reference
 
 4. LAYOUT PATTERNS
-   - "Interested in exploring further?" sits side-by-side with a RED SQUARE CARD containing the REQUEST INTRO button + arrow — NOT a standalone button
-   - Profile Overview + Operating Impact sit inside ONE bordered card container with two columns inside it — NOT two separate floating columns
+   - "Interested in exploring further?" sits side-by-side with a RED SQUARE CARD containing the REQUEST INTRO button + arrow â€” NOT a standalone button
+   - Profile Overview + Operating Impact sit inside ONE bordered card container with two columns inside it â€” NOT two separate floating columns
    - Footer mail/web icons are rendered as small images (or icon-font), not Unicode characters
 
 5. TYPOGRAPHY
@@ -5991,11 +5991,11 @@ YOUR HTML OUTPUT MUST MATCH THIS REFERENCE in the following dimensions:
    - Eyebrow labels (CANDIDATE INTELLIGENCE REPORT, PROFILE OVERVIEW) use uniform letter-spacing
 
 6. CONTENT COMPLETENESS
-   - If the reference has 6 ticker items, your output has 6 ticker items — do not drop "Precision Over Volume" or any other item
+   - If the reference has 6 ticker items, your output has 6 ticker items â€” do not drop "Precision Over Volume" or any other item
 
 CRITICAL RULES FOR USING THE REFERENCE:
-- The reference's TEXT CONTENT may differ from your spec — IGNORE the reference's text. Your text comes from the JSON SPEC ONLY.
-- The reference's IMAGE URLs are NOT yours — use the image URLs from the spec ONLY.
+- The reference's TEXT CONTENT may differ from your spec â€” IGNORE the reference's text. Your text comes from the JSON SPEC ONLY.
+- The reference's IMAGE URLs are NOT yours â€” use the image URLs from the spec ONLY.
 - COPY the reference's CSS PATTERNS (border styles, padding values, color usage, layout structure) but APPLY THEM to YOUR SPEC's content.
 - This is a stylistic reference for HOW to lay out Mavlers emails, not WHAT content to include.
 
@@ -6010,13 +6010,13 @@ ${referenceHtml}
 ${JSON.stringify(designSpec, null, 2)}
 === END DESIGN SPECIFICATION ===
 
-=== DEVELOPER-SPECIFIED VALUES (MANDATORY — these override the spec where they differ) ===
+=== DEVELOPER-SPECIFIED VALUES (MANDATORY â€” these override the spec where they differ) ===
 ${specs.join("\n\n")}
 === END DEVELOPER SPECIFICATIONS ===${imageSection}${visualReferenceInstructions}${referenceSection}`;
 
     const stage2StartTime = Date.now();
 
-    // v6.6.0: build the user content array — image first (Anthropic best
+    // v6.6.0: build the user content array â€” image first (Anthropic best
     // practice for multimodal attention), then text. If no preview buffer
     // is available (Figma image render failed), fall back to text-only.
     const userContent = [];
@@ -6032,7 +6032,7 @@ ${specs.join("\n\n")}
     }
     userContent.push({ type: "text", text: stage2UserPrompt });
 
-    // v9.0.2: Engine routing — Claude Code bridge OR existing Anthropic API.
+    // v9.0.2: Engine routing â€” Claude Code bridge OR existing Anthropic API.
     // This branch was previously only wired into the PDF /generate endpoint;
     // the Figma path always hit Anthropic directly. Now both endpoints honor
     // X-AI-Engine header / aiEngine body field / AI_ENGINE_DEFAULT env var.
@@ -6062,7 +6062,7 @@ ${specs.join("\n\n")}
     const compilerAssetSink = {};
 
     if (requestedEngine === "claude-code") {
-      // ─── Claude Code path (Mac bridge, Max 20× subscription) ───
+      // â”€â”€â”€ Claude Code path (Mac bridge, Max 20Ã— subscription) â”€â”€â”€
       try {
         const designImageBase64ForCC = previewBufferForStage2
           ? previewBufferForStage2.toString("base64")
@@ -6076,7 +6076,7 @@ ${specs.join("\n\n")}
           requestId: req.id,
           maveloperJobId: req.body?._maveloperJobId || null,
           espPlatform: req.body?.espPlatform || "none",
-          // COMPILER FLIP — STEP 4: the Figma coordinates parsed for this order
+          // COMPILER FLIP â€” STEP 4: the Figma coordinates parsed for this order
           // (fileKey, nodeId from figmaResult; finalWidth as the design width).
           // Threaded so the bridge can offer this design to the deterministic
           // compiler when it is enabled + allow-listed. Optional and additive.
@@ -6131,7 +6131,7 @@ ${specs.join("\n\n")}
         html_raw = stage2TextBlock.text;
       }
     } else {
-      // ─── Original Anthropic API path (UNCHANGED from v8.1.1) ───
+      // â”€â”€â”€ Original Anthropic API path (UNCHANGED from v8.1.1) â”€â”€â”€
       const stage2Response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 64000,
@@ -6156,21 +6156,21 @@ ${specs.join("\n\n")}
     }
 
     // COMPILER ZIP FIX: fold the compiler slice map (if the compiler ran) into
-    // imageUrlMap so it reaches result.body.imageUrlMap → /approve, whose ZIP then
+    // imageUrlMap so it reaches result.body.imageUrlMap â†’ /approve, whose ZIP then
     // localises the slice PNGs into images/ exactly like the LLM node exports.
     // INERT on the LLM/fallback path: compilerAssetSink is empty, so mergeCompilerSlices
     // returns the SAME imageUrlMap object by reference (no new keys, byte-identical).
-    // The delivered EMAIL html is unaffected — html_raw already carries absolute slice
+    // The delivered EMAIL html is unaffected â€” html_raw already carries absolute slice
     // URLs and fixImageUrls (below) skips http(s): src, so only the ZIP copy differs.
     imageUrlMap = mergeCompilerSlices(imageUrlMap, compilerAssetSink.compilerImageUrlMap);
 
     // COMPILER ZIP FIX v2 (drafts persist): the /approve ZIP is built from the
     // imageUrlMap the FRONTEND loads from the `drafts` table (drafts.image_url_map,
-    // keyed by order_id) — NOT from result.body/maveloper_jobs, and NOT from os_queue
+    // keyed by order_id) â€” NOT from result.body/maveloper_jobs, and NOT from os_queue
     // (which has no image_url_map column). Threading the merged map through res.json
     // alone therefore never reaches the table /approve reads. Persist it to `drafts`
     // here on the in-memory (non-restart) delivery route. GATED on a non-empty compiler
-    // slice map → a no-op on every LLM/figma-only order (the frontend owns those draft
+    // slice map â†’ a no-op on every LLM/figma-only order (the frontend owns those draft
     // rows, which persist byte-for-byte as today). Non-fatal: helper only logs on error.
     if (
       compilerAssetSink.compilerImageUrlMap &&
@@ -6190,19 +6190,19 @@ ${specs.join("\n\n")}
       zipWasUploaded: false,
       // Only strip a font the caller EXPLICITLY passed as secondary. The old
       // `|| designSpec.font_heading` default aimed the strip at the design's own
-      // brand font (e.g. Clash Grotesk) — fixSecondaryFontInBodyStack then removed
+      // brand font (e.g. Clash Grotesk) â€” fixSecondaryFontInBodyStack then removed
       // it from every font-family stack, leaving only the Arial/Helvetica fallback.
       // Never default to the spec's font; when absent, strip nothing.
       secondaryFont: secondaryFont,
-      // v9.7.0: Figma/bridge path → hygiene-only. Skips every PDF/OCR/Stage-2-era
+      // v9.7.0: Figma/bridge path â†’ hygiene-only. Skips every PDF/OCR/Stage-2-era
       // colour/text/structure corrector so the validated design is never overridden.
       mode: "figma",
       requestId: req.id,
     });
     const html = postProcessResult.html;
 
-    // v9.7.0 (§5): assert the hygiene pass did not break a validator guarantee.
-    // Never hard-fails — logs ERROR + returns violations so they are observable.
+    // v9.7.0 (Â§5): assert the hygiene pass did not break a validator guarantee.
+    // Never hard-fails â€” logs ERROR + returns violations so they are observable.
     const postProcessAssertions = assertFigmaPostProcess(html_raw, html, designSpec, {
       requestId: req.id,
       source: "generate-from-figma",
@@ -6226,13 +6226,13 @@ ${specs.join("\n\n")}
     res.json({
       html,
       orderId,
-      pageCount: 1, // Figma has no pages concept — single frame in, single HTML out
+      pageCount: 1, // Figma has no pages concept â€” single frame in, single HTML out
       pageImages: previewImageUrl ? [previewImageUrl] : [], // v6.1.0: side-by-side preview
       imageUrlMap,
       imageSource: "figma",
       imageCount: Object.keys(imageUrlMap).length,
       imageExportReport,                                    // v6.1.0: visibility into export status
-      model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic — which Claude model produced this
+      model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic â€” which Claude model produced this
       engineUsed,                                           // v9.0.2: "claude-code" | "console" | "console-fallback"
       referenceHtmlUsed: Boolean(REFERENCE_CACHE.get(fileKey)), // v8.0.0: was a human-coded reference injected
       figmaSource: {
@@ -6245,7 +6245,7 @@ ${specs.join("\n\n")}
       },
       designSpec,
       warnings,
-      // v9.7.0 (§5): post-process assertion violations (empty array = clean). The
+      // v9.7.0 (Â§5): post-process assertion violations (empty array = clean). The
       // async wrapper surfaces these into the job's progress_message for DB visibility.
       postProcessAssertions,
       requestId: req.id,
@@ -6285,7 +6285,7 @@ ${specs.join("\n\n")}
 });
 
 // =====================================================================
-// v9.1.0 — POST /generate-from-figma-async
+// v9.1.0 â€” POST /generate-from-figma-async
 //
 // Async wrapper around /generate-from-figma. Returns a jobId immediately
 // (<1s). Generation runs in background; result is stored in Supabase
@@ -6302,19 +6302,19 @@ ${specs.join("\n\n")}
 //   status="failed", error_message=<string>
 // =====================================================================
 //
-// v9.6.0 — startFigmaJobAsync: the reusable core of /generate-from-figma-async.
+// v9.6.0 â€” startFigmaJobAsync: the reusable core of /generate-from-figma-async.
 // Extracted (behaviour-preserving) so BOTH the HTTP route and the server-side
 // queue runner (queue-runner.js) can start a generation without an HTTP hop.
 // The runner has no user JWT, so calling this in-process sidesteps auth entirely.
 //
-// Params:  { body, requestId, user, headers }  (headers/user optional — the
+// Params:  { body, requestId, user, headers }  (headers/user optional â€” the
 //          runner passes {} / null; the HTTP route passes req.headers / req.user).
 // Returns: { statusCode:202, jobId, status, deduped? }        on success
 //          { statusCode, error, details }                     on validation/setup fail
 //
 // The background worker below is byte-for-byte the same logic as before; only the
-// req.* references became the passed-in params (req.body→body, req.id→requestId,
-// req.user→user, req.headers→headers). No generation logic changed.
+// req.* references became the passed-in params (req.bodyâ†’body, req.idâ†’requestId,
+// req.userâ†’user, req.headersâ†’headers). No generation logic changed.
 //
 async function startFigmaJobAsync({ body, requestId, user, headers }) {
   body = body || {};
@@ -6337,12 +6337,12 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
     };
   }
 
-  // ── v9.4.0 DEDUP GUARD (duplicate-generation cascade) ───────────────
+  // â”€â”€ v9.4.0 DEDUP GUARD (duplicate-generation cascade) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Lovable can fire this endpoint twice for the same design in quick
   // succession (double-submit / re-render / retry), spawning two ~20-min
   // generations. Before creating a new job, return the id of a recent
   // still-active job for the SAME figma_url instead of starting a second.
-  const DEDUP_WINDOW_MS = 120000; // 2 min — catches rapid double-fires and
+  const DEDUP_WINDOW_MS = 120000; // 2 min â€” catches rapid double-fires and
                                   // retry-after-timeout; gated on active
                                   // status, so completed jobs never block a
                                   // deliberate re-run, and stuck jobs self-heal.
@@ -6378,11 +6378,11 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
       error: dedupErr?.message,
     });
   }
-  // ── end dedup guard ─────────────────────────────────────────────────
+  // â”€â”€ end dedup guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   // Create the job row immediately. We need the jobId before returning to Lovable.
   // ID-SPACE RECONCILIATION: persist the OWNER-SUPPLIED order id (when the caller
-  // provided one — the queue runner always does) at INSERT time. /bridge-callback
+  // provided one â€” the queue runner always does) at INSERT time. /bridge-callback
   // fires DURING generation (before the handler returns and the completion write
   // below runs), and it reads maveloper_jobs.order_id to key the compiler slice
   // folder. Setting it here means those slices land in the OWNER folder, not a
@@ -6421,11 +6421,11 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
     userId: user?.id ?? "anonymous",
   });
 
-  // ──────────────────────────────────────────────────────────────
-  // Background work — runs after the caller flushes its 202 response.
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Background work â€” runs after the caller flushes its 202 response.
   // setImmediate ensures Node finishes flushing the response before
   // we start the long-running task.
-  // ──────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   setImmediate(async () => {
     const bgStartTime = Date.now();
     try {
@@ -6451,7 +6451,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
 
       // Invoke the synchronous handler. It will populate `result.body`
       // when it finishes (success or error). This call can take 10-30 min.
-      // We DELIBERATELY do not await any Railway HTTP timeout here — the
+      // We DELIBERATELY do not await any Railway HTTP timeout here â€” the
       // outer endpoint has already returned to the client.
       const handlerEntry = app._router?.stack?.find((layer) =>
         layer.route?.path === "/generate-from-figma" && layer.route?.methods?.post
@@ -6462,14 +6462,14 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
       }
 
       // The route's handler stack includes generateLimiter and optionalAuth
-      // before the actual handler. For the internal call we skip those —
+      // before the actual handler. For the internal call we skip those â€”
       // the user has already passed them on the async endpoint. Find the
       // last handler in the route's stack (the actual generation handler).
       const handlerStack = handlerEntry.route.stack;
       const actualHandler = handlerStack[handlerStack.length - 1].handle;
 
       await actualHandler(fakeReq, fakeRes, (err) => {
-        // Express "next" — only called on error inside the handler.
+        // Express "next" â€” only called on error inside the handler.
         if (err) throw err;
       });
 
@@ -6478,13 +6478,13 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
 
       if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
         // SUCCESS
-        // v9.7.0 (§5): surface post-process assertion violations into the job's
+        // v9.7.0 (Â§5): surface post-process assertion violations into the job's
         // progress_message so they are DB-visible via /job-status (not just in logs).
         const ppAssertions = Array.isArray(result.body.postProcessAssertions)
           ? result.body.postProcessAssertions
           : [];
         const progressMsg = ppAssertions.length > 0
-          ? `Generation complete in ${durationSec}s — POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
+          ? `Generation complete in ${durationSec}s â€” POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
           : `Generation complete in ${durationSec}s`;
         await updateJobStatus(jobId, {
           status: "completed",
@@ -6492,7 +6492,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
           engine_used: result.body.engineUsed ?? null,
           // v9.5.0: persist orderId + imageUrlMap so the frontend can call /approve.
           // Both are produced during generation (result.body) but were previously
-          // dropped — /job-status returned result.orderId/imageUrlMap = undefined,
+          // dropped â€” /job-status returned result.orderId/imageUrlMap = undefined,
           // so the frontend disabled the Approve button. Requires the order_id +
           // image_url_map columns (see migration note).
           order_id: result.body.orderId ?? null,
@@ -6502,7 +6502,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
         }, requestId);
         log("info", "Async job completed", { requestId, jobId, durationSec, postProcessViolations: ppAssertions.length });
       } else {
-        // FAILURE — handler set non-2xx status or no html
+        // FAILURE â€” handler set non-2xx status or no html
         const errMsg = result.body?.error
           ? `${result.body.error}: ${result.body.details ?? ""}`.trim()
           : `Handler returned status ${result.statusCode} with no html`;
@@ -6575,7 +6575,7 @@ app.post("/generate-from-figma-async", generateLimiter, optionalAuth, async (req
 });
 
 // =====================================================================
-// v9.1.0 — GET /job-status/:jobId
+// v9.1.0 â€” GET /job-status/:jobId
 //
 // Returns the current status of an async generation job.
 //
@@ -6677,8 +6677,8 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────────────────
-// v9.3.0 — POST /bridge-callback (durable via Supabase)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// v9.3.0 â€” POST /bridge-callback (durable via Supabase)
 //
 // The Mac bridge calls this endpoint when cc-runner finishes (success OR
 // failure). Body shape:
@@ -6687,12 +6687,12 @@ app.get("/job-status/:jobId", optionalAuth, async (req, res) => {
 //
 // We do two things:
 //   1. Write the result to Supabase maveloper_jobs row keyed by bridgeJobId
-//      (durable — survives Railway restarts so Lovable's poll sees the result).
+//      (durable â€” survives Railway restarts so Lovable's poll sees the result).
 //   2. Settle the in-memory promise if it still exists (so any awaiting
-//      handler can return cleanly — common case where Railway didn't restart).
+//      handler can return cleanly â€” common case where Railway didn't restart).
 //
 // Auth: shared secret in X-Bridge-Secret.
-// ────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.post("/bridge-callback", async (req, res) => {
   const incomingSecret = req.headers["x-bridge-secret"];
   if (!incomingSecret || incomingSecret !== MAC_BRIDGE_SECRET) {
@@ -6709,7 +6709,7 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(400).json({ error: "Missing bridgeJobId" });
   }
 
-  // ── Durable path: find the maveloper_jobs row by bridgeJobId ──────
+  // â”€â”€ Durable path: find the maveloper_jobs row by bridgeJobId â”€â”€â”€â”€â”€â”€
   // The row was tagged with `__BRIDGE__:<bridgeJobId>` in error_message
   // at dispatch time (see callClaudeCodeBridge). We look it up here.
   // If maveloperJobId was passed in the body, use it directly as a fast path.
@@ -6733,13 +6733,13 @@ app.post("/bridge-callback", async (req, res) => {
     }
   }
 
-  // ── COMPILER slice-image upload (additive; INERT on the LLM path) ─────────
+  // â”€â”€ COMPILER slice-image upload (additive; INERT on the LLM path) â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // On the deterministic-compiler path the bridge forwards `compilerAssets`: a
   // { relativeSrc: base64PNG } map of the slice images that exist only on the
   // laptop. Upload them with the SAME uploadImagesToDropbox() the PDF/Figma image
   // path uses, then rewrite the delivered HTML's relative <img src> to the returned
   // Dropbox URLs with the SAME fixImageUrls() postProcessHtml() uses. Doing it ONCE
-  // here — BEFORE both the durable Supabase write and the in-memory promise settle —
+  // here â€” BEFORE both the durable Supabase write and the in-memory promise settle â€”
   // makes BOTH delivery paths (the /generate-from-figma handler that awaits the
   // promise, and the restart-fallback durable write) emit absolute, working URLs.
   //
@@ -6755,13 +6755,13 @@ app.post("/bridge-callback", async (req, res) => {
   if (html && compilerAssets && typeof compilerAssets === "object" && Object.keys(compilerAssets).length > 0) {
     const assetCount = Object.keys(compilerAssets).length;
     if (!dropboxConfigured) {
-      log("error", "/bridge-callback compiler assets present but Dropbox is not configured — delivered images will be broken", {
+      log("error", "/bridge-callback compiler assets present but Dropbox is not configured â€” delivered images will be broken", {
         requestId: req.id, bridgeJobId, assetCount,
       });
     } else {
       try {
         // Derive an orderId for the Dropbox folder (best-effort; the folder is
-        // cosmetic — uploadToDropbox returns a self-contained direct URL regardless).
+        // cosmetic â€” uploadToDropbox returns a self-contained direct URL regardless).
         // Prefer the job row's order_id; fall back to the bridgeJobId.
         let assetOrderId = bridgeJobId;
         if (dbJobId && supabaseAdmin) {
@@ -6775,7 +6775,7 @@ app.post("/bridge-callback", async (req, res) => {
           } catch { /* keep bridgeJobId */ }
         }
         // Build the image list EXACTLY like the LLM path: [{ filename, buffer }].
-        // Key by BASENAME — that is what fixImageUrls() matches (src.split('/').pop()).
+        // Key by BASENAME â€” that is what fixImageUrls() matches (src.split('/').pop()).
         // Dedupe by basename (unique within one design's slice set).
         const byBase = new Map();
         for (const [relSrc, b64] of Object.entries(compilerAssets)) {
@@ -6787,7 +6787,7 @@ app.post("/bridge-callback", async (req, res) => {
         const images = [...byBase.values()];
         compilerImageUrlMap = await uploadImagesToDropbox(assetOrderId, images, log);
         const uploaded = Object.keys(compilerImageUrlMap).length;
-        // Rewrite the relative slice src → absolute Dropbox URL with the existing
+        // Rewrite the relative slice src â†’ absolute Dropbox URL with the existing
         // helper (skipPositionalFallback = the Figma-safe exact-basename match; it
         // never touches http/https/data srcs, so it is idempotent downstream).
         const rewrite = fixImageUrls(html, compilerImageUrlMap, null, { skipPositionalFallback: true });
@@ -6798,12 +6798,12 @@ app.post("/bridge-callback", async (req, res) => {
           unmatched: rewrite.unmatched,
         });
         if (uploaded < images.length) {
-          log("warn", "/bridge-callback partial compiler-slice upload — some delivered images may be broken", {
+          log("warn", "/bridge-callback partial compiler-slice upload â€” some delivered images may be broken", {
             requestId: req.id, bridgeJobId, uploaded, total: images.length,
           });
         }
       } catch (e) {
-        log("error", "/bridge-callback compiler-slice upload failed — shipping HTML with relative paths (non-fatal)", {
+        log("error", "/bridge-callback compiler-slice upload failed â€” shipping HTML with relative paths (non-fatal)", {
           requestId: req.id, bridgeJobId, error: e.message,
         });
         deliverHtml = html;
@@ -6812,12 +6812,12 @@ app.post("/bridge-callback", async (req, res) => {
     }
   }
 
-  // ── Write durable result to Supabase ──────────────────────────────
+  // â”€â”€ Write durable result to Supabase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (dbJobId && supabaseAdmin) {
     try {
       if (error) {
         // v9.8.1: cc-runner writes the honest quality-gate reason (IMAGE PARITY /
-        // STRUCTURAL COLLAPSE / BRAND FONT …) to STDERR; bridge-server.mjs forwards
+        // STRUCTURAL COLLAPSE / BRAND FONT â€¦) to STDERR; bridge-server.mjs forwards
         // it in the callback `stderr` field while `error` is the hardcoded generic
         // "Claude Code generation failed". Previously we persisted only `error`, so
         // the categories never reached the lead. Prefer stderr when present; keep the
@@ -6838,15 +6838,15 @@ app.post("/bridge-callback", async (req, res) => {
           })
           .eq("id", dbJobId);
       } else if (html) {
-        // v9.7.0 (§4): apply the SAME Figma hygiene pass the in-process handler
+        // v9.7.0 (Â§4): apply the SAME Figma hygiene pass the in-process handler
         // applies, BEFORE persisting. This kills the restart-dependent delivery
         // inconsistency: previously this durable write stored RAW bridge HTML while
-        // the normal path stored the (hygiene-processed) HTML — so the SAME job
+        // the normal path stored the (hygiene-processed) HTML â€” so the SAME job
         // delivered different bytes depending on whether Railway restarted.
         // NOTE: /bridge-callback has no designSpec/imageUrlMap context, so the
         // hygiene pass here runs WITHOUT image-URL matching (the bridge already
         // emits absolute Dropbox URLs, so pass-1 would be a no-op anyway) and the
-        // brand-font assertion is skipped (no designSpec → no brand_font to check);
+        // brand-font assertion is skipped (no designSpec â†’ no brand_font to check);
         // the count/size/img/anchor assertions still run for observability.
         // Non-fatal: if post-processing throws, we store the raw html.
         // deliverHtml === html on the LLM path (compiler block above was skipped),
@@ -6871,10 +6871,10 @@ app.post("/bridge-callback", async (req, res) => {
             result_html: finalHtml,
             // COMPILER ZIP FIX: mirror the slice map onto maveloper_jobs.image_url_map
             // so /job-status (the Lovable poller) also sees it. NOTE: /approve does NOT
-            // read this column — it reads the `drafts` row (persisted just below). This
+            // read this column â€” it reads the `drafts` row (persisted just below). This
             // maveloper_jobs write is kept for /job-status parity, not for the ZIP. Spread
             // is {} on every LLM-path callback (compilerImageUrlMap null), so the
-            // image_url_map column is left untouched — byte-identical to today.
+            // image_url_map column is left untouched â€” byte-identical to today.
             ...(compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0
               ? { image_url_map: compilerImageUrlMap }
               : {}),
@@ -6889,8 +6889,8 @@ app.post("/bridge-callback", async (req, res) => {
         // /job-status; the /approve ZIP instead reads the map the frontend loads from
         // the `drafts` table. On the restart/durable route the in-memory figma handler
         // is gone, so this is the ONLY place the slice map can reach `drafts` for a later
-        // /approve. Same guard → inert on every LLM-path callback (compilerImageUrlMap
-        // null). Uses the REAL order_id only (compilerOrderId; null → helper no-ops).
+        // /approve. Same guard â†’ inert on every LLM-path callback (compilerImageUrlMap
+        // null). Uses the REAL order_id only (compilerOrderId; null â†’ helper no-ops).
         if (compilerImageUrlMap && Object.keys(compilerImageUrlMap).length > 0) {
           await persistSliceMapToDrafts(supabaseAdmin, log, compilerOrderId, compilerImageUrlMap, req.id);
         }
@@ -6910,7 +6910,7 @@ app.post("/bridge-callback", async (req, res) => {
               .update({ delivery_meta: { certificate: compilerCertificate, generatedBy: "compiler" } })
               .eq("id", dbJobId);
             if (dmErr) {
-              log("warn", "/bridge-callback delivery_meta write failed (column not migrated?) — certificate.txt will degrade gracefully", {
+              log("warn", "/bridge-callback delivery_meta write failed (column not migrated?) â€” certificate.txt will degrade gracefully", {
                 requestId: req.id, bridgeJobId, error: dmErr.message,
               });
             }
@@ -6936,13 +6936,13 @@ app.post("/bridge-callback", async (req, res) => {
       });
     }
   } else {
-    log("warn", "/bridge-callback no Supabase row found for bridgeJobId — result still posted to in-memory promise if exists", {
+    log("warn", "/bridge-callback no Supabase row found for bridgeJobId â€” result still posted to in-memory promise if exists", {
       requestId: req.id,
       bridgeJobId,
     });
   }
 
-  // ── Settle the in-memory promise (fast path for non-restarted Railway) ──
+  // â”€â”€ Settle the in-memory promise (fast path for non-restarted Railway) â”€â”€
   const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
   if (entry) {
     if (error) {
@@ -6957,18 +6957,18 @@ app.post("/bridge-callback", async (req, res) => {
         bridgeJobId,
         bytesGenerated: bytesGenerated || deliverHtml.length,
       });
-      // deliverHtml === html on the LLM path → identical to today; on the compiler
+      // deliverHtml === html on the LLM path â†’ identical to today; on the compiler
       // path it is the slice-rewritten HTML the awaiting /generate-from-figma handler
       // then post-processes (its fixImageUrls no-ops on the now-absolute slice URLs).
       // COMPILER ZIP FIX: also hand back the slice map so the figma handler can fold
-      // it into result.body.imageUrlMap (→ /approve ZIP localises the slices). Null on
+      // it into result.body.imageUrlMap (â†’ /approve ZIP localises the slices). Null on
       // the LLM path, so callClaudeCodeBridge leaves its assetSink untouched there.
       settleBridgeJob(bridgeJobId, { html: deliverHtml, compilerImageUrlMap, bytesGenerated: bytesGenerated || deliverHtml.length, elapsedSeconds });
     } else {
       settleBridgeJob(bridgeJobId, { error: "Bridge callback missing html field" });
     }
   } else {
-    log("info", "/bridge-callback no in-memory promise (Railway likely restarted) — durable Supabase write is the result of record", {
+    log("info", "/bridge-callback no in-memory promise (Railway likely restarted) â€” durable Supabase write is the result of record", {
       requestId: req.id,
       bridgeJobId,
       dbJobId,
@@ -6988,15 +6988,15 @@ app.post("/bridge-callback", async (req, res) => {
 // the request body: the durable image map, the id generation keyed artifacts by
 // (genOrderId), the ESP / dark-mode the order was queued with, and the compiler
 // proof certificate. This removes /approve's dependence on the frontend sending a
-// complete map — the owner cannot change the frontend, so the backend reconciles.
+// complete map â€” the owner cannot change the frontend, so the backend reconciles.
 //
 // Reconciliation of the two id spaces the owner found:
 //   - os_queue.order_id  = the OWNER-supplied name (== the `orderId` arg here)
-//   - os_queue.job_id    → maveloper_jobs.id  (the generation job)
+//   - os_queue.job_id    â†’ maveloper_jobs.id  (the generation job)
 //   - maveloper_jobs.order_id = the id GENERATION keyed images/preview under
 // We first try maveloper_jobs matched directly on this order id (the reconciled
 // path, where generation already used the owner id). If that misses, we hop
-// os_queue.order_id → job_id → maveloper_jobs.id. Every step is best-effort and
+// os_queue.order_id â†’ job_id â†’ maveloper_jobs.id. Every step is best-effort and
 // tolerant: a missing table/column/row yields nulls, never an approve failure.
 // -----------------------------------------------------------------
 async function resolveApproveJobMeta(orderId, requestId) {
@@ -7058,15 +7058,15 @@ async function resolveApproveJobMeta(orderId, requestId) {
         meta.certificate = dm.delivery_meta.certificate || null;
       }
     } catch {
-      // delivery_meta column not present (migration not run) → certificate stays
-      // null → certificate.txt states the compiler cert was not located. Honest.
+      // delivery_meta column not present (migration not run) â†’ certificate stays
+      // null â†’ certificate.txt states the compiler cert was not located. Honest.
     }
   }
   return meta;
 }
 
 // -----------------------------------------------------------------
-// POST /approve — assemble the LOOSE delivery folder and upload to Dropbox
+// POST /approve â€” assemble the LOOSE delivery folder and upload to Dropbox
 // Called after dev reviews preview and clicks "Approve & Upload"
 // Accepts: { orderId, html, imageUrlMap?, espPlatform? }
 // Writes:  /maveloper/<YYYY>/<MM-YYYY>/<ORDER ID>/ with <ORDER ID>.html, images/,
@@ -7100,20 +7100,20 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     const orderId = sanitizeOrderId(rawOrderId) || String(rawOrderId);
     const folderPath = getDropboxFolderPath(orderId); // /maveloper/<YYYY>/<MM-YYYY>/<orderId>
 
-    // ── ID-SPACE RECONCILIATION + SERVER-SIDE MAP RESOLUTION ──────────────────
+    // â”€â”€ ID-SPACE RECONCILIATION + SERVER-SIDE MAP RESOLUTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // The images/preview were uploaded during generation, possibly keyed by a
-    // DIFFERENT id (a frame-derived / FIGMA-<ts> id) than this owner id — that is
+    // DIFFERENT id (a frame-derived / FIGMA-<ts> id) than this owner id â€” that is
     // the split the owner found in production. We resolve everything the folder
     // needs WITHOUT depending on the frontend sending a map:
-    //   1. The delivered HTML is authoritative — it carries an absolute Dropbox URL
+    //   1. The delivered HTML is authoritative â€” it carries an absolute Dropbox URL
     //      for every image the email references. We localise straight from it.
     //   2. As a supplement we pull the durable map + generation id + compiler
     //      certificate from maveloper_jobs (matched by this order id, or via the
-    //      os_queue.order_id → os_queue.job_id → maveloper_jobs.id link when the
+    //      os_queue.order_id â†’ os_queue.job_id â†’ maveloper_jobs.id link when the
     //      generation id differs). All best-effort; the HTML alone is sufficient.
     const jobMeta = await resolveApproveJobMeta(orderId, req.id);
 
-    // Build the URL → local-filename map. Priority for a filename: an explicit map
+    // Build the URL â†’ local-filename map. Priority for a filename: an explicit map
     // entry (the basename generation uploaded under) wins; otherwise derive the
     // basename from the URL. Deduped by URL; filename collisions get a numeric
     // suffix so two different URLs never overwrite one images/ file.
@@ -7152,7 +7152,7 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 
     const urlList = Object.keys(urlToFilename);
     if (urlList.length === 0) {
-      log("warn", "Approve: no referenced image URLs found (html + maps empty) — folder will have html only", { requestId: req.id, orderId });
+      log("warn", "Approve: no referenced image URLs found (html + maps empty) â€” folder will have html only", { requestId: req.id, orderId });
     }
     log("info", "Building delivery FOLDER", { requestId: req.id, orderId, folderPath, referencedImages: urlList.length });
 
@@ -7180,12 +7180,12 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     for (const img of images) localMap[img.url] = img.filename;
     const localHtml = localizeHtml(html, localMap);
 
-    // ── Assemble delivery-notes.txt + certificate.txt from the DELIVERED bytes ──
+    // â”€â”€ Assemble delivery-notes.txt + certificate.txt from the DELIVERED bytes â”€â”€
     // generatedBy: a stored compiler certificate is AUTHORITATIVE (only the compiler
     // path forwards one). Fall back to the delivered-html marker (compiler additive
-    // pass comment) when no cert reached us — so a compiler order still reads as
+    // pass comment) when no cert reached us â€” so a compiler order still reads as
     // "compiler" (with an honest "certificate not located" note) even if the comment
-    // survived post-processing but the cert did not. No signal → LLM.
+    // survived post-processing but the cert did not. No signal â†’ LLM.
     const generatedBy = (jobMeta.certificate || looksCompilerAuthored(html)) ? "compiler" : "llm";
     const esp = jobMeta.esp || req.body.espPlatform || "none";
     const darkMode = detectDarkMode(html) || jobMeta.darkMode === true;
@@ -7197,7 +7197,7 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     });
     const certificateText = buildCertificateText({ generatedBy, certificate: jobMeta.certificate, orderId });
 
-    // ── Write the LOOSE folder (no zip — Dropbox zips folders on download) ──────
+    // â”€â”€ Write the LOOSE folder (no zip â€” Dropbox zips folders on download) â”€â”€â”€â”€â”€â”€
     await uploadFileToDropboxRaw(`${folderPath}/${orderId}.html`, Buffer.from(localHtml, "utf-8"));
     for (const img of images) {
       await uploadFileToDropboxRaw(`${folderPath}/images/${img.filename}`, img.buffer);
@@ -7226,7 +7226,7 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     }
 
     // One public share link for the FOLDER (Dropbox zips it for the recipient on
-    // download — the loose-folder delivery the owner asked for).
+    // download â€” the loose-folder delivery the owner asked for).
     const dropboxUrl = await createFolderShareLink(folderPath);
 
     log("info", "Delivery folder uploaded to Dropbox", {
@@ -7234,12 +7234,12 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       imageCount: images.length, previewStatus, generatedBy, durationMs: Date.now() - startTime,
     });
 
-    // v9.6.0 (spec §9) — PERSIST the Dropbox link onto the os_queue row so the
+    // v9.6.0 (spec Â§9) â€” PERSIST the Dropbox link onto the os_queue row so the
     // "Dropbox" affordance on Completed cards works for everyone, not just the
     // session that clicked Approve (the /os ApproveButton kept it in local React
     // state only, so os_queue.dropbox_url was always null). Response is unchanged.
     //
-    // Standalone defect fix for the CURRENT client-driven flow — runs whenever the
+    // Standalone defect fix for the CURRENT client-driven flow â€” runs whenever the
     // Dropbox upload succeeded, INDEPENDENT of RUNNER_ENABLED (ungated deliberately:
     // os_queue.dropbox_url is dead today, so this must be live before the runner is).
     // Non-fatal: a write failure only warns; the response payload is identical.
@@ -7292,11 +7292,11 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 });
 
 // =====================================================================
-// v9.6.0 — SERVER-SIDE QUEUE RUNNER (shipped DARK behind RUNNER_ENABLED)
+// v9.6.0 â€” SERVER-SIDE QUEUE RUNNER (shipped DARK behind RUNNER_ENABLED)
 //
 // Drains os_queue headless so the queue processes with NO /os tab open. The
 // instance is ALWAYS constructed (so the routes below have something to talk
-// to), but .start() no-ops unless RUNNER_ENABLED === "true" — the dark build
+// to), but .start() no-ops unless RUNNER_ENABLED === "true" â€” the dark build
 // never ticks, never heartbeats, never writes. See queue-runner.js.
 // =====================================================================
 const queueRunner = createQueueRunner({
@@ -7306,7 +7306,7 @@ const queueRunner = createQueueRunner({
   env: process.env,
 });
 
-// GET /runner/status — debug/observability, no auth. Reports the flag + last
+// GET /runner/status â€” debug/observability, no auth. Reports the flag + last
 // heartbeat + live queue counts. Harmless when dark (runnerEnabled:false).
 app.get("/runner/status", async (req, res) => {
   try {
@@ -7317,9 +7317,9 @@ app.get("/runner/status", async (req, res) => {
   }
 });
 
-// POST /queue/run-next — manual trigger (replaces the /os "Run next now" button).
+// POST /queue/run-next â€” manual trigger (replaces the /os "Run next now" button).
 // Requires a Supabase JWT (reuse requireAuth). Forces ONE immediate tick. When
-// the runner is dark it does NOT dispatch — it reports disabled so the button
+// the runner is dark it does NOT dispatch â€” it reports disabled so the button
 // stays honest until the flag is flipped.
 app.post("/queue/run-next", requireAuth, async (req, res) => {
   try {
@@ -7346,7 +7346,7 @@ const server = app.listen(PORT, () => {
     rasterizeScale: RASTERIZE_SCALE,
   });
   // Boot the queue runner. No-ops (just logs a DISABLED boot line) unless
-  // RUNNER_ENABLED === "true" — so the dark build's only visible effect is one
+  // RUNNER_ENABLED === "true" â€” so the dark build's only visible effect is one
   // extra log line at startup.
   queueRunner.start();
 });
@@ -7373,7 +7373,7 @@ const shutdown = (signal) => {
     log("info", "HTTP server closed");
     process.exit(0);
   });
-  // v5.5.0: 30s was too aggressive — Stage 2 alone can run for several minutes
+  // v5.5.0: 30s was too aggressive â€” Stage 2 alone can run for several minutes
   // with 32K max_tokens. Drain window must comfortably exceed
   // ANTHROPIC_TIMEOUT_MS for an in-flight Stage 2 to complete.
   setTimeout(() => {
