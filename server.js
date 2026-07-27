@@ -28,6 +28,8 @@ import {
   assignLocalFilenames,
   localizeHtml,
   planDeliveredImagesFolder,
+  collectDeadLocalRefs,
+  gateDeliveredFolderStatic,
   detectDarkMode,
   looksCompilerAuthored,
   collectFonts,
@@ -35,6 +37,7 @@ import {
   buildDeliveryNotes,
   buildCertificateText,
 } from "./delivery-folder.js";
+import { extractAssetRefs, isRemoteRef, assetBasename, rewriteRefsByBasename } from "./asset-refs.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -1027,21 +1030,41 @@ function fixImageUrls(html, imageUrlMap, imageDimensionsMap, options = {}) {
     return match;
   });
 
+  // â”€â”€ FOLDER-FIX: the SAME exact-basename rewrite for NON-src mechanisms â”€â”€â”€â”€â”€
+  // Pass 1 above is `src=`-only, and that is the second reason TEST27-1800
+  // shipped 7 files short: even once the bridge forwards a background image, a
+  // src-only rewrite leaves `background-image:url(assets/fill_<sha>.png)`
+  // RELATIVE, so /approve's `^https?://` collector drops it and the folder is
+  // short again. Mechanisms handled: CSS url(), the HTML `background=`
+  // attribute, srcset candidates and poster â€” enumerated by asset-refs.js, the
+  // one extractor the collector and the delivered-folder gate both use.
+  //
+  // Deliberately EXACT-MATCH ONLY, never positional: an unmatched background is
+  // reported, never guessed at. Idempotent (remote refs are skipped), so the LLM
+  // path â€” where every asset is already an absolute Dropbox URL before this runs
+  // â€” is a no-op and its bytes are unchanged.
+  {
+    const bg = rewriteRefsByBasename(output, byName, { skipMechs: ["src"] });
+    output = bg.html;
+    replaced += bg.replaced;
+  }
+
   // v9.7.0 (Figma gate Â§3): on the Figma/bridge path the spec already carries
   // absolute Dropbox URLs, so any relative src left after pass 1 is an ANOMALY,
   // not something to guess at. The positional fallback below can silently bind
   // the WRONG image, so we skip it here and instead RETURN the leftover names
   // (the caller logs a WARN). PDF path passes no options â†’ fallback runs as before.
   if (options.skipPositionalFallback) {
+    // FOLDER-FIX: scan EVERY mechanism, not just src=. A leftover relative
+    // background is precisely the anomaly this branch exists to surface, and the
+    // src-only scan reported `unmatched: []` on TEST27-1800 while 7 backgrounds
+    // sat un-rewritten â€” a clean log line over a broken delivery.
     const leftover = [];
-    const scanRe = /\bsrc\s*=\s*["']([^"']+)["']/gi;
-    let sm;
-    while ((sm = scanRe.exec(output)) !== null) {
-      const s = sm[1];
-      if (/^(https?:|data:|cid:)/i.test(s)) continue;
-      const fn = s.split("/").pop();
+    for (const ref of extractAssetRefs(output)) {
+      if (isRemoteRef(ref.url)) continue;
+      const fn = assetBasename(ref.url);
       if (!fn || /^spacer\.gif$/i.test(fn)) continue;
-      leftover.push(fn);
+      leftover.push(ref.mech === "src" ? fn : `${fn} (${ref.mech})`);
     }
     return { html: output, replaced, sequentialFallbacks: 0, fallbackUsed: [], unmatched: leftover };
   }
@@ -7452,6 +7475,65 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       });
     }
 
+    // â”€â”€ â˜… DELIVERED-FOLDER INTEGRITY GATE (SEAM_AUDIT I-1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // The last thing before the share link exists, and the FIRST instrument that
+    // has ever measured the document the owner actually opens. TEST27-1800
+    // shipped 79 of 86 images with `images ok: true, missing: []` on the job
+    // record, because every check ran against the workspace copy.
+    //
+    // â˜… ON FAILURE THIS SHIPS, LOUDLY. IT DOES NOT BLOCK. Four reasons:
+    //   1. A lead is waiting. Blocking turns a partly-broken folder into NO
+    //      delivery, which is strictly worse for the person waiting on it.
+    //   2. The EMAIL copy â€” absolute Dropbox URLs, the thing that actually gets
+    //      deployed â€” is unaffected by a folder defect. Withholding a working
+    //      email over an offline-convenience artifact is the wrong trade.
+    //   3. What failed on TEST27-1800 was not the delivery, it was the SILENCE.
+    //      The fix for silence is speech, and the disclosure NAMES every file.
+    //   4. This gate has never run in production. A gate that has never run in
+    //      production must not be able to stop production â€” if its extraction is
+    //      over-broad it would block every order, be switched off within a day,
+    //      and close nothing. It earns the right to block by being right first.
+    // The disclosure is its own file so it sorts to the TOP of the Dropbox
+    // listing: this incident's failure was not missing information, it was that
+    // nothing made the information unavoidable.
+    let folderIntegrity = null;
+    try {
+      const finalImageNames = await dropboxListFolderNames(`${folderPath}/images`);
+      folderIntegrity = gateDeliveredFolderStatic(localHtml, finalImageNames, {
+        orderId,
+        // A URL we tried and failed to materialise is a DISCLOSED mixed state,
+        // not a surprise (server.js materialisation returns null on failure).
+        declaredMaterialisationFailures: urlList.filter((u) => !(u in localMap)),
+      });
+      if (!folderIntegrity.ok) {
+        log("error", "â˜… APPROVE SHIPPED AN INCOMPLETE DELIVERY FOLDER â€” disclosed in the folder", {
+          requestId: req.id, orderId, folderPath,
+          referenced: folderIntegrity.counts.referenced,
+          presentInFolder: folderIntegrity.counts.presentInFolder,
+          missingFiles: folderIntegrity.missingFiles,
+          deadRefs: folderIntegrity.deadRefs,
+        });
+        await uploadFileToDropboxRaw(
+          `${folderPath}/!!!-FOLDER-INCOMPLETE-READ-ME.txt`,
+          Buffer.from(folderIntegrity.disclosure, "utf-8")
+        );
+      } else {
+        log("info", "Delivered-folder integrity gate GREEN", {
+          requestId: req.id, orderId,
+          referenced: folderIntegrity.counts.referenced,
+          presentInFolder: folderIntegrity.counts.presentInFolder,
+          undeclaredAbsolute: folderIntegrity.counts.undeclaredAbsolute,
+        });
+      }
+    } catch (gateErr) {
+      // The gate must never be the reason a delivery fails. A gate that can
+      // crash a delivery is a gate that gets deleted.
+      folderIntegrity = { ok: null, error: gateErr?.message || String(gateErr) };
+      log("warn", "Delivered-folder integrity gate could not run â€” delivery continues UNVERIFIED", {
+        requestId: req.id, orderId, error: gateErr?.message,
+      });
+    }
+
     // One public share link for the FOLDER (Dropbox zips it for the recipient on
     // download â€” the loose-folder delivery the owner asked for).
     const dropboxUrl = await createFolderShareLink(folderPath);
@@ -7500,6 +7582,18 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       imageCount: images.length,
       previewStatus,
       generatedBy,
+      // SEAM_AUDIT I-1: the folder's own integrity, so the frontend can surface
+      // "this folder is short" instead of the owner discovering it by opening it.
+      // ok:null means the gate could not run, which is NOT the same as ok:true.
+      folderIntegrity: folderIntegrity
+        ? {
+            ok: folderIntegrity.ok,
+            missingFiles: folderIntegrity.missingFiles || [],
+            deadRefs: folderIntegrity.deadRefs || [],
+            counts: folderIntegrity.counts || null,
+            error: folderIntegrity.error || null,
+          }
+        : null,
       requestId: req.id,
     });
 

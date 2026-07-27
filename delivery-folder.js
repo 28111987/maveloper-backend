@@ -15,6 +15,10 @@
 // is string-in / string-out so it is unit-testable without live credentials.
 // =====================================================================
 
+import {
+  extractAssetRefs, distinctAssetUrls, replaceAssetUrl, isRemoteRef,
+} from "./asset-refs.js";
+
 // ── Dropbox-safe order id ─────────────────────────────────────────────
 // The owner-supplied order id becomes a Dropbox FOLDER NAME. Strip only the
 // characters Dropbox forbids in a path segment (/ \ : ? * " < > |) and control
@@ -37,23 +41,18 @@ export function sanitizeOrderId(raw) {
 // independent of any image map the frontend may or may not send: whatever the
 // email points at is exactly what we bundle. Returns the ordered, de-duplicated
 // list of absolute http(s) URLs referenced by the HTML.
+// ★ FOLDER-FIX. The mechanism list is no longer written out here. It lives in
+// asset-refs.js, the SINGLE extractor every stage in both repos now shares, so
+// the collector that BUILDS the folder and the gate that MEASURES it cannot
+// disagree about what "referenced" means. Two mechanisms this function used to
+// miss and now does not:
+//   • `background="https://…"` — the HTML4 attribute. MEASURED: 5 of 103 surveyed
+//     LLM artifacts reference a real Dropbox image that way AND NO OTHER WAY.
+//   • an entity-encoded URL (`…&amp;raw=1`) — the same logical asset in a second
+//     byte form, which used to be collected once and localised zero times.
+// Distinctness is now by DECODED url, so those two forms collapse to one file.
 export function collectReferencedUrls(html) {
-  if (!html || typeof html !== "string") return [];
-  const urls = new Set();
-  // <img src="..."> / src='...'
-  const srcRe = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)')/gi;
-  let m;
-  while ((m = srcRe.exec(html)) !== null) {
-    const u = (m[1] || m[2] || "").trim();
-    if (/^https?:\/\//i.test(u)) urls.add(u);
-  }
-  // CSS background url(...) — background:url(...) / background-image:url("...")
-  const urlRe = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+))\s*\)/gi;
-  while ((m = urlRe.exec(html)) !== null) {
-    const u = (m[1] || m[2] || m[3] || "").trim();
-    if (/^https?:\/\//i.test(u)) urls.add(u);
-  }
-  return [...urls];
+  return distinctAssetUrls(html, (r) => /^https?:\/\//i.test(r.url));
 }
 
 // The local filename for a referenced URL: the basename of its path, ignoring
@@ -83,20 +82,31 @@ function safeDecode(s) {
 // can carry local refs. Collected so the images/ trim NEVER deletes a file the
 // delivered html still points at, whichever form the reference takes.
 export function collectLocalImageNames(html) {
-  if (!html || typeof html !== "string") return [];
   const names = new Set();
-  const add = (raw) => {
-    const u = String(raw || "").trim();
-    if (!u || /^https?:\/\//i.test(u) || /^data:/i.test(u)) return;
-    const m = /(?:^|\/)images\/([^/?#"')\s]+)/i.exec(u);
+  for (const ref of extractAssetRefs(html)) {
+    if (isRemoteRef(ref.url)) continue;
+    const m = /(?:^|\/)images\/([^/?#"')\s]+)/i.exec(ref.url);
     if (m && m[1]) names.add(safeDecode(m[1]));
-  };
-  const srcRe = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)')/gi;
-  let m;
-  while ((m = srcRe.exec(html)) !== null) add(m[1] || m[2]);
-  const urlRe = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+))\s*\)/gi;
-  while ((m = urlRe.exec(html)) !== null) add(m[1] || m[2] || m[3]);
+  }
   return [...names];
+}
+
+// ── the assets the html references but CANNOT reach ───────────────────────────
+// Every LOCAL (relative) asset ref that is not an `images/<name>` ref. On a
+// correctly delivered folder this is EMPTY: /approve either localises a ref to
+// `images/<file>` or leaves it an absolute URL (a disclosed MIXED document). A
+// leftover relative ref is neither — it is a DEAD PATH, and it is exactly what
+// TEST27-1800's 7 `assets/fill_<sha>.png` backgrounds were. Reported so the
+// share-link step can refuse to call a folder complete when the html still
+// points at a directory the folder does not contain.
+export function collectDeadLocalRefs(html) {
+  const dead = new Set();
+  for (const ref of extractAssetRefs(html)) {
+    if (isRemoteRef(ref.url)) continue;
+    if (/(?:^|\/)images\/[^/?#"')\s]+/i.test(ref.url)) continue;
+    dead.add(ref.url);
+  }
+  return [...dead];
 }
 
 // ── url → local-filename assignment ───────────────────────────────────
@@ -170,6 +180,150 @@ export function planDeliveredImagesFolder(html, urlToFilename, existingImageName
   return { keep: [...keep], remove };
 }
 
+// ── ★ THE DELIVERED-FOLDER INTEGRITY GATE (static arm) ────────────────────────
+// TEST27-1800 shipped a folder whose images/ held 79 files while the delivered
+// html needed 86, and NOTHING said so. Every instrument in the chain measured a
+// document nobody receives (SEAM_AUDIT I-1), so the folder that DID reach the
+// owner was rendered by no gate at all.
+//
+// ★ WHY THIS IS A STATIC CHECK AND NOT `delivered-folder-gate.mjs`.
+// That gate is the stronger instrument — it launches headless Chrome and reads
+// COMPUTED `background-image`, which catches a background this scan cannot see
+// (one injected by a `<style>` rule, or a shorthand the extractor mis-parses).
+// It CANNOT run at /approve: `/approve` runs on Railway, which has no Chrome
+// binary, and the folder lives on Dropbox rather than local disk. Wiring the
+// render gate there would mean shipping Chrome into the container and
+// downloading ~22 MB of images per approval, on the request path, for every
+// order. So the split is deliberate and stated:
+//
+//   • THIS function runs on EVERY delivery, needs nothing but the html string
+//     and the folder listing /approve already fetches for the trim, and would
+//     have caught TEST27-1800 outright (its 7 dead `assets/…` refs are exactly
+//     the DEAD_LOCAL class below).
+//   • `delivered-folder-gate.mjs` stays the pre-deploy / local instrument that
+//     proves this one is not lying, on a real render.
+//
+// The two share `asset-refs.js`, so they cannot disagree about what a reference
+// IS — only about what a browser then does with it.
+//
+// Pure: no I/O. Returns violations, notes and a ready-to-write disclosure.
+//
+//   `localHtml`     the LOCALISED html actually written into the folder
+//   `folderImages`  basenames currently in <folder>/images/ (post-trim)
+//   `declaredMaterialisationFailures` absolute URLs /approve KNOWS it failed to
+//                   materialise (server.js:7328). A disclosed absolute is an
+//                   honest MIXED document; an undisclosed one is a surprise.
+export function gateDeliveredFolderStatic(localHtml, folderImages, opts = {}) {
+  const declared = new Set(opts.declaredMaterialisationFailures || []);
+  const present = new Set(folderImages || []);
+  const violations = [];
+  const notes = [];
+
+  // (1) DEAD LOCAL REFS — a relative path that is neither `images/…` nor
+  //     absolute. It resolves to nothing inside the folder. ★ THIS IS THE
+  //     TEST27-1800 CLASS: 7 × `assets/fill_<sha>.png`.
+  for (const ref of collectDeadLocalRefs(localHtml)) {
+    violations.push({
+      kind: "DEAD_LOCAL", ref,
+      why: `the folder html points at "${ref}", a path the folder does not contain`,
+    });
+  }
+
+  // (2) MISSING FILES — referenced as images/<name>, not in images/.
+  const referencedNames = collectLocalImageNames(localHtml);
+  for (const name of referencedNames) {
+    if (!present.has(name)) {
+      violations.push({
+        kind: "MISSING_FILE", ref: `images/${name}`,
+        why: `the html references images/${name} but that file is NOT in the folder`,
+      });
+    }
+  }
+
+  // (3) ABSOLUTE REFS still in the folder copy. NOT a violation: a genuinely
+  //     external asset (an ESP-hosted logo, a tracking pixel) is legitimate, and
+  //     a materialisation failure that /approve declared is an honest disclosed
+  //     state. Both are REPORTED so the recipient's offline copy is never
+  //     silently a hotlink — but neither inflates the missing-file count, because
+  //     a gate that cries wolf gets switched off.
+  const absolute = [...new Set(
+    extractAssetRefs(localHtml)
+      .filter((r) => /^https?:\/\//i.test(r.url))
+      .map((r) => r.url)
+  )];
+  for (const url of absolute) {
+    notes.push({
+      kind: declared.has(url) ? "DECLARED_ABSOLUTE" : "UNDECLARED_ABSOLUTE", ref: url,
+    });
+  }
+
+  const missingFiles = violations
+    .filter((v) => v.kind === "MISSING_FILE")
+    .map((v) => v.ref.replace(/^images\//, ""));
+  const deadRefs = violations.filter((v) => v.kind === "DEAD_LOCAL").map((v) => v.ref);
+
+  return {
+    ok: violations.length === 0,
+    violations,
+    notes,
+    counts: {
+      referenced: referencedNames.length,
+      presentInFolder: present.size,
+      dead: deadRefs.length,
+      missing: missingFiles.length,
+      absolute: absolute.length,
+      undeclaredAbsolute: notes.filter((n) => n.kind === "UNDECLARED_ABSOLUTE").length,
+    },
+    missingFiles,
+    deadRefs,
+    disclosure: violations.length === 0 ? null
+      : buildFolderIntegrityDisclosure({ violations, notes, orderId: opts.orderId }),
+  };
+}
+
+// The disclosure the lead actually reads. Written as its OWN file so it sorts to
+// the top of the Dropbox listing — burying it in delivery-notes.txt would repeat
+// this incident's actual failure, which was not absence of information but
+// absence of anything that made the information unavoidable.
+export function buildFolderIntegrityDisclosure({ violations, notes = [], orderId }) {
+  const L = [];
+  L.push("!!!  THIS DELIVERY FOLDER IS INCOMPLETE  !!!");
+  L.push("");
+  L.push(`order: ${orderId || "(unknown)"}`);
+  L.push("");
+  L.push("The HTML in this folder references files that are not in it. The email");
+  L.push("will render with blank or missing areas where those files belong.");
+  L.push("");
+  L.push("★ The EMAIL copy sent for deployment references the images by absolute");
+  L.push("  Dropbox URL and is NOT affected by this. Only this offline folder is.");
+  L.push("");
+  const dead = violations.filter((v) => v.kind === "DEAD_LOCAL");
+  const miss = violations.filter((v) => v.kind === "MISSING_FILE");
+  if (miss.length) {
+    L.push(`MISSING FROM images/  (${miss.length})`);
+    for (const v of miss) L.push(`  - ${v.ref}`);
+    L.push("");
+  }
+  if (dead.length) {
+    L.push(`REFERENCES THAT RESOLVE NOWHERE  (${dead.length})`);
+    for (const v of dead) L.push(`  - ${v.ref}`);
+    L.push("");
+  }
+  const undeclared = notes.filter((n) => n.kind === "UNDECLARED_ABSOLUTE");
+  if (undeclared.length) {
+    L.push(`STILL POINTING AT DROPBOX rather than a local file  (${undeclared.length})`);
+    L.push("  (these render online but not from an offline copy of this folder)");
+    for (const n of undeclared.slice(0, 20)) L.push(`  - ${n.ref}`);
+    if (undeclared.length > 20) L.push(`  … and ${undeclared.length - 20} more`);
+    L.push("");
+  }
+  L.push("WHAT TO DO: re-approve this order. If the same files are named again,");
+  L.push("send this file to engineering — it means the image collector missed a");
+  L.push("reference mechanism, which is exactly what happened on TEST27-1800.");
+  L.push("");
+  return L.join("\n") + "\n";
+}
+
 // ── HTML localisation ─────────────────────────────────────────────────
 // Swap each absolute URL for its local `images/<filename>` path so the folder's
 // html references the co-located files (owner requirement). NEVER mutates the
@@ -177,11 +331,18 @@ export function planDeliveredImagesFolder(html, urlToFilename, existingImageName
 // the backend keeps is untouched (the deliberate two-copy split: email = absolute
 // Dropbox URLs, folder = local images/). Longest URLs first so a URL that is a
 // prefix of another is not partially replaced.
+// ★ FOLDER-FIX: replace EVERY BYTE FORM of each URL, not just the one the map
+// was keyed by. `job_1779773959367_5508db1a` carries one logical Dropbox URL
+// twice — raw inside `url(...)` and entity-encoded (`&amp;raw=1`) inside
+// `background="…"`. A pure split/join swapped the raw form and left the
+// attribute pointing at Dropbox: an UNDECLARED mixed document, which reads as
+// "delivered fine" to a folder check and as a hotlink to the recipient.
+// replaceAssetUrl (asset-refs.js) swaps both forms, longest first.
 export function localizeHtml(html, urlToFilename) {
   let out = html;
   const entries = Object.entries(urlToFilename).sort((a, b) => b[0].length - a[0].length);
   for (const [url, filename] of entries) {
-    out = out.split(url).join(`images/${filename}`);
+    out = replaceAssetUrl(out, url, `images/${filename}`).html;
   }
   return out;
 }
@@ -455,7 +616,10 @@ export default {
   assignLocalFilenames,
   localizeHtml,
   collectLocalImageNames,
+  collectDeadLocalRefs,
   planDeliveredImagesFolder,
+  gateDeliveredFolderStatic,
+  buildFolderIntegrityDisclosure,
   detectDarkMode,
   looksCompilerAuthored,
   collectFonts,
