@@ -6793,7 +6793,7 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets, compilerCertificate } = req.body || {};
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets, compilerCertificate, routeProvenance } = req.body || {};
 
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
@@ -6993,11 +6993,40 @@ app.post("/bridge-callback", async (req, res) => {
         // column has not been migrated yet the failure is isolated (the delivered
         // result_html is already committed) and certificate.txt degrades to an honest
         // "certificate not located" note. Inert on the LLM path (no compilerCertificate).
-        if (compilerCertificate && typeof compilerCertificate === "object") {
+        // ★ ROUTE PROVENANCE — WHICH ENGINE MADE THIS EMAIL, ON THE JOB ROW.
+        // Written into the SAME EXISTING jsonb column as the certificate
+        // (maveloper_jobs.delivery_meta). NO new column is invented: a write to a
+        // non-existent column is exactly the defect that shipped once already
+        // (os_queue.image_url_map) and degraded silently. approve-schema.test.mjs
+        // marks delivery_meta pending:true — the owner confirms it with one command;
+        // if it is absent this write warns and the FOLDER-side provenance still
+        // ships, because the folder copy does not need the DB at all.
+        //
+        // ★ Unlike the certificate, provenance is written on BOTH routes — the LLM
+        // artifact is precisely the one that must carry an engine statement.
+        if ((compilerCertificate && typeof compilerCertificate === "object") ||
+            (routeProvenance && typeof routeProvenance === "object")) {
           try {
+            const deliveryMeta = {};
+            if (compilerCertificate && typeof compilerCertificate === "object") {
+              deliveryMeta.certificate = compilerCertificate;
+              deliveryMeta.generatedBy = "compiler";
+            }
+            if (routeProvenance && typeof routeProvenance === "object") {
+              deliveryMeta.provenance = routeProvenance;
+              // The engine's OWN statement outranks the downstream html heuristic.
+              deliveryMeta.generatedBy = routeProvenance.engine === "compiler" ? "compiler" : "llm";
+              log("info", "/bridge-callback route-provenance recorded", {
+                requestId: req.id, bridgeJobId,
+                engine: routeProvenance.engine,
+                diamondTag: routeProvenance.diamondTag,
+                fallback: !!(routeProvenance.fallback && routeProvenance.fallback.occurred),
+                guard: (routeProvenance.fallback && routeProvenance.fallback.guard) || null,
+              });
+            }
             const { error: dmErr } = await supabaseAdmin
               .from("maveloper_jobs")
-              .update({ delivery_meta: { certificate: compilerCertificate, generatedBy: "compiler" } })
+              .update({ delivery_meta: deliveryMeta })
               .eq("id", dbJobId);
             if (dmErr) {
               log("warn", "/bridge-callback delivery_meta write failed (column not migrated?) â€” certificate.txt will degrade gracefully", {
@@ -7146,6 +7175,8 @@ async function resolveApproveJobMeta(orderId, requestId) {
         .maybeSingle();
       if (dm && dm.delivery_meta && typeof dm.delivery_meta === "object") {
         meta.certificate = dm.delivery_meta.certificate || null;
+        // ★ The route-provenance record, for certificate.txt + delivery-notes.txt.
+        meta.provenance = dm.delivery_meta.provenance || null;
       }
     } catch {
       // delivery_meta column not present (migration not run) â†’ certificate stays
@@ -7321,11 +7352,20 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     const darkMode = detectDarkMode(html) || jobMeta.darkMode === true;
     const fonts = collectFonts(html);
     const ledger = deriveWordFatalLedger(html);
+    // ★ ROUTE PROVENANCE reaches BOTH human-facing files. A lead must never
+    //   receive an artifact without knowing which engine made it, and on a fallback,
+    //   which named guard refused it. jobMeta.provenance is null for an order that
+    //   predates this change; both builders then degrade to the old heuristic
+    //   wording and say plainly that the wording IS a heuristic.
     const deliveryNotes = buildDeliveryNotes({
       orderId, esp, darkMode, fonts, ledger, generatedBy,
       imageCount: images.length, generatedAt: new Date().toISOString(),
+      provenance: jobMeta.provenance || null,
     });
-    const certificateText = buildCertificateText({ generatedBy, certificate: jobMeta.certificate, orderId });
+    const certificateText = buildCertificateText({
+      generatedBy, certificate: jobMeta.certificate, orderId,
+      provenance: jobMeta.provenance || null,
+    });
 
     // â”€â”€ Write the LOOSE folder (no zip â€” Dropbox zips folders on download) â”€â”€â”€â”€â”€â”€
     // The images/ files are ALREADY in place (copied server-side or downloaded above).
