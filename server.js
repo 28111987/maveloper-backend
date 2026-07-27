@@ -38,6 +38,17 @@ import {
   buildCertificateText,
 } from "./delivery-folder.js";
 import { extractAssetRefs, isRemoteRef, assetBasename, rewriteRefsByBasename } from "./asset-refs.js";
+// ★ ORDER-CONFIRMATION EMAIL. Two new modules, imported together and committed
+// together — a backend file importing a module the deploy does not have is a
+// crash on boot. Neither adds an npm dependency: the transports are built on
+// global fetch (undici, already a dependency) and node:tls/node:net.
+// Inert unless ORDER_CONFIRMATION_ENABLED === "true" (default OFF).
+import { buildOrderConfirmation } from "./order-confirmation.js";
+import {
+  isConfirmationEnabled,
+  sendOrderConfirmation,
+  confirmationMetaFor,
+} from "./order-confirmation-transport.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -7142,7 +7153,10 @@ app.post("/bridge-callback", async (req, res) => {
 // tolerant: a missing table/column/row yields nulls, never an approve failure.
 // -----------------------------------------------------------------
 async function resolveApproveJobMeta(orderId, requestId) {
-  const meta = { imageUrlMap: null, genOrderId: null, certificate: null, esp: null, darkMode: null };
+  // jobRowId: added for the order-confirmation email, which records its own
+  // outcome into THIS row's existing delivery_meta jsonb. Additive — every
+  // pre-existing consumer of `meta` ignores it.
+  const meta = { imageUrlMap: null, genOrderId: null, certificate: null, esp: null, darkMode: null, jobRowId: null };
   if (!supabaseAdmin || !orderId) return meta;
 
   // os_queue: ESP + dark-mode + the job link.
@@ -7185,6 +7199,7 @@ async function resolveApproveJobMeta(orderId, requestId) {
   if (job) {
     meta.imageUrlMap = job.image_url_map || null;
     meta.genOrderId = job.order_id || null;
+    meta.jobRowId = job.id || null;
 
     // Compiler certificate lives in maveloper_jobs.delivery_meta (jsonb), written
     // by /bridge-callback from the bridge-forwarded compilerCertificate. Selected
@@ -7207,6 +7222,48 @@ async function resolveApproveJobMeta(orderId, requestId) {
     }
   }
   return meta;
+}
+
+/**
+ * ★ ORDER-CONFIRMATION: the os_queue fields the email needs, read in their OWN
+ * select. Deliberately NOT folded into resolveApproveJobMeta's existing
+ * `select("job_id, esp, dark_mode")`: that select feeds the delivery folder, and
+ * widening it would mean any problem with a confirmation-only column could take
+ * esp/darkMode down with it. This is the same isolation discipline the
+ * delivery_meta read already uses a few lines above ("Selected SEPARATELY so a
+ * not-yet-migrated column (absent) never fails the map load").
+ *
+ * ★ EVERY COLUMN BELOW IS IN THE SHIPPED DDL — no column is invented.
+ * supabase-setup.sql:197-224 (os_queue): order_id, figma_url, esp, dark_mode,
+ * tat_hours, uploaded_at, deadline, lead_email, started_at, finished_at, and
+ * effective_deadline via the idempotent ALTER at :221 (already selected in
+ * production by queue-runner.js:197).
+ *
+ * Returns null on any failure — the caller then skips the email and says why.
+ */
+async function resolveConfirmationRow(orderId, requestId) {
+  if (!supabaseAdmin || !orderId) return null;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("os_queue")
+      .select("order_id, lead_email, figma_url, esp, dark_mode, tat_hours, uploaded_at, deadline, effective_deadline, started_at, finished_at")
+      .eq("order_id", orderId)
+      .order("uploaded_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      log("warn", "Order-confirmation: os_queue row lookup failed (non-fatal, email will be skipped)", {
+        requestId, orderId, error: error.message,
+      });
+      return null;
+    }
+    return data || null;
+  } catch (e) {
+    log("warn", "Order-confirmation: os_queue row lookup threw (non-fatal, email will be skipped)", {
+      requestId, orderId, error: e.message,
+    });
+    return null;
+  }
 }
 
 // -----------------------------------------------------------------
@@ -7575,6 +7632,176 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       }
     }
 
+    // â”€â”€ â˜…â˜… ORDER-CONFIRMATION EMAIL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // WHY HERE, AND NOWHERE EARLIER. The order is COMPLETE at this line and not
+    // one line before it:
+    //   â€¢ images/ is materialised and trimmed to the delivered reference set
+    //   â€¢ <orderId>.html, delivery-notes.txt, certificate.txt are uploaded
+    //   â€¢ preview.png is co-located (or its absence is recorded)
+    //   â€¢ the integrity gate has run and disclosed
+    //   â€¢ the FOLDER SHARE LINK EXISTS (createFolderShareLink, ~90 lines above)
+    //   â€¢ os_queue.dropbox_url is written back
+    // The email must carry the Dropbox links, so it CANNOT fire before the share
+    // link exists. And it must not fire from the browser or from the queue
+    // runner's status='delivered' write: at that point the delivery folder does
+    // not exist yet, so the two links the spec requires would both be null.
+    //
+    // â˜…â˜… IT MUST NEVER BLOCK DELIVERY. Three independent guarantees, because one
+    // is not enough for something that sits in the delivery path:
+    //   1. sendOrderConfirmation() has NO throw path â€” every failure is a
+    //      returned { ok:false } plus a loud error log.
+    //   2. This whole block is wrapped in its OWN try/catch. Without it, a throw
+    //      from the link/preview/DB calls here would fall into /approve's outer
+    //      catch and turn a COMPLETED delivery into a 500 with "Upload failed" â€”
+    //      the frontend would report the order as failed when the folder is
+    //      sitting in Dropbox, complete. That is precisely the failure mode the
+    //      spec forbids, and it is why the inner catch is not redundant.
+    //   3. Everything above has already been committed to Dropbox and Supabase.
+    //      Nothing in this block can undo any of it.
+    //
+    // â˜… GATED OFF BY DEFAULT. With ORDER_CONFIRMATION_ENABLED unset, the flag
+    // check short-circuits BEFORE the two Dropbox calls below, so production
+    // behaviour â€” including request latency and Dropbox API usage â€” is
+    // byte-identical to today.
+    let confirmationEmail = null;
+    if (isConfirmationEnabled(process.env)) {
+      try {
+        // 1. The queue row: lead_email, figma_url, TAT, the buffered deadline.
+        const qRow = await resolveConfirmationRow(orderId, req.id);
+
+        // 2. â˜… THE DIRECT HTML LINK, alongside the folder link. Both are required
+        //    by the spec. createFolderShareLink is path-generic
+        //    (sharingCreateSharedLinkWithSettings takes any path), so the same
+        //    helper serves a file; the name is historical. Best-effort: a failure
+        //    here costs the second button, not the email.
+        let dropboxHtmlUrl = null;
+        try {
+          dropboxHtmlUrl = await createFolderShareLink(`${folderPath}/${orderId}.html`);
+        } catch (hlErr) {
+          log("warn", "Order-confirmation: direct HTML share link failed (email will carry the folder link only)", {
+            requestId: req.id, orderId, error: hlErr?.message,
+          });
+        }
+
+        // 3. â˜… preview.png INLINE, NOT ATTACHED. A cid: part renders in the body
+        //    even when the client blocks remote images, which is the strongest
+        //    form of inline â€” so we download the bytes. Best-effort: if the
+        //    download fails (or previewStatus is "absent") we fall back to the
+        //    absolute Dropbox URL, which is still inline in the body and still
+        //    not an attachment, and the email says so rather than showing a
+        //    broken-image box.
+        let previewBytes = null;
+        let previewUrl = null;
+        if (previewStatus !== "absent") {
+          try {
+            const dl = await dbx.filesDownload({ path: previewDest });
+            const bin = dl?.result?.fileBinary;
+            if (bin && bin.length) previewBytes = Buffer.isBuffer(bin) ? bin : Buffer.from(bin);
+          } catch (pvErr) {
+            log("warn", "Order-confirmation: preview.png download failed â€” falling back to a remote inline URL", {
+              requestId: req.id, orderId, error: pvErr?.message,
+            });
+          }
+          if (!previewBytes) {
+            try {
+              // Share link â†’ direct-access URL. Same two substitutions
+              // uploadToDropbox already does (dl=0 â†’ raw=1, then swap the host to
+              // dl.dropboxusercontent.com); inlined rather than extracted so this
+              // change touches no existing function.
+              let u = await createFolderShareLink(previewDest);
+              u = u.includes("dl=0") ? u.replace("dl=0", "raw=1") : u + (u.includes("?") ? "&" : "?") + "raw=1";
+              previewUrl = u.replace("www.dropbox.com", "dl.dropboxusercontent.com");
+            } catch (plErr) {
+              log("warn", "Order-confirmation: preview.png share link failed â€” the email will omit the preview", {
+                requestId: req.id, orderId, error: plErr?.message,
+              });
+            }
+          }
+        }
+
+        // 4. Build the message. Pure â€” no I/O, so this cannot hang.
+        //    generationSeconds: the spec asks for generation time IN SECONDS.
+        //    Preferred source is the provenance record's own number; this is the
+        //    fallback, computed from os_queue.started_at â†’ finished_at (both in
+        //    the DDL at supabase-setup.sql:215-216).
+        let generationSeconds = null;
+        if (qRow && qRow.started_at && qRow.finished_at) {
+          const ms = new Date(qRow.finished_at).getTime() - new Date(qRow.started_at).getTime();
+          if (Number.isFinite(ms) && ms > 0) generationSeconds = Math.round(ms / 1000);
+        }
+
+        const message = buildOrderConfirmation({
+          // os_queue (every column verified in supabase-setup.sql:197-224)
+          orderId,
+          leadEmail: qRow ? qRow.lead_email : null,
+          figmaUrl: qRow ? qRow.figma_url : null,
+          esp,                                  // resolved above (os_queue.esp / body)
+          darkMode,                             // resolved above (html scan OR os_queue.dark_mode)
+          tatHours: qRow ? Number(qRow.tat_hours) : null,
+          deadline: qRow ? qRow.deadline : null,
+          effectiveDeadline: qRow ? (qRow.effective_deadline || qRow.deadline) : null,
+          // the delivered artefacts, from THIS request
+          deliveredHtml: html,                  // the EMAIL copy (absolute URLs) â€” the bytes the lead sends
+          dropboxFolderUrl: dropboxUrl,
+          dropboxHtmlUrl,
+          previewUrl,
+          hasInlinePreviewBytes: !!previewBytes,
+          previewStatus,
+          imageCount: images.length,
+          ledger,                               // deriveWordFatalLedger(html), same ledger delivery-notes.txt uses
+          // maveloper_jobs.delivery_meta
+          provenance: jobMeta.provenance || null,
+          certificate: jobMeta.certificate || null,
+          generationSeconds,
+          // â˜… Email on Acid: NO field stores this in either repo (no column, no
+          //   jsonb key, no API call â€” /os has only a "Coming in the Email on
+          //   Acid integration release" tooltip). The spec says "when one
+          //   exists"; one never does yet, so the row is simply absent. Wired as
+          //   a named parameter so the day a field appears it is a one-line
+          //   change here and nothing else.
+          emailOnAcidUrl: null,
+        });
+
+        // 5. Send. NEVER THROWS.
+        const result = await sendOrderConfirmation({
+          message, previewBytes, orderId, requestId: req.id, env: process.env, log,
+        });
+        confirmationEmail = confirmationMetaFor(result, message);
+
+        // 6. â˜… THE FAILURE MUST BE VISIBLE ON THE JOB ROW, NOT ONLY IN A LOG LINE
+        //    THAT SCROLLS AWAY. Written into maveloper_jobs.delivery_meta â€” the
+        //    SAME EXISTING jsonb column the certificate and provenance already
+        //    use (written at /bridge-callback, read at resolveApproveJobMeta).
+        //    â˜… NO NEW COLUMN IS INVENTED. Read-modify-write so the certificate
+        //    and provenance already in the column are preserved.
+        if (supabaseAdmin && jobMeta.jobRowId) {
+          try {
+            const { data: cur } = await supabaseAdmin
+              .from("maveloper_jobs").select("delivery_meta").eq("id", jobMeta.jobRowId).limit(1).maybeSingle();
+            const merged = { ...(cur && cur.delivery_meta && typeof cur.delivery_meta === "object" ? cur.delivery_meta : {}), confirmationEmail };
+            const { error: cmErr } = await supabaseAdmin
+              .from("maveloper_jobs").update({ delivery_meta: merged }).eq("id", jobMeta.jobRowId);
+            if (cmErr) {
+              log("warn", "Order-confirmation: delivery_meta.confirmationEmail write failed (outcome is still in the log + the /approve response)", {
+                requestId: req.id, orderId, error: cmErr.message,
+              });
+            }
+          } catch (cmThrow) {
+            log("warn", "Order-confirmation: delivery_meta.confirmationEmail write threw (outcome is still in the log + the /approve response)", {
+              requestId: req.id, orderId, error: cmThrow.message,
+            });
+          }
+        }
+      } catch (confErr) {
+        // Guarantee 2. This catch is the difference between "the lead did not get
+        // an email" and "the order reports as failed". It must stay.
+        confirmationEmail = { attempted: true, ok: false, reason: "confirmation-block-threw", error: confErr?.message || String(confErr) };
+        log("error", "â˜… ORDER-CONFIRMATION BLOCK THREW â€” ORDER SHIPPED ANYWAY. The lead was NOT notified.", {
+          requestId: req.id, orderId, error: confErr?.message || String(confErr), stack: confErr?.stack?.split("\n").slice(0, 4).join(" | "),
+        });
+      }
+    }
+
     res.json({
       dropboxUrl,
       orderId,
@@ -7594,6 +7821,11 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
             error: folderIntegrity.error || null,
           }
         : null,
+      // â˜… ORDER-CONFIRMATION outcome, so a send failure is visible in the UI the
+      // owner is already looking at rather than only in Railway logs. null means
+      // the feature is OFF (the default) â€” which is NOT the same as a failure,
+      // and the frontend distinguishes the two.
+      confirmationEmail,
       requestId: req.id,
     });
 

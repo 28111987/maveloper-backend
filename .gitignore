@@ -8,3 +8,8 @@ node_modules/
 
 # Large local corpus dump — 4.6 GB; must NEVER enter the Railway-deployed repo
 HTML Extended Collection/
+
+# Rendered order-confirmation emails (the STUB transport's output). These are
+# per-order artifacts containing a real lead's email address — generated output,
+# never source. Regenerate any time with: node order-confirmation.witness.mjs
+order-confirmations/
