@@ -7162,10 +7162,21 @@ async function resolveApproveJobMeta(orderId, requestId) {
   // os_queue: ESP + dark-mode + the job link.
   let jobId = null;
   try {
+    // ★ os_queue.order_id IS NOT UNIQUE. `.limit(1)` with no ORDER BY therefore
+    // picked an ARBITRARY row whenever an order id had more than one — which the
+    // /os double-submit defect made routine — and this row supplies the job link,
+    // the ESP and the dark-mode flag for the whole delivery. Picking the wrong
+    // one silently mis-labels the delivery folder and can resolve the wrong image
+    // map. Ordered newest-first so the choice is at least deterministic and is the
+    // run a lead most likely means. (The /os client now derives the row's primary
+    // key from the submission so a duplicate active order cannot be created; this
+    // is the backend half of the same problem, and it also covers every duplicate
+    // already in the table.)
     const { data: q } = await supabaseAdmin
       .from("os_queue")
       .select("job_id, esp, dark_mode")
       .eq("order_id", orderId)
+      .order("uploaded_at", { ascending: false })
       .limit(1)
       .maybeSingle();
     if (q) {
@@ -7477,120 +7488,30 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       }
     }
 
-    // â”€â”€ TRIM images/ to EXACTLY the delivered-html reference set â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Generation Phase B uploaded THIS order's Figma NODE EXPORTS (layer-1.png,
-    // group-3.png, vector-2.png, blank-gif.png, â€¦) into <folder>/images/ BEFORE
-    // the html existed â€” they had to be reachable as absolute URLs for generation
-    // and the /bridge-callback src rewrite. For a COMPILER order the delivered html
-    // references ONLY the slice_*@2x.png files, so those node exports are now
-    // UNREFERENCED clutter (57 files where the html uses 25) and roughly double the
-    // lead's download. The DELIVERED HTML IS THE AUTHORITY: images/ must hold
-    // exactly what it references. We could not skip placing them (generation runs
-    // before the html), so we remove the unreferenced remainder now â€” after the
-    // referenced set is fully materialised and BEFORE the folder share link is made.
-    //   â€¢ COMPILER path: node exports pruned â†’ images/ == the referenced slices.
-    //   â€¢ LLM path: the node exports ARE the referenced files â†’ keep-set == every
-    //     file â†’ nothing removed (folder byte-identical to today).
-    // Best-effort: any list/delete failure is logged and skipped â€” the delivered
-    // html still resolves every image (nothing referenced is ever a delete target),
-    // the folder just keeps a few extra files. Never fatal to delivery.
+    // ── ★ THE SHARE LINK IS MADE HERE, NOT AT THE END ─────────────────────────
+    // The owner reports the Dropbox link taking 40 to 60 seconds to appear. It was
+    // created as the LAST step of this route, behind two stages that this file's
+    // own comments declare non-blocking housekeeping:
     //
-    // RATE-LIMIT DISCIPLINE (dropbox-prune.js): the first cut fired N concurrent
-    // filesDeleteV2 calls right after the ~25 shared-link metadata calls of the
-    // materialisation loop â€” Dropbox 429'd the whole burst and every delete was
-    // abandoned, so the folder kept its unreferenced files. Now we (1) pace a
-    // short gap so the delete phase does not start while the API is hot, then
-    // (2) delete ALL unreferenced files in ONE filesDeleteBatch call (polling its
-    // async job to completion), with 429 retry + Retry-After-honouring backoff
-    // around the batch, its poll, and the serialised per-file fallback. A per-entry
-    // failure is a skipped file, never fatal.
-    try {
-      const imagesFolder = `${folderPath}/images`;
-      const existingNames = await dropboxListFolderNames(imagesFolder);
-      const { remove } = planDeliveredImagesFolder(html, urlToFilename, existingNames);
-      if (remove.length > 0) {
-        // pacing gap â€” let the API cool down after the metadata/copy burst
-        await sleepMs(DROPBOX_PRUNE_PACING_MS);
-        const { pruned, failed, mode } = await pruneImages(dbx, imagesFolder, remove, {
-          sleep: sleepMs,
-          log: (level, msg, meta) => log(level, msg, { requestId: req.id, orderId, ...(meta || {}) }),
-          maxAttempts: DROPBOX_DELETE_MAX_ATTEMPTS,
-          baseDelayMs: DROPBOX_BATCH_RETRY_DELAY_MS,
-          interFileMs: DROPBOX_RETRY_INTERVAL_MS,
-          pollIntervalMs: DROPBOX_DELETE_POLL_INTERVAL_MS,
-          pollTimeoutMs: DROPBOX_DELETE_POLL_TIMEOUT_MS,
-        });
-        log(failed > 0 ? "warn" : "info", "Approve images/ trimmed to delivered-html reference set", {
-          requestId: req.id, orderId, mode,
-          existing: existingNames.length, kept: existingNames.length - pruned, pruned,
-          failed, // > 0 means some unreferenced files survived the retries â€” folder still delivers
-        });
-      }
-    } catch (pruneErr) {
-      log("warn", "Approve: images/ trim skipped (folder list failed) â€” delivered html still resolves, folder may carry extra files", {
-        requestId: req.id, orderId, error: pruneErr?.message,
-      });
-    }
-
-    // â”€â”€ â˜… DELIVERED-FOLDER INTEGRITY GATE (SEAM_AUDIT I-1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // The last thing before the share link exists, and the FIRST instrument that
-    // has ever measured the document the owner actually opens. TEST27-1800
-    // shipped 79 of 86 images with `images ok: true, missing: []` on the job
-    // record, because every check ran against the workspace copy.
+    //   · the images/ prune  — "Best-effort … Never fatal to delivery." It pays a
+    //     fixed DROPBOX_PRUNE_PACING_MS cool-down, then a filesDeleteBatch whose
+    //     async job is POLLED at DROPBOX_DELETE_POLL_INTERVAL_MS, with up to
+    //     DROPBOX_DELETE_MAX_ATTEMPTS retries at DROPBOX_BATCH_RETRY_DELAY_MS.
+    //   · the integrity gate — "ON FAILURE THIS SHIPS, LOUDLY. IT DOES NOT BLOCK."
+    //     It costs a second full folder listing before it can decide that.
     //
-    // â˜… ON FAILURE THIS SHIPS, LOUDLY. IT DOES NOT BLOCK. Four reasons:
-    //   1. A lead is waiting. Blocking turns a partly-broken folder into NO
-    //      delivery, which is strictly worse for the person waiting on it.
-    //   2. The EMAIL copy â€” absolute Dropbox URLs, the thing that actually gets
-    //      deployed â€” is unaffected by a folder defect. Withholding a working
-    //      email over an offline-convenience artifact is the wrong trade.
-    //   3. What failed on TEST27-1800 was not the delivery, it was the SILENCE.
-    //      The fix for silence is speech, and the disclosure NAMES every file.
-    //   4. This gate has never run in production. A gate that has never run in
-    //      production must not be able to stop production â€” if its extraction is
-    //      over-broad it would block every order, be switched off within a day,
-    //      and close nothing. It earns the right to block by being right first.
-    // The disclosure is its own file so it sorts to the TOP of the Dropbox
-    // listing: this incident's failure was not missing information, it was that
-    // nothing made the information unavoidable.
-    let folderIntegrity = null;
-    try {
-      const finalImageNames = await dropboxListFolderNames(`${folderPath}/images`);
-      folderIntegrity = gateDeliveredFolderStatic(localHtml, finalImageNames, {
-        orderId,
-        // A URL we tried and failed to materialise is a DISCLOSED mixed state,
-        // not a surprise (server.js materialisation returns null on failure).
-        declaredMaterialisationFailures: urlList.filter((u) => !(u in localMap)),
-      });
-      if (!folderIntegrity.ok) {
-        log("error", "â˜… APPROVE SHIPPED AN INCOMPLETE DELIVERY FOLDER â€” disclosed in the folder", {
-          requestId: req.id, orderId, folderPath,
-          referenced: folderIntegrity.counts.referenced,
-          presentInFolder: folderIntegrity.counts.presentInFolder,
-          missingFiles: folderIntegrity.missingFiles,
-          deadRefs: folderIntegrity.deadRefs,
-        });
-        await uploadFileToDropboxRaw(
-          `${folderPath}/!!!-FOLDER-INCOMPLETE-READ-ME.txt`,
-          Buffer.from(folderIntegrity.disclosure, "utf-8")
-        );
-      } else {
-        log("info", "Delivered-folder integrity gate GREEN", {
-          requestId: req.id, orderId,
-          referenced: folderIntegrity.counts.referenced,
-          presentInFolder: folderIntegrity.counts.presentInFolder,
-          undeclaredAbsolute: folderIntegrity.counts.undeclaredAbsolute,
-        });
-      }
-    } catch (gateErr) {
-      // The gate must never be the reason a delivery fails. A gate that can
-      // crash a delivery is a gate that gets deleted.
-      folderIntegrity = { ok: null, error: gateErr?.message || String(gateErr) };
-      log("warn", "Delivered-folder integrity gate could not run â€” delivery continues UNVERIFIED", {
-        requestId: req.id, orderId, error: gateErr?.message,
-      });
-    }
-
+    // Neither changes the link. Pruning only REMOVES unreferenced files from the
+    // folder and the gate only ADDS a disclosure file to it; a Dropbox folder link
+    // is a live view of the folder, so its value is identical whether it is minted
+    // before or after. What the old order did was make the person waiting on the
+    // delivery wait on the tidying — and, because os_queue.dropbox_url is written
+    // immediately after the link, it also kept the /os console blind for the whole
+    // of it. The link and the row write now happen the moment the folder holds
+    // everything the delivered html references; the tidying follows.
+    //
+    // Every stage is timed, so this is a measurement from here on rather than an
+    // argument.
+    const tShareStart = Date.now();
     // One public share link for the FOLDER (Dropbox zips it for the recipient on
     // download â€” the loose-folder delivery the owner asked for).
     const dropboxUrl = await createFolderShareLink(folderPath);
@@ -7631,6 +7552,145 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
         });
       }
     }
+
+
+    const tHousekeepingStart = Date.now();
+    log("info", "Approve: delivery folder share link ready", {
+      requestId: req.id, orderId, folderPath,
+      shareLinkMs: tHousekeepingStart - tShareStart,
+      msFromApproveStart: tHousekeepingStart - startTime,
+    });
+
+    // â”€â”€ TRIM images/ to EXACTLY the delivered-html reference set â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Generation Phase B uploaded THIS order's Figma NODE EXPORTS (layer-1.png,
+    // group-3.png, vector-2.png, blank-gif.png, â€¦) into <folder>/images/ BEFORE
+    // the html existed â€” they had to be reachable as absolute URLs for generation
+    // and the /bridge-callback src rewrite. For a COMPILER order the delivered html
+    // references ONLY the slice_*@2x.png files, so those node exports are now
+    // UNREFERENCED clutter (57 files where the html uses 25) and roughly double the
+    // lead's download. The DELIVERED HTML IS THE AUTHORITY: images/ must hold
+    // exactly what it references. We could not skip placing them (generation runs
+    // before the html), so we remove the unreferenced remainder now â€” after the
+    // referenced set is fully materialised. It now runs AFTER the share link is
+    // made rather than before it: removing unreferenced files does not change a
+    // folder link, and this stage is best-effort, so nobody should wait on it.
+    //   â€¢ COMPILER path: node exports pruned â†’ images/ == the referenced slices.
+    //   â€¢ LLM path: the node exports ARE the referenced files â†’ keep-set == every
+    //     file â†’ nothing removed (folder byte-identical to today).
+    // Best-effort: any list/delete failure is logged and skipped â€” the delivered
+    // html still resolves every image (nothing referenced is ever a delete target),
+    // the folder just keeps a few extra files. Never fatal to delivery.
+    //
+    // RATE-LIMIT DISCIPLINE (dropbox-prune.js): the first cut fired N concurrent
+    // filesDeleteV2 calls right after the ~25 shared-link metadata calls of the
+    // materialisation loop â€” Dropbox 429'd the whole burst and every delete was
+    // abandoned, so the folder kept its unreferenced files. Now we (1) pace a
+    // short gap so the delete phase does not start while the API is hot, then
+    // (2) delete ALL unreferenced files in ONE filesDeleteBatch call (polling its
+    // async job to completion), with 429 retry + Retry-After-honouring backoff
+    // around the batch, its poll, and the serialised per-file fallback. A per-entry
+    // failure is a skipped file, never fatal.
+    let tPruneMs = 0;
+    const tPruneStart = Date.now();
+    try {
+      const imagesFolder = `${folderPath}/images`;
+      const existingNames = await dropboxListFolderNames(imagesFolder);
+      const { remove } = planDeliveredImagesFolder(html, urlToFilename, existingNames);
+      if (remove.length > 0) {
+        // pacing gap â€” let the API cool down after the metadata/copy burst
+        await sleepMs(DROPBOX_PRUNE_PACING_MS);
+        const { pruned, failed, mode } = await pruneImages(dbx, imagesFolder, remove, {
+          sleep: sleepMs,
+          log: (level, msg, meta) => log(level, msg, { requestId: req.id, orderId, ...(meta || {}) }),
+          maxAttempts: DROPBOX_DELETE_MAX_ATTEMPTS,
+          baseDelayMs: DROPBOX_BATCH_RETRY_DELAY_MS,
+          interFileMs: DROPBOX_RETRY_INTERVAL_MS,
+          pollIntervalMs: DROPBOX_DELETE_POLL_INTERVAL_MS,
+          pollTimeoutMs: DROPBOX_DELETE_POLL_TIMEOUT_MS,
+        });
+        log(failed > 0 ? "warn" : "info", "Approve images/ trimmed to delivered-html reference set", {
+          requestId: req.id, orderId, mode,
+          existing: existingNames.length, kept: existingNames.length - pruned, pruned,
+          failed, // > 0 means some unreferenced files survived the retries â€” folder still delivers
+        });
+      }
+    } catch (pruneErr) {
+      log("warn", "Approve: images/ trim skipped (folder list failed) â€” delivered html still resolves, folder may carry extra files", {
+        requestId: req.id, orderId, error: pruneErr?.message,
+      });
+    }
+    tPruneMs = Date.now() - tPruneStart;
+    // â”€â”€ â˜… DELIVERED-FOLDER INTEGRITY GATE (SEAM_AUDIT I-1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Runs AFTER the share link exists (it declares itself non-blocking two
+    // paragraphs down, so it must not delay the link), and it is the FIRST instrument that
+    // has ever measured the document the owner actually opens. TEST27-1800
+    // shipped 79 of 86 images with `images ok: true, missing: []` on the job
+    // record, because every check ran against the workspace copy.
+    //
+    // â˜… ON FAILURE THIS SHIPS, LOUDLY. IT DOES NOT BLOCK. Four reasons:
+    //   1. A lead is waiting. Blocking turns a partly-broken folder into NO
+    //      delivery, which is strictly worse for the person waiting on it.
+    //   2. The EMAIL copy â€” absolute Dropbox URLs, the thing that actually gets
+    //      deployed â€” is unaffected by a folder defect. Withholding a working
+    //      email over an offline-convenience artifact is the wrong trade.
+    //   3. What failed on TEST27-1800 was not the delivery, it was the SILENCE.
+    //      The fix for silence is speech, and the disclosure NAMES every file.
+    //   4. This gate has never run in production. A gate that has never run in
+    //      production must not be able to stop production â€” if its extraction is
+    //      over-broad it would block every order, be switched off within a day,
+    //      and close nothing. It earns the right to block by being right first.
+    // The disclosure is its own file so it sorts to the TOP of the Dropbox
+    // listing: this incident's failure was not missing information, it was that
+    // nothing made the information unavoidable.
+    let tGateMs = 0;
+    const tGateStart = Date.now();
+    let folderIntegrity = null;
+    try {
+      const finalImageNames = await dropboxListFolderNames(`${folderPath}/images`);
+      folderIntegrity = gateDeliveredFolderStatic(localHtml, finalImageNames, {
+        orderId,
+        // A URL we tried and failed to materialise is a DISCLOSED mixed state,
+        // not a surprise (server.js materialisation returns null on failure).
+        declaredMaterialisationFailures: urlList.filter((u) => !(u in localMap)),
+      });
+      if (!folderIntegrity.ok) {
+        log("error", "â˜… APPROVE SHIPPED AN INCOMPLETE DELIVERY FOLDER â€” disclosed in the folder", {
+          requestId: req.id, orderId, folderPath,
+          referenced: folderIntegrity.counts.referenced,
+          presentInFolder: folderIntegrity.counts.presentInFolder,
+          missingFiles: folderIntegrity.missingFiles,
+          deadRefs: folderIntegrity.deadRefs,
+        });
+        await uploadFileToDropboxRaw(
+          `${folderPath}/!!!-FOLDER-INCOMPLETE-READ-ME.txt`,
+          Buffer.from(folderIntegrity.disclosure, "utf-8")
+        );
+      } else {
+        log("info", "Delivered-folder integrity gate GREEN", {
+          requestId: req.id, orderId,
+          referenced: folderIntegrity.counts.referenced,
+          presentInFolder: folderIntegrity.counts.presentInFolder,
+          undeclaredAbsolute: folderIntegrity.counts.undeclaredAbsolute,
+        });
+      }
+    } catch (gateErr) {
+      // The gate must never be the reason a delivery fails. A gate that can
+      // crash a delivery is a gate that gets deleted.
+      folderIntegrity = { ok: null, error: gateErr?.message || String(gateErr) };
+      log("warn", "Delivered-folder integrity gate could not run â€” delivery continues UNVERIFIED", {
+        requestId: req.id, orderId, error: gateErr?.message,
+      });
+    }
+    tGateMs = Date.now() - tGateStart;
+
+    log("info", "Approve: post-link housekeeping complete", {
+      requestId: req.id, orderId,
+      // What the lead used to wait on before the link existed. If these two
+      // numbers are large, they are large AFTER the link is already in the row.
+      housekeepingMs: Date.now() - tHousekeepingStart,
+      pruneMs: tPruneMs,
+      gateMs: tGateMs,
+    });
 
     // â”€â”€ â˜…â˜… ORDER-CONFIRMATION EMAIL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // WHY HERE, AND NOWHERE EARLIER. The order is COMPLETE at this line and not
@@ -7861,6 +7921,87 @@ const queueRunner = createQueueRunner({
 
 // GET /runner/status â€” debug/observability, no auth. Reports the flag + last
 // heartbeat + live queue counts. Harmless when dark (runnerEnabled:false).
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ GET /os/provenance?jobIds=a,b,c — WHICH ENGINE MADE EACH ORDER.
+//
+// The /os console has every operational fact about an order (deadline, elapsed,
+// lead, ESP) and not one QUALITY fact, because the whole provenance record — the
+// engine, the diamond tag, the refusal guard on a fallback, live-text coverage,
+// slice ratio, property-accuracy range, divergence count, seconds elapsed — lives
+// on maveloper_jobs.delivery_meta and the browser has no route to it.
+//
+// WHY A BACKEND ROUTE RATHER THAN A DIRECT SUPABASE READ. `maveloper_jobs` is not
+// declared in the /os repo's supabase-setup.sql, so whether an `authenticated`
+// role can SELECT it is not knowable from that repo — and an RLS refusal returns
+// an EMPTY RESULT WITH NO ERROR, which would have rendered as "this order has no
+// provenance" for every order, forever, indistinguishably from the truth. The
+// backend holds supabaseAdmin and already answers /job-status from this table, so
+// the fact is served from where it is certainly readable.
+//
+// RETURNS THE RECORD RAW. No interpretation here: the ratio/range unit rules
+// (every quality ratio is 0-1; accuracy is a floor..ceiling range) are already
+// written down once in order-confirmation.js, and a second interpretation living
+// on a transport route is how two surfaces start quoting one number two ways. The
+// /os client ports that reader and is tested against it.
+//
+// Auth: optionalAuth, matching GET /job-status, which this console already polls
+// every fifteen seconds and which returns strictly more (the full delivered HTML)
+// for the same class of id. Tightening this one alone would buy nothing and would
+// add a 503 failure mode (requireAuth needs SUPABASE_JWT_SECRET) to a panel whose
+// correct behaviour when it cannot answer is to say so quietly.
+// ─────────────────────────────────────────────────────────────────────────────
+const OS_PROVENANCE_MAX_IDS = 60;
+
+app.get("/os/provenance", optionalAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(200).json({ jobs: {}, degraded: "supabase not configured", requestId: req.id });
+    }
+    const raw = String(req.query.jobIds || "").trim();
+    if (!raw) return res.json({ jobs: {}, requestId: req.id });
+
+    const isUuid = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+    const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter(isUuid))].slice(
+      0,
+      OS_PROVENANCE_MAX_IDS,
+    );
+    if (ids.length === 0) return res.json({ jobs: {}, requestId: req.id });
+
+    const { data, error } = await supabaseAdmin
+      .from("maveloper_jobs")
+      .select("id, order_id, engine_used, delivery_meta, completed_at")
+      .in("id", ids);
+
+    if (error) {
+      // The delivery_meta column may not be migrated on this project. That is a
+      // DEGRADED answer, not a failure: the console shows "no provenance recorded"
+      // rather than an error, exactly as it does for an order that predates the
+      // record. Never a 500 — this endpoint must not be able to break the screen.
+      log("warn", "/os/provenance read failed (delivery_meta not migrated?)", {
+        requestId: req.id, error: error.message, count: ids.length,
+      });
+      return res.status(200).json({ jobs: {}, degraded: error.message, requestId: req.id });
+    }
+
+    const jobs = {};
+    for (const row of data ?? []) {
+      const dm = row.delivery_meta && typeof row.delivery_meta === "object" ? row.delivery_meta : null;
+      jobs[row.id] = {
+        orderId: row.order_id ?? null,
+        engineUsed: row.engine_used ?? null,
+        completedAt: row.completed_at ?? null,
+        generatedBy: (dm && dm.generatedBy) || null,
+        provenance: (dm && dm.provenance) || null,
+        certificate: (dm && dm.certificate) || null,
+      };
+    }
+    return res.json({ jobs, requestId: req.id });
+  } catch (err) {
+    log("error", "/os/provenance threw", { requestId: req.id, error: err.message });
+    return res.status(200).json({ jobs: {}, degraded: err.message, requestId: req.id });
+  }
+});
+
 app.get("/runner/status", async (req, res) => {
   try {
     const s = await queueRunner.status();
