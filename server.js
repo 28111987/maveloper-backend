@@ -49,6 +49,21 @@ import {
   sendOrderConfirmation,
   confirmationMetaFor,
 } from "./order-confirmation-transport.js";
+// ★★ APPROVE IDEMPOTENCY + IMAGE-MAP RECONCILIATION. Two more pure modules,
+// imported and committed together with this file for the same reason as the pair
+// above. Neither adds an npm dependency (node:crypto is built in) and neither
+// performs I/O: approve-idempotency.js decides, image-map-reconcile.js counts,
+// and this file does the reading and writing.
+import {
+  approveFingerprint,
+  readApproveRecord,
+  decideApprove,
+  buildApproveRecord,
+  replayApproveResponse,
+  beginApprove,
+  APPROVE_RECORD_KEY,
+} from "./approve-idempotency.js";
+import { reconcileImageMap, summariseReconciliation } from "./image-map-reconcile.js";
 
 // v9.1.2: set a process-wide long-timeout dispatcher for the bridge fetch.
 // Previous v9.1.1 used per-call `dispatcher` option with .close() in finally,
@@ -7156,7 +7171,11 @@ async function resolveApproveJobMeta(orderId, requestId) {
   // jobRowId: added for the order-confirmation email, which records its own
   // outcome into THIS row's existing delivery_meta jsonb. Additive — every
   // pre-existing consumer of `meta` ignores it.
-  const meta = { imageUrlMap: null, genOrderId: null, certificate: null, esp: null, darkMode: null, jobRowId: null };
+  // approveRecord: the PRIOR successful approve for this order, read from the
+  // same existing delivery_meta jsonb the certificate and provenance come from.
+  // null means "no prior approve is known", which means the idempotency guard
+  // does not fire — its failure mode is always to deliver.
+  const meta = { imageUrlMap: null, genOrderId: null, certificate: null, esp: null, darkMode: null, jobRowId: null, approveRecord: null };
   if (!supabaseAdmin || !orderId) return meta;
 
   // os_queue: ESP + dark-mode + the job link.
@@ -7226,6 +7245,9 @@ async function resolveApproveJobMeta(orderId, requestId) {
         meta.certificate = dm.delivery_meta.certificate || null;
         // ★ The route-provenance record, for certificate.txt + delivery-notes.txt.
         meta.provenance = dm.delivery_meta.provenance || null;
+        // ★★ The prior approve, for the idempotency guard. Read tolerantly:
+        // an absent key, a wrong shape or an unknown schema all yield null.
+        meta.approveRecord = readApproveRecord(dm.delivery_meta);
       }
     } catch {
       // delivery_meta column not present (migration not run) â†’ certificate stays
@@ -7312,6 +7334,28 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     const orderId = sanitizeOrderId(rawOrderId) || String(rawOrderId);
     const folderPath = getDropboxFolderPath(orderId); // /maveloper/<YYYY>/<MM-YYYY>/<orderId>
 
+    // ── ★★ IDEMPOTENCY, ARM 1: the CONCURRENT duplicate ───────────────────────
+    // The durable record (arm 2, below) is written at the END of a run, so two
+    // calls that overlap both read "no prior approve" and both deliver. That is
+    // not theoretical: /approve's client budget is 600 seconds and the failure
+    // mode of an automated caller is a retry of a request it believes has
+    // stalled. This latch is per-process — it does not cover two Railway
+    // replicas — and it is stated as a second line, not as the mechanism.
+    const latch = beginApprove(orderId, { requestId: req.id });
+    if (!latch.ok) {
+      log("warn", "Approve: REFUSED a concurrent duplicate — one approve for this order is already running", {
+        requestId: req.id, orderId, heldBy: latch.held.requestId, heldForMs: Date.now() - latch.held.startedAt,
+      });
+      return res.status(409).json({
+        error: "Approve already in progress",
+        details: `An approve for ${orderId} is already running. Nothing was rebuilt and no second email was sent. Wait for it to finish.`,
+        alreadyInProgress: true,
+        orderId,
+        requestId: req.id,
+      });
+    }
+    try {
+
     // â”€â”€ ID-SPACE RECONCILIATION + SERVER-SIDE MAP RESOLUTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // The images/preview were uploaded during generation, possibly keyed by a
     // DIFFERENT id (a frame-derived / FIGMA-<ts> id) than this owner id â€” that is
@@ -7324,6 +7368,46 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
     //      os_queue.order_id â†’ os_queue.job_id â†’ maveloper_jobs.id link when the
     //      generation id differs). All best-effort; the HTML alone is sufficient.
     const jobMeta = await resolveApproveJobMeta(orderId, req.id);
+
+    // ── ★★ IDEMPOTENCY, ARM 2: the DURABLE record ─────────────────────────────
+    // Approving the same order twice used to re-run this whole route: it rebuilt
+    // the delivery folder, re-materialised every image into Dropbox, re-created
+    // the share link, and — with ORDER_CONFIRMATION_ENABLED on — SENT THE LEAD A
+    // SECOND CONFIRMATION EMAIL. Harmless only for as long as /approve is a
+    // deliberate manual click; a defect the day the server-side runner calls it.
+    //
+    // ★ NO COLUMN WAS INVENTED. The state lives in maveloper_jobs.delivery_meta,
+    // the EXISTING jsonb this route already reads (certificate, provenance) and
+    // already writes (confirmationEmail). If the column is absent, or no job row
+    // matches this order, the record is null and the guard is simply inert —
+    // today's behaviour, unchanged.
+    //
+    // ★ IT CANNOT BLOCK A LEGITIMATE RE-APPROVE. The key is a fingerprint of the
+    // DELIVERED BYTES (order id + html), so a re-compile changes it and the
+    // re-approve runs in full. And a prior run that shipped short, never got a
+    // link, or whose email failed is recorded as incomplete — so a re-approve of
+    // identical bytes is treated as the repair it is. `force: true` in the body
+    // is the explicit escape hatch.
+    const approveFp = approveFingerprint({ orderId, html });
+    const decision = decideApprove({
+      record: jobMeta.approveRecord,
+      fingerprint: approveFp,
+      force: req.body.force === true,
+    });
+    if (!decision.run) {
+      log("info", "Approve: DUPLICATE SUPPRESSED — identical bytes already delivered, folder NOT rebuilt and NO second email sent", {
+        requestId: req.id, orderId, fingerprint: approveFp,
+        firstApprovedAt: decision.prior.at, firstRequestId: decision.prior.requestId,
+        dropboxUrl: decision.prior.dropboxUrl,
+      });
+      return res.json(replayApproveResponse(decision.prior, { requestId: req.id }));
+    }
+    if (jobMeta.approveRecord) {
+      log("info", "Approve: prior approve found and NOT suppressed — this run proceeds", {
+        requestId: req.id, orderId, reason: decision.reason,
+        priorFingerprint: jobMeta.approveRecord.fingerprint, thisFingerprint: approveFp,
+      });
+    }
 
     // Build the URL â†’ local-filename map. THE DELIVERED HTML IS THE AUTHORITY for
     // WHICH images belong in the folder: only URLs the html actually references
@@ -7673,6 +7757,45 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
           undeclaredAbsolute: folderIntegrity.counts.undeclaredAbsolute,
         });
       }
+
+      // ── ★ IMAGE-MAP RECONCILIATION, MEASURED ON EVERY APPROVE ───────────────
+      // A live order recorded an imageUrlMap of 287 entries while its delivered
+      // folder held 114, and the two numbers were waved off as "probably the node
+      // exports, correctly excluded". Probably is not a measurement, and the last
+      // pair waved off as "two different counts" turned out to be two different
+      // UNITS and seven files short. From here on the split is a log line: every
+      // map entry is accounted for as referenced+present, unreferenced,
+      // a duplicate under another key, or something-else-named, and the four are
+      // asserted to sum to the map's size. FREE: it is pure arithmetic over the
+      // html, the maps and the folder listing this route already has in hand —
+      // no extra Dropbox or Supabase call.
+      try {
+        const rec = reconcileImageMap({
+          imageUrlMap: jobMeta.imageUrlMap || bodyImageUrlMap || {},
+          preferredFromBody: bodyImageUrlMap || null,
+          deliveredHtml: html,
+          folderImageNames: finalImageNames,
+        });
+        log(rec.balanced && rec.anyReferencedFileMissing !== true ? "info" : "error",
+          rec.balanced && rec.anyReferencedFileMissing !== true
+            ? "Approve: imageUrlMap reconciled against the delivered html and folder"
+            : "★ APPROVE: IMAGE-MAP RECONCILIATION DID NOT BALANCE — the gap is the finding",
+          {
+            requestId: req.id, orderId,
+            summary: summariseReconciliation(rec),
+            ...rec.counts,
+            gap: rec.gap,
+            unreferencedByKind: rec.unreferencedByKind,
+            otherByReason: rec.otherByReason,
+            referencedMissingFromFolder: (rec.referencedNotInFolder || []).map((m) => m.assignedFilename),
+            referencedMissingFromMap: rec.referencedNotInMap.length,
+          });
+      } catch (recErr) {
+        // An accounting instrument must never be able to fail a delivery.
+        log("warn", "Approve: image-map reconciliation could not run (delivery unaffected)", {
+          requestId: req.id, orderId, error: recErr?.message,
+        });
+      }
     } catch (gateErr) {
       // The gate must never be the reason a delivery fails. A gate that can
       // crash a delivery is a gate that gets deleted.
@@ -7862,6 +7985,53 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       }
     }
 
+    // ── ★★ IDEMPOTENCY: RECORD THIS RUN ──────────────────────────────────────
+    // Written LAST, so only a run that got this far is remembered — and written
+    // as a read-modify-write MERGE, for the same reason the confirmationEmail
+    // write above is one: a blind update would delete the certificate, the
+    // provenance and the confirmation outcome that share this jsonb. The read
+    // happens here rather than being reused from resolveApproveJobMeta because
+    // the email block may have written to the column since.
+    //
+    // Non-fatal in every direction: no job row, no column, or a failed write
+    // means the next approve of these bytes simply runs in full, which is
+    // exactly today's behaviour. A guard that could fail a delivery would be
+    // worse than the duplicate it prevents.
+    if (supabaseAdmin && jobMeta.jobRowId) {
+      try {
+        const approveRecord = buildApproveRecord({
+          fingerprint: approveFp, orderId, folderPath, dropboxUrl,
+          imageCount: images.length, previewStatus, generatedBy,
+          folderIntegrity, confirmationEmail, requestId: req.id,
+        });
+        const { data: cur } = await supabaseAdmin
+          .from("maveloper_jobs").select("delivery_meta").eq("id", jobMeta.jobRowId).limit(1).maybeSingle();
+        const merged = {
+          ...(cur && cur.delivery_meta && typeof cur.delivery_meta === "object" ? cur.delivery_meta : {}),
+          [APPROVE_RECORD_KEY]: approveRecord,
+        };
+        const { error: apErr } = await supabaseAdmin
+          .from("maveloper_jobs").update({ delivery_meta: merged }).eq("id", jobMeta.jobRowId);
+        if (apErr) {
+          log("warn", "Approve: idempotency record write failed — a repeat approve of these bytes will run in full (today's behaviour)", {
+            requestId: req.id, orderId, error: apErr.message,
+          });
+        } else {
+          log("info", "Approve: idempotency record written", {
+            requestId: req.id, orderId, fingerprint: approveFp, complete: approveRecord.complete,
+          });
+        }
+      } catch (apThrow) {
+        log("warn", "Approve: idempotency record write threw — a repeat approve of these bytes will run in full (today's behaviour)", {
+          requestId: req.id, orderId, error: apThrow.message,
+        });
+      }
+    } else {
+      log("info", "Approve: no job row for this order — the idempotency record cannot be stored, so a repeat approve will run in full", {
+        requestId: req.id, orderId,
+      });
+    }
+
     res.json({
       dropboxUrl,
       orderId,
@@ -7889,6 +8059,12 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       requestId: req.id,
     });
 
+    } finally {
+      // The latch is released on EVERY exit — success, thrown error, or the
+      // early returns above. A latch that can be left held turns one failed
+      // approve into an order that can never be approved again.
+      latch.release();
+    }
   } catch (err) {
     log("error", "Approve/upload error", {
       requestId: req.id,

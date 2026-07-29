@@ -343,9 +343,24 @@ W("B2.4 ★★ THE BLOCK HAS ITS OWN try/catch — without it a throw here would
   /ORDER-CONFIRMATION BLOCK THREW/.test(block) && /ORDER SHIPPED ANYWAY/.test(block),
   ["catch (confErr) present, logs at error, does not rethrow"]);
 
+// ★ THIS ASSERTION WAS RED AND NOBODY SAW IT. Its first clause used to read
+// `iFlagGate < iShareLink + block.length` — arithmetic across two unrelated
+// offsets that happened to be true while createFolderShareLink(folderPath) sat
+// LATE in the route. Commit 1b436b5 hoisted the share link above the
+// housekeeping (correctly — it is why the Dropbox link now appears in seconds),
+// which moved iShareLink 5.4 KB earlier and made the sum smaller than iFlagGate.
+// The witness has therefore been reporting "22 held, 1 broke" since that commit
+// while the PROPERTY it names has never stopped being true. Restated as the
+// property itself: every Dropbox call and the send that the confirmation block
+// makes must sit
+// after the flag gate, so an unset flag reaches none of them.
+const iHtmlLink = approveSrc.indexOf("createFolderShareLink(`${folderPath}/${orderId}.html`)");
+const iPreviewDownload = approveSrc.indexOf("await dbx.filesDownload({ path: previewDest })");
 W("B2.5 ★ the flag gate wraps the WHOLE block, so with the flag off not even a Dropbox call is made",
-  iFlagGate < iShareLink + block.length && iFlagGate < approveSrc.indexOf("createFolderShareLink(`${folderPath}/${orderId}.html`)"),
+  iFlagGate > 0 && iHtmlLink > iFlagGate && iPreviewDownload > iFlagGate && iSend > iFlagGate &&
+  iHtmlLink < iResJson && iPreviewDownload < iResJson,
   ["the direct-HTML-link call and the preview download both sit INSIDE the flag gate",
+   `flag gate +${iFlagGate} < html share link +${iHtmlLink} < preview download +${iPreviewDownload} < send +${iSend}`,
    "→ flag off means byte-identical production behaviour, including latency and Dropbox API usage"]);
 
 W("B2.6 ★ the confirmation write to delivery_meta is a read-modify-write MERGE, not an overwrite",
