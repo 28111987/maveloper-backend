@@ -23,14 +23,19 @@ import {
   countPlaceholderLinks,
   readProvenanceFacts,
   buildLeadSummary,
+  buildFields,
+  qbGradText,
+  encodedSizeReport,
   buildOrderConfirmation,
   buildRfc822,
-  buildOutlookCaveat,
   fmtIST,
   fmtSeconds,
   esc,
   safeHref,
-  PREVIEW_CID,
+  LOGO_MASTHEAD,
+  LOGO_FOOTER,
+  BRAND_ATTRIBUTION,
+  TOKENS,
 } from "./order-confirmation.js";
 import {
   isConfirmationEnabled,
@@ -119,6 +124,46 @@ const FALLBACK_PROV = {
   deliveredVerification: null,
   banner: "ENGINE: LLM PIPELINE — ★ FALLBACK. The compiler REFUSED this design [COORDINATES_MISSING] and the LLM produced this artifact instead.",
   humanBlock: "ROUTE PROVENANCE\n  ★ FALLBACK — THIS IS NOT COMPILER OUTPUT.",
+};
+
+// ★★ THE SECOND STATE THIS EMAIL HAS TO RENDER, AS OF 2026-07-29.
+// The owner has BANNED the LLM route: every order is COMPILER or it FAILS. So a
+// design the compiler refuses no longer hands off to an LLM — it produces no
+// artifact at all. Same real guard/reason pair from the compiler adapter
+// (COORDINATES_MISSING / "missing figma coordinates"), but the record now says
+// engine:"compiler", shipped:false, fallback.occurred:false — and the guard sits
+// ONLY at compiler.refusalGuard, which is why the email reads it from there.
+const FAILURE_PROV = {
+  schema: 2,
+  at: "2026-07-27T09:03:44.001Z",
+  jobId: "job_compilefail_1",
+  engine: "compiler",
+  engineLabel: "DETERMINISTIC COMPILER (DIAMOND-46)",
+  diamondTag: "DIAMOND-46",
+  figma: { fileKey: null, nodeId: null, designWidth: null },
+  compiler: {
+    attempted: true, exit: 2, proven: false, shipped: false,
+    refusalGuard: "COORDINATES_MISSING",
+    refusalReason: "missing figma coordinates",
+    transforms: null, notAttemptedBecause: null,
+  },
+  fallback: {
+    occurred: false, from: null, to: null, guard: null, reason: null,
+    mode: "off", flag: "COMPILER_FALLBACK_MODE",
+    note: "COMPILER_FALLBACK_MODE=off — the LLM route is banned. A refusal is a FAILED ORDER, not a substitution.",
+  },
+  quality: {
+    liveTextCoverage: null, sliceRatioNodes: null, sliceRatioArea: null,
+    propertyAccuracyFloor: null, propertyAccuracyCeiling: null,
+    divergenceCount: null, divergenceBreakdown: null,
+    textNodes: null, slicedTextNodes: null, wordFatalCount: null,
+    source: "no certificate path (the compiler did not get far enough to write one)",
+  },
+  delivery: { espTarget: null, espTargetRecognised: null, espTokensApplied: null, darkMode: false, specSource: null, note: "" },
+  secondsElapsed: 0,
+  deliveredVerification: null,
+  banner: "ENGINE: DETERMINISTIC COMPILER — ★ REFUSED [COORDINATES_MISSING]. NOTHING WAS BUILT.",
+  humanBlock: "ROUTE PROVENANCE\n  ★ COMPILE FAILED — no artifact was produced.",
 };
 
 const BASE_ROW = {
@@ -222,22 +267,34 @@ ok(certOnly.divergences.value === 12 && certOnly.divergences.source === "certifi
 ok(certOnly.accuracyDerived && certOnly.accuracyDerived.value === 98.8, "accuracy is COMPUTED from certificate checksRun/divergenceCount when provenance has none");
 ok(certOnly.slicedImages.value === 25, "certificate.imagesTotal serves as the slice-count proxy");
 
-// ── ★ THE LEAD-READABLE TRANSLATION ───────────────────────────────────────────
+// ── ★ THE VERDICT, IN FOUR STRINGS ────────────────────────────────────────────
 const cs = buildLeadSummary(cf, { placeholderCount: 33 });
-ok(/deterministic compiler/i.test(cs.headline), "compiler summary leads with a plain sentence naming the engine");
-ok(cs.tone === "lime" && cs.fellBack === false, "a compiler ship is lime and not marked as a fallback");
-ok(cs.paragraphs.some((p) => /108 text blocks/.test(p)), "the live-text guarantee is stated in lead language with the real count");
-ok(cs.paragraphs.some((p) => /not pixel-perfect|59 checked/.test(p)), "★ certify exit 1 is disclosed — a compiler ship is not silently presented as proven");
-ok(cs.paragraphs.some((p) => /replace 33 placeholder link/.test(p)), "the sendability sentence carries the real placeholder count");
+ok(cs.state === "shipped" && cs.tone === "lime", "a clean compiler ship is state 'shipped' and lime");
+ok(/compiler/i.test(cs.headline) && cs.headline.length < 70, "the headline names the engine in one short statement");
+ok(/DIAMOND-46/.test(cs.chip), "the scope chip carries the build tag");
+ok(/pixel-perfect/.test(cs.cap), "★ certify exit 1 is still disclosed — the one caption carries the caveat now the detail table is gone");
 ok(!/slice ratio|divergence|certify/i.test(cs.headline), "the HEADLINE contains no jargon a lead would not understand");
 
+// ★★ THE COMPILE-FAILURE STATE. The LLM route is banned; a refusal is a failed
+//    order, and the guard sits only at compiler.refusalGuard.
+const xf = readProvenanceFacts({ provenance: FAILURE_PROV, deliveredHtml: "" });
+ok(xf.refusalGuard === "COORDINATES_MISSING", "★ the refusal guard is read from compiler.refusalGuard, NOT via the fallback block");
+ok(xf.compilerShipped === false, "compiler.shipped:false is read");
+const xs = buildLeadSummary(xf, { placeholderCount: 0 });
+ok(xs.state === "failed", "★★ a compiler that refused renders state 'failed' — NOT a clean ship");
+ok(xs.tone === "red" && xs.chip === "COMPILE FAILED", "★ a failed compile is RED and says COMPILE FAILED");
+ok(/could not build/i.test(xs.headline), "★ the failure headline says the order did not build, in plain words");
+ok(/COORDINATES_MISSING/.test(xs.cap) && /missing figma coordinates/.test(xs.cap), "★ the failure names the guard AND quotes the verbatim reason");
+ok(!/LLM/i.test(xs.headline + xs.cap + xs.engineLabel), "★★ a compiler failure NEVER mentions an LLM substitution — that route is banned");
+ok(/nothing was built/i.test(xs.cap), "the failure states the consequence: no HTML, no folder");
+
+// A pre-ban record that DOES name an LLM substitution must still not read as a
+// compiler ship. It renders red like any other non-compiler artifact.
 const fs2 = buildLeadSummary(ff, { placeholderCount: 33 });
-ok(/LLM, not the deterministic compiler/i.test(fs2.headline), "★ a fallback SAYS SO PLAINLY in the headline");
-ok(fs2.tone === "amber" && fs2.fellBack === true, "a fallback is amber and flagged");
-ok(fs2.paragraphs.some((p) => /COORDINATES_MISSING/.test(p)), "★ the fallback names the guard to the lead");
-ok(fs2.paragraphs.some((p) => /missing figma coordinates/.test(p)), "★ the fallback quotes the verbatim reason to the lead");
-ok(fs2.paragraphs.some((p) => /no pixel-level proof/i.test(p)), "the fallback states what the lead loses, in plain terms");
-ok(!fs2.paragraphs.some((p) => /108 text blocks/.test(p)), "the compiler's live-text claim is NOT made on a fallback");
+ok(fs2.state === "llm" && fs2.tone === "red", "★ a legacy LLM record is red, not lime — it is not a compiler ship");
+ok(/did not come from the deterministic compiler/i.test(fs2.headline), "★ a legacy LLM record SAYS SO PLAINLY in the headline");
+ok(/COORDINATES_MISSING/.test(fs2.cap) && /missing figma coordinates/.test(fs2.cap), "★ it still names the guard and the verbatim reason");
+ok(!/108 text blocks/.test(fs2.cap), "the compiler's live-text claim is NOT made on a non-compiler build");
 
 // ── the assembled message ─────────────────────────────────────────────────────
 const msg = buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV });
@@ -248,31 +305,71 @@ ok(/^TEST27-1907 is built — 33 links to replace before sending$/.test(msg.subj
 ok(buildOrderConfirmation({ ...BASE_ROW, deliveredHtml: "<a href='https://x'>ok</a>", provenance: COMPILER_PROV }).subject.includes("ready to send"), "a build with no placeholders gets a 'ready to send' subject");
 
 const H = msg.html;
-// SPEC CONTENT CHECKLIST — every required element present in the rendered bytes.
-ok(H.includes("TEST27-1907"), "content: Order ID");
-ok(H.includes("figma.com/design/TmppLGRXkZmWB5OqzZD00H"), "content: the Figma link");
-ok(/24h/.test(H), "content: TAT");
-ok(/IST/.test(H), "content: the deadline in IST");
-ok(/klaviyo/i.test(H), "content: ESP target");
-ok(/Dark mode supported/.test(H), "content: dark or light");
-ok(/deterministic compiler/i.test(H) && /DIAMOND-46/.test(H), "content: GENERATED BY, from route provenance");
-ok(H.includes(BASE_ROW.dropboxFolderUrl.replace(/&/g, "&amp;")), "content: the Dropbox folder link");
-ok(H.includes(BASE_ROW.dropboxHtmlUrl.replace(/&/g, "&amp;")), "content: the DIRECT HTML link");
-ok(/41\.6s|42s/.test(H), "content: generation time in seconds (from provenance secondsElapsed)");
-ok(/Live-text coverage/.test(H) && /100%/.test(H), "content: live-text coverage, as a percentage of the 0-1 ratio");
-ok(/Slice ratio/.test(H) && /17\.81%/.test(H), "content: slice ratio");
-ok(/12\.72% of the visual area/.test(H), "content: slice ratio by area too");
-ok(/95\.93%.*99\.35%|95\.93% to 99\.35%/.test(H), "content: accuracy as a RANGE");
-ok(/Outlook/.test(H), "content: the Outlook caveat");
-ok(/On mobile/.test(H), "content: mobile status");
-ok(!/Email on Acid/.test(H), "content: the Email on Acid row is ABSENT when no link exists (never faked)");
-ok(
-  buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV, emailOnAcidUrl: "https://app.emailonacid.com/test/abc" }).html.includes("Email on Acid"),
-  "content: the Email on Acid row APPEARS the moment a link is supplied",
-);
-ok(/automated confirmation/i.test(H) && /do not reply/i.test(H), "★ an explicit automated / do-not-reply line is present");
-ok(/33 placeholder links to replace/.test(H), "★ the placeholder count is a prominent block, not a footnote");
-ok((H.match(/33/g) || []).length >= 3, "★ the placeholder count appears in at least three places");
+
+// ── ★★ THE ELEVEN FIELDS, AND NOTHING ELSE ────────────────────────────────────
+// The owner listed these himself on 2026-07-29. Each one must be in the bytes.
+ok(H.includes("TEST27-1907"), "field 1/11: Order ID");
+ok(/>TAT</.test(H) && /24h/.test(H), "field 2/11: TAT");
+ok(/YOUR DEADLINE|Your deadline/i.test(H) && /IST/.test(H), "field 3/11: Your deadline, in IST");
+ok(/ESP target/i.test(H) && /klaviyo/i.test(H), "field 4/11: ESP target");
+ok(/Colour scheme/i.test(H) && /Dark \+ light/.test(H), "field 5/11: Colour scheme (dark or light)");
+ok(/Generated by/i.test(H) && /Deterministic compiler/i.test(H) && /DIAMOND-46/.test(H), "field 6/11: Generated by");
+ok(/Build time/i.test(H) && /41\.6s|42s/.test(H), "field 7/11: Build time, in seconds");
+ok(H.includes("figma.com/design/TmppLGRXkZmWB5OqzZD00H"), "field 8/11: the Figma design link");
+ok(H.includes(BASE_ROW.dropboxHtmlUrl.replace(/&/g, "&amp;")), "field 9/11: the direct HTML link");
+ok(H.includes(BASE_ROW.dropboxFolderUrl.replace(/&/g, "&amp;")), "field 11/11: the Dropbox link");
+
+// ★ field 10/11 — EMAIL ON ACID. No field stores one yet (blocked on a budget
+//   decision), so the row must not exist at all: never a blank row, never a dead
+//   label. The moment a link is supplied, it appears.
+ok(!/Email on Acid/.test(H), "★ field 10/11 is ABSENT when no link exists — no blank row, no dead label");
+{
+  const withEoa = buildOrderConfirmation({
+    ...BASE_ROW, provenance: COMPILER_PROV, emailOnAcidUrl: "https://app.emailonacid.com/test/abc",
+  });
+  ok(withEoa.html.includes("Email on Acid") && withEoa.html.includes("app.emailonacid.com/test/abc"),
+    "★ field 10/11 APPEARS the moment a link is supplied");
+  ok(withEoa.diagnostics.fieldCount === 11, `★★ with the Email on Acid link present the count is exactly ELEVEN (got ${withEoa.diagnostics.fieldCount})`);
+  ok(msg.diagnostics.fieldCount === 10, "★ without it, ten — the eleventh is the only optional one");
+}
+
+// ── ★★ WHAT WAS DELETED. These assertions are the cut, expressed as tests. ────
+ok(!/Live-text coverage/.test(H) && !/Live editable text/.test(H), "DELETED: live-text coverage");
+ok(!/Slice ratio/.test(H) && !/17\.81%/.test(H) && !/12\.72%/.test(H), "DELETED: slice ratio");
+ok(!/Layout accuracy/.test(H) && !/95\.93%/.test(H) && !/99\.35%/.test(H), "DELETED: layout accuracy");
+ok(!/Known differences/.test(H) && !/59 checked/.test(H), "DELETED: known differences");
+ok(!/Final-file check/.test(H), "DELETED: the final-file check row");
+ok(!/how it was built/i.test(H), "DELETED: the HOW IT WAS BUILT prose block");
+ok(!/the build, in detail/i.test(H), "DELETED: THE BUILD IN DETAIL block");
+ok(!/before you send/i.test(H), "DELETED: the BEFORE YOU SEND section");
+// (the word "Outlook" survives inside a CSS comment explaining [data-ogsc]; the
+//  CAVEAT — the Word-engine paragraph a lead was asked to read — is what went.)
+ok(!/Outlook on Windows|Outlook 2007-2019|none of the constructs|Word to draw email/.test(H), "DELETED: the Outlook caveat");
+ok(!/On mobile/.test(H), "DELETED: the mobile caveat");
+ok(!/<img[^>]*preview/i.test(H) && !/Full-length preview/.test(H), "DELETED: the inline full-length preview image");
+// The 25-line itemisation is gone. Its most distinctive artefact was a list of
+// link TEXTS lifted out of the delivered HTML — none of that may survive.
+ok(!/Which links/.test(H), "DELETED: the 'Which links' itemisation header");
+ok(!/placeholder link #/.test(H), "DELETED: the per-placeholder ordinal list");
+{
+  const texts = ph.items.map((i) => i.text).filter((t) => t && t.length > 8);
+  ok(texts.length > 3 && !texts.some((t) => H.includes(t)),
+    `★★ DELETED: not one of the ${texts.length} placeholder link TEXTS appears anywhere in the email`);
+}
+
+// ── ★ THE ONE THING KEPT THAT HE DID NOT LIST ─────────────────────────────────
+// A lead who forwards an unedited master template ships dead links. One line.
+{
+  const line = /(\d+) placeholder links?<\/strong> still points? to &ldquo;#&rdquo; &mdash; this email is not sendable until (they are|it is) replaced\./.exec(H);
+  ok(!!line && line[1] === "33", "★ the placeholder warning is present and carries the real count");
+  ok((H.match(/not sendable/g) || []).length === 1, "★★ it is ONE line — it appears exactly once in the document");
+  const clean = buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV, deliveredHtml: "<a href='https://x'>ok</a>" });
+  ok(!/placeholder/i.test(clean.html) && !/not sendable/.test(clean.html),
+    "★★ COUNT ZERO → the line is OMITTED entirely, and the word 'placeholder' appears nowhere");
+  ok(!/#E8C07D/i.test(clean.html) && /#E8C07D/i.test(H),
+    "★ colour ENCODES: amber has one job, so zero placeholders means zero amber in the document");
+}
+ok(/automated order confirmation/i.test(H) && /do not reply/i.test(H), "★ KEPT (spec): the automated-confirmation line and the do-not-reply statement");
 
 // ── ★ IT MUST BE A REAL EMAIL ─────────────────────────────────────────────────
 ok(!/display\s*:\s*flex/i.test(H), "real email: NO flexbox");
@@ -285,45 +382,170 @@ ok(/cellpadding="0"/.test(H) && /cellspacing="0"/.test(H) && /border="0"/.test(H
 ok(/style="[^"]*color:#/i.test(H), "real email: styles are inline with explicit hex");
 ok(/name="color-scheme"/.test(H) && /supported-color-schemes/.test(H), "real email: dark-client metas present");
 ok(/prefers-color-scheme: dark/.test(H), "real email: renders in a dark client (dark-mode block present)");
+ok(/\[data-ogsc\]/.test(H), "★ real email: [data-ogsc] too — Outlook.com's dark mode ignores prefers-color-scheme");
 ok(/<!--\[if mso\]>/.test(H), "real email: an MSO conditional block for the Word engine");
-ok(H.includes("#C1FF72"), "★ brand: Maveloper lime #C1FF72");
-ok(/Born at Mavlers/.test(H), "★ brand: 'Born at Mavlers'");
 ok(!/border-radius:\s*[1-9]/.test(H), "★ brand: sharp edges, per the /os sharp-edge system (also Outlook-safe)");
 ok(/<!DOCTYPE/.test(H) && /<\/html>/.test(H), "real email: a complete document");
+ok(!/<link[^>]+fonts|@import/i.test(H), "★ real email: NO webfont is fetched — the design is drawn for the fallback face");
 
-// ── ★ preview.png INLINE, NOT ATTACHED ────────────────────────────────────────
-const inlineMsg = buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV, hasInlinePreviewBytes: true });
-ok(inlineMsg.html.includes(`src="cid:${PREVIEW_CID}"`), "★ with bytes, the preview is a cid: reference (inline, survives blocked remote images)");
-ok(inlineMsg.diagnostics.previewMode === "inline-cid", "diagnostics report inline-cid mode");
-ok(msg.html.includes("preview.png?rlkey") || msg.html.includes("preview.png"), "without bytes, the preview falls back to the absolute Dropbox URL — still inline in the body");
-ok(msg.diagnostics.previewMode === "inline-remote-url", "diagnostics report the remote-URL fallback honestly");
-const noPrev = buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV, previewUrl: null, previewStatus: "absent" });
-ok(!/<img[^>]*preview/.test(noPrev.html) && noPrev.diagnostics.previewMode === "absent", "with no preview at all, no broken image box is rendered");
+// ── ★★ PART 2 — THE BRAND CORRECTIONS ─────────────────────────────────────────
+ok(!/Born at Mavlers/i.test(H) && !/Born at Mavlers/i.test(msg.text),
+  "★★ RETIRED: 'Born at Mavlers' appears nowhere in the HTML or the text part");
+ok(BRAND_ATTRIBUTION === "CRAFTED BY MAVLERS", "★ the attribution constant is 'CRAFTED BY MAVLERS'");
+ok(H.includes("CRAFTED BY MAVLERS") && msg.text.includes("CRAFTED BY MAVLERS"), "★★ 'CRAFTED BY MAVLERS' is in both parts");
 
-const raw = buildRfc822(inlineMsg, { date: "Mon, 27 Jul 2026 12:00:00 +0530", messageId: "<x@y>", previewBytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]) });
+// ── ★★ THE TWO REAL LOGOS, AND THE BLOCKED-IMAGE STATE ────────────────────────
+ok(H.includes(LOGO_MASTHEAD) && H.includes(LOGO_FOOTER), "★ both real logo GIFs are wired");
+{
+  const imgs = H.match(/<img\b[^>]*>/g) || [];
+  ok(imgs.length === 2, `★ exactly two images — both logos, no preview (got ${imgs.length})`);
+  for (const [i, tag] of imgs.entries()) {
+    const alt = (tag.match(/\balt="([^"]*)"/) || [])[1];
+    ok(!!alt && /^[A-Z][A-Z ]+$/.test(alt), `★★ logo ${i + 1}: the alt reads as a wordmark, not a filename (${alt})`);
+    ok(/\bwidth="\d+"/.test(tag) && /\bheight="\d+"/.test(tag),
+      `★★ logo ${i + 1}: width AND height ATTRIBUTES reserve the box so the layout cannot collapse`);
+    ok(/font-family:/.test(tag) && /font-weight:/.test(tag) && /color:#/.test(tag),
+      `★★ logo ${i + 1}: the alt text is STYLED, so a blocked image renders as a wordmark and not as 8px serif`);
+  }
+  ok(/alt="MAVELOPER"/.test(H), "★ the masthead alt IS the Maveloper wordmark");
+  ok(/alt="DESIGN MAVLERS"/.test(H), "★ the footer alt IS the DesignMavlers wordmark");
+  // 600x120 and 500x500 are the real GIF header dimensions, read off the files.
+  ok(/width="170" height="34"/.test(H), "★ the masthead logo is drawn at its true 5:1 ratio (source 600x120)");
+  ok(/width="60" height="60"/.test(H), "★ the footer logo is SQUARE (source 500x500) and is not stretched into a letterbox");
+}
+ok(H.includes("Maveloper &middot; CRAFTED BY MAVLERS"),
+  "★★ the attribution is LIVE TEXT under the footer logo — blocked images cost the animation, never the identity");
+
+// ── ★★ PART 3 — THE DESIGN SYSTEM, IN THE BRIEF'S VOCABULARY ──────────────────
+ok(/font-family:Poppins,'Segoe UI'/.test(H), "★ Poppins,'Segoe UI' — the second face is deliberate, it catches Windows and Gmail");
+ok(/class="em_sec em_panel"/.test(H), "★ emSec_: each section is its own band");
+ok(/background-image:radial-gradient\(ellipse/.test(H) && /bgcolor="#0B0B0E"/.test(H),
+  "★ emSec_: a solid bgcolor for Outlook PLUS a radial glow for everything else");
+ok((H.match(/border-top:1px solid #1E1E26;padding:50px 46px/g) || []).length === 3,
+  "★ emSec_: three bands, each with the 1px top border and 50px/46px padding");
+ok(/linear-gradient\(90deg,#C1FF72 0%,#FFDD2F 100%\)/.test(H), "★ emKick_: the 28px gradient rule");
+ok(/letter-spacing:0.24em;text-transform:uppercase/.test(H), "★ emKick_: the uppercase letterspaced 10px label");
+ok(/>THE ORDER</.test(H) && /THE BUILD/.test(H) && /YOUR FILES/.test(H), "★ emKick_: three sections announce themselves");
+ok(/COMPILER &middot; DIAMOND-46/.test(H), "★ emKick_: the optional scope chip");
+ok(/class="em_t23 em_ondark_ink"/.test(H) && /font-size:23px/.test(H), "★ emHeadScoped_: the 23px 800-weight statement");
+ok(/font-size:13.5px;line-height:22px/.test(H) && /max-width:520px/.test(H), "★ emCap_: 13.5px at max-width 520px with generous leading");
+ok(/class="em_mast"/.test(H) && /font-size:48px/.test(H), "★ the masthead: a gradient panel and a very large 48px title");
+ok(/height:2.5px;line-height:2.5px/.test(H) && /linear-gradient\(90deg,#FFDD2F 0%,#C1FF72 100%\)/.test(H),
+  "★ the footer: a 2.5px yellow-to-lime rule, then the black panel");
+ok(/@media only screen and \(max-width: 600px\)/.test(H), "★ @media max-width 600px, as the reference specifies");
+ok(/\.col2, \.col2b \{ display: block/.test(H), "★ col2 / col2b stacking classes");
+ok(/class="col2"/.test(H) && /class="col2b"/.test(H), "★ …and they are actually applied to the grid cells");
+
+// ── ★★ qbGradText_ — THE ONLY TEXT GRADIENT THAT SURVIVES GMAIL ───────────────
+{
+  const g = qbGradText("ABCD", "#C1FF72", "#FFDD2F");
+  const spans = g.match(/<span style="color:#[0-9a-f]{6};">/g) || [];
+  ok(spans.length === 4, "★ qbGradText_ emits one solid-colour <span> PER CHARACTER — no background-clip, which Gmail strips");
+  ok(g.startsWith('<span style="color:#c1ff72;">A'), "★ …ramping from the first colour");
+  ok(g.endsWith('<span style="color:#ffdd2f;">D</span>'), "★ …to the last");
+  ok(!/background/.test(g), "★ …and it uses no background property at all");
+  ok(qbGradText("").length === 0 && qbGradText("X").length > 0, "qbGradText_ handles empty and single-character input");
+  // ★ SPENT ONCE, ON THE ONE VALUE WORTH IT. Not on prose.
+  const perChar = (H.match(/<span style="color:#[0-9a-f]{6};">/g) || []).length;
+  ok(perChar === "TEST27-1907".length,
+    `★★ the ramp is used EXACTLY ONCE, on the Order ID, and nowhere else (${perChar} spans for an ${"TEST27-1907".length}-character id)`);
+}
+
+// ── ★★ THE COLOUR LAW: "colour ENCODES, it never decorates" ───────────────────
+ok(H.includes(TOKENS.LIME), "★ LIME #C1FF72 — the deterministic route");
+ok(!H.includes(TOKENS.RED), "★★ a shipped order carries NO red anywhere — red has exactly one job, and it is failure");
+ok(H.includes(TOKENS.YELLOW), "★ YELLOW #FFDD2F — the house, in the masthead ramp and the footer rule");
+{
+  // Yellow may never touch a data value: every occurrence must be a ramp stop,
+  // the footer rule, the footer alt/attribution, or the kicker rule.
+  const yellowLines = H.split("\n").filter((l) => l.includes(TOKENS.YELLOW));
+  ok(
+    yellowLines.every((l) => /linear-gradient|em_foot|alt="DESIGN MAVLERS"|height="3"/.test(l)),
+    "★★ YELLOW never touches a data value — only ramps, the footer rule and the house attribution",
+  );
+  // ★ Links carry NO hue. The one filled affordance — the Dropbox button — is
+  //   the verdict, and it only exists on an order that shipped.
+  ok(/color:#FFFFFF;text-decoration:none;border-bottom:1px solid #4E4E5A/.test(H),
+    "★★ link rows are INK + underline, not accent-tinted");
+  ok(/bgcolor="#C1FF72" height="46"/.test(H),
+    "★ the one filled button IS the verdict — and a lime button can only exist on an order that shipped");
+}
+
+// ── ★★ THE FAILURE VARIANT IS RED THE WHOLE WAY DOWN ──────────────────────────
+{
+  const failMsg = buildOrderConfirmation({
+    ...BASE_ROW, provenance: FAILURE_PROV, generationSeconds: null,
+    deliveredHtml: "", dropboxFolderUrl: null, dropboxHtmlUrl: null,
+  });
+  const F = failMsg.html;
+  ok(failMsg.diagnostics.state === "failed", "★★ the failure variant is state 'failed'");
+  ok(/did not build/.test(failMsg.subject), `★ the SUBJECT says the order did not build (got: ${failMsg.subject})`);
+  ok(/ORDER HELD/.test(F) && !/ORDER CONFIRMED/.test(F), "★ the masthead label is ORDER HELD, not ORDER CONFIRMED");
+  ok(F.includes(TOKENS.RED), "★ RED #FF5A47 is present");
+  ok(!F.includes(TOKENS.LIME), "★★ …and NOT ONE lime pixel survives — the whole document is tinted by its verdict");
+  ok((F.match(/rgba\(255,90,71,0\.\d+\)/g) || []).length === 3, "★ all three band glows carry the failure hue, not just the one that states it");
+  ok(/linear-gradient\(90deg,#FFDD2F 0%,#FF5A47 100%\)/.test(F),
+    "★★ even the footer rule ramps house-yellow → RED: lime does not outlive the fact it encodes");
+  ok(/COMPILE FAILED/.test(F), "★ the scope chip says COMPILE FAILED");
+  ok(/COORDINATES_MISSING/.test(F) && /missing figma coordinates/.test(F), "★★ the failure names the guard and quotes the verbatim reason");
+  ok(!/LLM/i.test(F), "★★ NO LLM SUBSTITUTION IS MENTIONED — the owner banned that route; a refusal is a failed order");
+  ok(!/dropbox\.com/.test(F), "★ no Dropbox link is faked for an order that produced no folder");
+  ok(F.includes("figma.com"), "★ the Figma link survives — it is the design the lead sent us, and it still exists");
+  // ★★ AND IT IS NOT RED. Colour that encodes cannot be spent on a thing it does
+  //    not describe: the compile failed, the LINK did not.
+  ok(/figma\.com[^"]*" target="_blank" style="color:#FFFFFF/.test(F),
+    "★★ the surviving Figma link is INK, not failure-red — a working link is never coloured as broken");
+  ok(!/color:#FF5A47;text-decoration:none/.test(F), "★ no link anywhere borrows the verdict hue");
+  ok(!/Build time/.test(F), "★ secondsElapsed 0 on a refused compile is a missing measurement, so the row is OMITTED");
+  ok(!/not sendable/.test(F), "★ nothing was built, so there is no placeholder warning to give");
+}
+
+// ── ★ THE PREVIEW IMAGE IS GONE, AND SO IS THE PART THAT CARRIED IT ───────────
+ok(msg.inlineImages.length === 0, "★ inlineImages is empty — nothing is inlined any more");
+ok(msg.diagnostics.previewMode === "removed", "diagnostics say so plainly rather than reporting a mode that no longer exists");
+{
+  const stillPassed = buildOrderConfirmation({ ...BASE_ROW, provenance: COMPILER_PROV, hasInlinePreviewBytes: true });
+  ok(stillPassed.inlineImages.length === 0 && !/cid:/.test(stillPassed.html),
+    "★★ /approve still passes preview bytes and they are ACCEPTED AND IGNORED — the send site did not have to change");
+}
+
+const raw = buildRfc822(msg, { date: "Mon, 27 Jul 2026 12:00:00 +0530", messageId: "<x@y>" });
 ok(/^From: Maveloper <shrujal@mavlers.com>/m.test(raw), "rfc822: From header");
 ok(/^Bcc: shrujal@mavlers.com/m.test(raw), "★ rfc822: the Bcc header is present");
-ok(/Content-Type: multipart\/related/.test(raw), "★ rfc822: multipart/RELATED — the image is tied to the HTML that references it");
 ok(/Content-Type: multipart\/alternative/.test(raw), "rfc822: a text/plain alternative is included");
-ok(new RegExp(`Content-ID: <${PREVIEW_CID}>`).test(raw), "★ rfc822: the image carries the Content-ID the HTML points at");
-ok(/Content-Disposition: inline/.test(raw), "★★ rfc822: Content-Disposition is INLINE — NOT 'attachment'");
+ok(!/multipart\/related/.test(raw), "★ rfc822: with nothing to inline it is a clean multipart/alternative");
 ok(!/Content-Disposition: attachment/.test(raw), "★★ rfc822: the word 'attachment' appears nowhere");
 ok(/^Auto-Submitted: auto-generated/m.test(raw), "rfc822: Auto-Submitted marks it machine-generated");
-const rawNoImg = buildRfc822(msg, { date: "d", messageId: "<m>" });
-ok(!/multipart\/related/.test(rawNoImg) && /multipart\/alternative/.test(rawNoImg), "rfc822: with no bytes it degrades to a clean multipart/alternative");
 ok(
-  buildRfc822(inlineMsg, { date: "d", messageId: "<m>", previewBytes: Buffer.from([1]) }) ===
-    buildRfc822(inlineMsg, { date: "d", messageId: "<m>", previewBytes: Buffer.from([1]) }),
+  buildRfc822(msg, { date: "d", messageId: "<m>" }) === buildRfc822(msg, { date: "d", messageId: "<m>" }),
   "rfc822 is deterministic (clock is injected, never read) so it can be regression-tested",
 );
 
+// ── ★★ THE ENCODED SIZE, AGAINST GMAIL'S CLIP THRESHOLD ───────────────────────
+{
+  const s = msg.diagnostics.encodedSize;
+  ok(s && s.gmailClipLimit === 102400, "★ the check runs on EVERY build, against Gmail's ~102,400 encoded bytes");
+  ok(s.quotedPrintableBytes === Math.ceil(s.rawBytes * 1.06), "★ quoted-printable is modelled at +6%, as the reference does");
+  ok(s.base64Bytes > s.quotedPrintableBytes, "★ base64 is modelled too — it is what this repo's own buildRfc822 emits");
+  ok(s.worstCaseBytes === Math.max(s.qp, s.base64Bytes) || s.worstCaseBytes === s.base64Bytes, "★ the verdict is taken against the WORSE encoding");
+  ok(s.clipped === false, `★★ NOT CLIPPED — ${s.worstCaseBytes} of ${s.gmailClipLimit} encoded bytes, ${s.headroomPct}% headroom`);
+  ok(s.headroomPct > 50, `★ and it is not close: over half the budget is unused (${s.headroomPct}%)`);
+  ok(Buffer.byteLength(H) < 26000, `★★ the source HTML is far smaller than the 34,497 bytes it replaced (now ${Buffer.byteLength(H)})`);
+  const huge = encodedSizeReport("x".repeat(200000));
+  ok(huge.clipped === true && huge.headroomBytes < 0, "★ and the check actually fires: an oversized document reports clipped:true");
+}
+
 // ── the plain-text part ───────────────────────────────────────────────────────
 const T = msg.text;
-ok(/33 PLACEHOLDER LINKS TO REPLACE — NOT SENDABLE YET/.test(T), "★ the text part leads with the placeholder gate too");
+ok(/33 placeholder links still point to "#"/.test(T), "★ the text part carries the same one-line warning");
+ok((T.match(/not sendable/g) || []).length === 1, "★ …once, exactly as in the HTML");
 ok(/do not reply/i.test(T), "the text part carries the do-not-reply line");
 ok(!/<\/?(table|tr|td|div|span|strong|img|a|p|br)\b[^>]*>/i.test(T), "the text part contains no HTML tags");
-ok(!/&(mdash|amp|nbsp|ldquo|rdquo|hellip|times|rarr|#39|quot);/.test(T), "the text part has no leftover HTML entities — they are decoded to real characters");
-ok(/17\.81%/.test(T), "the text part keeps the exact numbers");
+ok(!/&(mdash|amp|nbsp|ldquo|rdquo|hellip|times|rarr|middot|#39|quot);/.test(T), "the text part has no leftover HTML entities — they are decoded to real characters");
+ok(!/17\.81%|95\.93%|Outlook|On mobile|HOW IT WAS BUILT|THE BUILD, IN DETAIL/.test(T),
+  "★★ the text part was cut too — the deletions are not hiding in the plain-text alternative");
+ok(/^Order ID: TEST27-1907$/m.test(T) && /^TAT: 24h$/m.test(T) && /^ESP target: klaviyo$/m.test(T) && /^Colour scheme: Dark \+ light$/m.test(T),
+  "★ the text part carries the same eleven fields");
 ok(new RegExp(BASE_ROW.dropboxFolderUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).test(T), "the text part carries the raw Dropbox URL");
 
 // ── escaping / injection ──────────────────────────────────────────────────────
@@ -347,14 +569,36 @@ ok(fmtSeconds(null) === null && fmtSeconds(-1) === null, "fmtSeconds refuses non
 // refused compile records secondsElapsed 0 and that beat the real os_queue span.
 ok(fmtSeconds(0) === null && fmtSeconds(0.4) === null, "★ a sub-second build time is a missing measurement, not '0s'");
 {
-  const m0 = buildOrderConfirmation({ ...BASE_ROW, provenance: FALLBACK_PROV, generationSeconds: 150 });
+  const m0 = buildOrderConfirmation({ ...BASE_ROW, provenance: FAILURE_PROV, generationSeconds: 150 });
   ok(/2 min 30s \(150s\)/.test(m0.html), "★ secondsElapsed:0 falls through to the real os_queue span, not '0s'");
   ok(!/Build time: 0s|>0s</.test(m0.html), "no '0s' build time reaches the lead");
-  const mNone = buildOrderConfirmation({ ...BASE_ROW, provenance: FALLBACK_PROV, generationSeconds: null });
+  const mNone = buildOrderConfirmation({ ...BASE_ROW, provenance: FAILURE_PROV, generationSeconds: null });
   ok(!/Build time/.test(mNone.html), "with no usable time at all, the Build time row is OMITTED rather than faked");
 }
-ok(/none of the constructs/.test(buildOutlookCaveat([])), "an empty Word-fatal ledger yields an honest 'none detected' caveat");
-ok(/Word/.test(buildOutlookCaveat([{ construct: "css-float", count: 3, note: "n" }])), "a populated ledger names the Word engine and the constructs");
+
+// ── ★ buildFields: a field that could not be READ is OMITTED, never blank ─────
+{
+  const bare = buildFields({ orderId: "X1" });
+  ok(bare.order.length === 0 && bare.links.length === 0,
+    "★ with nothing readable, every optional field is omitted — no 'unknown', no blank rows");
+  ok(bare.build.length === 1 && bare.build[0].value === "Generic",
+    "★ …except ESP target, because 'Generic' is a real answer to that question and not a guess");
+  ok(!bare.build.some((p) => p.label === "Colour scheme"),
+    "★★ darkMode undefined is NOT darkMode false — the row is omitted rather than guessing 'Light only'");
+  ok(bare.fieldCount === 2, "…so only the order id and the ESP target remain");
+  const full = buildFields({
+    orderId: "X1", tatHours: 24, bufferedDeadlineIST: "a", rawDeadlineIST: "a",
+    esp: "klaviyo", darkMode: false, engineLabel: "E", generationSeconds: "42s",
+    figmaUrl: "https://f", dropboxHtmlUrl: "https://h", dropboxFolderUrl: "https://d",
+    emailOnAcidUrl: "https://e",
+  });
+  ok(full.fieldCount === 11, `★★ everything present → exactly ELEVEN fields (got ${full.fieldCount})`);
+  ok(full.links[0].primary === true && full.links[0].label === "Dropbox folder", "the Dropbox folder is the primary CTA");
+  ok(full.order.find((p) => p.label === "Your deadline").value === "a",
+    "★ when the buffered and raw deadlines are the same, the '(buffered)' gloss is not added");
+  ok(!full.build.find((p) => p.label === "Colour scheme").value.includes("Dark"),
+    "darkMode:false renders 'Light only'");
+}
 
 // ── the FLAG ──────────────────────────────────────────────────────────────────
 ok(CONFIRMATION_FLAG === "ORDER_CONFIRMATION_ENABLED", "the flag is named ORDER_CONFIRMATION_ENABLED");
@@ -430,14 +674,15 @@ ok(meta.placeholderLinks === 33 && meta.engine === "compiler", "the job-row reco
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mav-conf-"));
   const stub = createStubTransport({ dir, log: () => {} });
   const r = await stub.send({
-    message: inlineMsg, previewBytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+    message: msg, previewBytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
     orderId: "TEST27-1907", date: "Mon, 27 Jul 2026 12:00:00 +0530", messageId: "<x@y>",
   });
   ok(r.ok === true && r.sent === false, "the stub reports success WITHOUT claiming it sent anything");
   const eml = await fs.readFile(r.wrote.eml, "utf-8");
-  ok(eml.includes("Content-Disposition: inline") && eml.includes(`Content-ID: <${PREVIEW_CID}>`), "★ the stub's .eml is a real message with the preview INLINE");
+  ok(eml.includes("Content-Type: multipart/alternative") && !eml.includes("Content-Disposition"),
+    "★ the stub's .eml is a real message and carries no part to dispose of");
   const browser = await fs.readFile(r.wrote.html, "utf-8");
-  ok(!browser.includes("src=\"cid:"), "the stub's browser copy rewrites the cid: src so it renders outside a mail client");
+  ok(!browser.includes('src="cid:'), "the stub's browser copy has no cid: src to rewrite — nothing is inlined");
   ok(browser.includes("NOT SENT"), "the stub's browser copy says plainly that it was not sent");
   const j = JSON.parse(await fs.readFile(r.wrote.json, "utf-8"));
   ok(j.notSent === true && j.envelope.bcc === "shrujal@mavlers.com" && j.inlinePreview.attachedAsFile === false, "the stub's json records the envelope, the bcc and that nothing was attached");

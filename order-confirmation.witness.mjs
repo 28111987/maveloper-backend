@@ -77,20 +77,36 @@ const COMPILER_PROV = {
   humanBlock: "ROUTE PROVENANCE\n  compiler tag        : DIAMOND-46\n  certify exit        : 1   proven=false",
 };
 
-const FALLBACK_PROV = {
-  schema: 2, at: "2026-07-27T09:03:44.001Z", jobId: "job_failsfirst_1",
-  engine: "llm", engineLabel: "LLM PIPELINE (Claude Code)", diamondTag: "DIAMOND-46",
-  figma: { fileKey: null, nodeId: null, designWidth: null },
+// ★★ THE SECOND VARIANT WAS AN LLM SUBSTITUTION. IT IS NOW A COMPILER FAILURE.
+//
+// The owner has BANNED the LLM route: every order is COMPILER or it FAILS. The
+// old fixture described a fallback — the compiler refused, the LLM built the
+// email anyway, and the email disclosed the handoff. That artifact can no longer
+// exist, so rendering it as the second proof would be showing him a screen his
+// system will never produce again.
+//
+// REWORDED, keeping the SAME real guard/reason pair from the compiler adapter
+// (COORDINATES_MISSING / "missing figma coordinates"). What changed:
+//   engine   "llm" → "compiler"            the compiler is the only engine now
+//   fallback  occurred:true → false,  mode "fallback" → "off"
+//   exit      null → 2                     it ran and it gave up
+//   the guard now lives ONLY at compiler.refusalGuard, which is where a refusal
+//   WITHOUT a handoff records it — and is exactly why order-confirmation.js was
+//   changed to read the guard from there instead of only through fallback.*.
+// The order produces NO artifact: no delivered HTML, no folder, no share link.
+const FAILURE_PROV = {
+  schema: 2, at: "2026-07-27T09:03:44.001Z", jobId: "job_compilefail_1",
+  engine: "compiler", engineLabel: "DETERMINISTIC COMPILER (DIAMOND-46)", diamondTag: "DIAMOND-46",
+  figma: { fileKey: "TmppLGRXkZmWB5OqzZD00H", nodeId: "1:7", designWidth: null },
   compiler: {
-    attempted: true, exit: null, proven: null, shipped: false,
+    attempted: true, exit: 2, proven: false, shipped: false,
     refusalGuard: "COORDINATES_MISSING", refusalReason: "missing figma coordinates",
     transforms: null, notAttemptedBecause: null,
   },
   fallback: {
-    occurred: true, from: "compiler", to: "llm",
-    guard: "COORDINATES_MISSING", reason: "missing figma coordinates",
-    mode: "fallback", flag: "COMPILER_FALLBACK_MODE",
-    note: "COMPILER_FALLBACK_MODE=fallback (default) — the LLM produced this artifact BECAUSE the compiler refused. This is recorded, not silent (Owner Requirement 8).",
+    occurred: false, from: null, to: null, guard: null, reason: null,
+    mode: "off", flag: "COMPILER_FALLBACK_MODE",
+    note: "COMPILER_FALLBACK_MODE=off — the LLM route is banned. A refusal is a FAILED ORDER, not a substitution.",
   },
   quality: {
     liveTextCoverage: null, sliceRatioNodes: null, sliceRatioArea: null,
@@ -99,11 +115,11 @@ const FALLBACK_PROV = {
     textNodes: null, slicedTextNodes: null, wordFatalCount: null,
     source: "no certificate path (the compiler did not get far enough to write one)",
   },
-  delivery: { espTarget: null, espTargetRecognised: null, espTokensApplied: null, darkMode: false, specSource: null, note: "" },
+  delivery: { espTarget: null, espTargetRecognised: null, espTokensApplied: null, darkMode: null, specSource: null, note: "" },
   secondsElapsed: 0,
   deliveredVerification: null,
-  banner: "ENGINE: LLM PIPELINE — ★ FALLBACK. The compiler REFUSED this design [COORDINATES_MISSING] and the LLM produced this artifact instead.",
-  humanBlock: "ROUTE PROVENANCE\n  ★ FALLBACK — THIS IS NOT COMPILER OUTPUT.\n  refusal guard : COORDINATES_MISSING",
+  banner: "ENGINE: DETERMINISTIC COMPILER — ★ REFUSED [COORDINATES_MISSING]. NOTHING WAS BUILT.",
+  humanBlock: "ROUTE PROVENANCE\n  ★ COMPILE FAILED — no artifact was produced.\n  refusal guard : COORDINATES_MISSING",
 };
 
 const rowFor = (orderId, over = {}) => ({
@@ -125,86 +141,214 @@ const rowFor = (orderId, over = {}) => ({
   ...over,
 });
 
+/**
+ * ★ THE NARROW PROOF. A lead opens this on a phone, so a proof that only exists
+ * at 600px is half a proof.
+ *
+ * There is no headless browser in this repo (no puppeteer, no playwright), so
+ * this is NOT a screenshot and is not claimed to be one. It is the SAME email
+ * bytes with two things done to them so a desktop browser draws the phone
+ * layout: the page is pinned to 375px, and the rules inside the email's own
+ * `@media only screen and (max-width: 600px)` block are restated unconditionally.
+ * Those are the exact rules a phone would apply — they are lifted out of the
+ * rendered document, not re-authored — so what you see is what the stack does.
+ */
+function narrowCopy(html, width = 375) {
+  const m = /@media only screen and \(max-width: 600px\) \{([\s\S]*?)\n  \}/.exec(html);
+  const rules = m ? m[1] : "";
+  const inject = `<style type="text/css">
+  /* ── NARROW PROOF — NOT PART OF THE SENT EMAIL ──────────────────────────────
+     The page is pinned to ${width}px and the email's own max-width:600px rules
+     are restated unconditionally, lifted verbatim from the block above. This is
+     what a phone draws. Nothing else about the document is altered. */
+  html { background: #060608; }
+  body { max-width: ${width}px !important; margin: 0 auto !important; }
+${rules}
+</style>`;
+  return html.replace("</head>", `${inject}\n</head>`);
+}
+
 console.log("\n════════════════════════════════════════════════════════════════════");
-console.log("A. BOTH RENDERINGS, ON REAL DATA");
+console.log("A. BOTH RENDERINGS, ON REAL DATA — WIDE AND NARROW");
 console.log("════════════════════════════════════════════════════════════════════");
 console.log("   Delivered HTML: references/arsenal-pulse.html — a REAL deliverable");
 console.log("   committed to this repo (181,532 bytes, 33 real href=\"#\" placeholders,");
 console.log("   104 images). Provenance: the real route-provenance.mjs shape with the");
-console.log("   real numbers from compile job_1785026968111_96fadbd7 (DIAMOND-46).\n");
+console.log("   real numbers from compile job_1785026968111_96fadbd7 (DIAMOND-46).");
+console.log("   ★ Variant 2 is now a COMPILER FAILURE, not an LLM substitution —");
+console.log("     the LLM route is banned, so that artifact can no longer exist.\n");
 
 await fs.mkdir(OUT, { recursive: true });
 const stub = createStubTransport({ dir: OUT, log: () => {} });
 const written = {};
+const sizes = {};
 
-for (const [label, orderId, prov] of [
-  ["COMPILER ROUTE", "TEST27-1907-compiler", COMPILER_PROV],
-  ["LLM-FALLBACK ROUTE", "TEST27-1907-llm-fallback", FALLBACK_PROV],
+for (const [label, orderId, prov, over] of [
+  ["COMPILER ROUTE", "TEST27-1907-compiler", COMPILER_PROV, {}],
+  // ★ A refused compile produces NOTHING: no delivered bytes to scan for
+  //   placeholders, no folder to share, no direct HTML link. Passing the real
+  //   deliverable here anyway would be staging a failure that still had files.
+  ["COMPILE FAILURE", "TEST27-1907-compile-failure", FAILURE_PROV, {
+    deliveredHtml: "", dropboxFolderUrl: null, dropboxHtmlUrl: null,
+    ledger: [], imageCount: 0, generationSeconds: null, darkMode: null, esp: null,
+  }],
 ]) {
-  const message = buildOrderConfirmation({ ...rowFor(orderId), provenance: prov });
+  const message = buildOrderConfirmation({ ...rowFor(orderId, over), provenance: prov });
   const r = await sendOrderConfirmation({
     message, previewBytes: FAKE_PNG, orderId,
     env: { ORDER_CONFIRMATION_ENABLED: "true" }, log: () => {}, transport: stub,
     date: "Mon, 27 Jul 2026 12:00:00 +0530", messageId: `<${orderId}@maveloper.local>`,
   });
-  written[label] = r.wrote;
+  // ★ THE NARROW COPY, written next to the wide one.
+  const narrowPath = path.join(OUT, `${orderId}-narrow.html`);
+  await fs.writeFile(narrowPath, narrowCopy(message.html), "utf-8");
+  written[label] = { ...r.wrote, narrow: narrowPath };
+  sizes[label] = message.diagnostics.encodedSize;
+
   console.log(`── ${label} ──────────────────────────────────────────────`);
-  console.log(`   subject : ${message.subject}`);
-  console.log(`   envelope: ${message.from} → ${message.to}   bcc ${message.bcc}`);
-  console.log(`   .eml    : ${r.wrote.eml}`);
-  console.log(`   .html   : ${r.wrote.html}`);
-  console.log(`   .json   : ${r.wrote.json}`);
-  console.log(`   engine  : ${message.diagnostics.engine}   fellBack=${message.diagnostics.fellBack}` +
+  console.log(`   subject   : ${message.subject}`);
+  console.log(`   envelope  : ${message.from} → ${message.to}   bcc ${message.bcc}`);
+  console.log(`   .eml      : ${r.wrote.eml}`);
+  console.log(`   .html     : ${r.wrote.html}`);
+  console.log(`   .html 375 : ${narrowPath}`);
+  console.log(`   .json     : ${r.wrote.json}`);
+  console.log(`   state     : ${message.diagnostics.state}   engine=${message.diagnostics.engine}` +
     `${message.diagnostics.fallbackGuard ? `   guard=${message.diagnostics.fallbackGuard}` : ""}`);
-  console.log(`   preview : ${message.diagnostics.previewMode}`);
+  console.log(`   fields    : ${message.diagnostics.fieldCount} of 11 (the 11th is Email on Acid, which has no source yet)`);
+  const s = message.diagnostics.encodedSize;
+  console.log(`   size      : html ${s.htmlBytes} + text ${s.textBytes} = ${s.rawBytes} raw`);
+  console.log(`               qp ${s.quotedPrintableBytes} · base64 ${s.base64Bytes} · worst ${s.worstCaseBytes}` +
+    ` of ${s.gmailClipLimit} → ${s.clipped ? "★ CLIPPED" : `NOT clipped, ${s.headroomPct}% headroom`}`);
   console.log("");
 }
 
 const compilerHtml = await fs.readFile(written["COMPILER ROUTE"].html, "utf-8");
-const fallbackHtml = await fs.readFile(written["LLM-FALLBACK ROUTE"].html, "utf-8");
+const failureHtml = await fs.readFile(written["COMPILE FAILURE"].html, "utf-8");
 const compilerEml = await fs.readFile(written["COMPILER ROUTE"].eml, "utf-8");
+const compilerNarrow = await fs.readFile(written["COMPILER ROUTE"].narrow, "utf-8");
 
-W("A1 ★ the two renderings are DIFFERENT documents — a fallback does not read like a compiler ship",
-  compilerHtml !== fallbackHtml && Math.abs(compilerHtml.length - fallbackHtml.length) > 200,
-  [`compiler : ${compilerHtml.length} bytes`, `fallback : ${fallbackHtml.length} bytes`,
-   `delta    : ${Math.abs(compilerHtml.length - fallbackHtml.length)} bytes`]);
+// ★ THE NUMBER THE OWNER ASKED FOR: bytes before, bytes after.
+const BYTES_BEFORE = 34497; // order-confirmations/TEST27-1907-compiler.html, pre-redesign
+W("A0 ★★ THE CUT IS REAL — the rendered HTML is far smaller than what it replaced",
+  compilerHtml.length < BYTES_BEFORE * 0.7,
+  [`before : ${BYTES_BEFORE} bytes (25 itemised links, the prose, the detail table, the caveats, the preview)`,
+   `after  : ${compilerHtml.length} bytes (eleven fields)`,
+   `saved  : ${BYTES_BEFORE - compilerHtml.length} bytes, ${(100 - (compilerHtml.length / BYTES_BEFORE) * 100).toFixed(1)}% smaller`]);
 
-W("A2 ★ the compiler rendering names the engine AND its real proof numbers",
-  /deterministic compiler/i.test(compilerHtml) && /DIAMOND-46/.test(compilerHtml) &&
-  /100%/.test(compilerHtml) && /17\.81%/.test(compilerHtml) && /59 checked properties/.test(compilerHtml),
-  ["live-text coverage 100% · slice ratio 17.81% (12.72% area)",
-   "property accuracy 95.93% to 99.35% · 59 divergences, broken down"]);
+W("A1 ★ the two renderings are DIFFERENT documents — a failure does not read like a ship",
+  compilerHtml !== failureHtml && Math.abs(compilerHtml.length - failureHtml.length) > 200,
+  [`compiler : ${compilerHtml.length} bytes`, `failure  : ${failureHtml.length} bytes`,
+   `delta    : ${Math.abs(compilerHtml.length - failureHtml.length)} bytes`]);
 
-W("A3 ★★ the FALLBACK rendering says so PLAINLY and NAMES THE REASON",
-  /built by our LLM, not the deterministic compiler/i.test(fallbackHtml) &&
-  /COORDINATES_MISSING/.test(fallbackHtml) && /missing figma coordinates/.test(fallbackHtml),
-  ["headline names the LLM", "guard : COORDINATES_MISSING", "reason: \"missing figma coordinates\" (verbatim)"]);
+W("A2 ★★ THE ELEVEN FIELDS, AND NOTHING ELSE",
+  /TEST27-1907-compiler/.test(compilerHtml) && /24h/.test(compilerHtml) && /IST/.test(compilerHtml) &&
+  /klaviyo/i.test(compilerHtml) && /Dark \+ light/.test(compilerHtml) && /DIAMOND-46/.test(compilerHtml) &&
+  /42s/.test(compilerHtml) && /figma\.com/.test(compilerHtml) && /\.html\?rlkey/.test(compilerHtml) &&
+  /dropbox\.com\/scl\/fo/.test(compilerHtml) && !/Email on Acid/.test(compilerHtml) &&
+  !/Live-text coverage|Slice ratio|Layout accuracy|Known differences|Final-file check/.test(compilerHtml) &&
+  !/how it was built/i.test(compilerHtml) && !/before you send/i.test(compilerHtml) &&
+  !/Which links/.test(compilerHtml) && !/<img[^>]*preview/i.test(compilerHtml),
+  ["present : order id · TAT · deadline · ESP · colour scheme · generated by · build time",
+   "          · figma link · html link · dropbox link",
+   "absent  : email-on-acid (no source exists yet — the row is not rendered)",
+   "cut     : the 25-line itemisation, the prose, the detail table, the caveats, the preview"]);
 
-W("A4 ★ the fallback rendering makes NO compiler claim and reports NO invented numbers",
-  !/17\.81%|95\.93%|108 text blocks|DIAMOND-46 \(proven/.test(fallbackHtml) &&
-  !/Layout accuracy/.test(fallbackHtml) && !/Slice ratio/.test(fallbackHtml),
-  ["no accuracy row, no slice-ratio row — the record has no numbers, so none are printed"]);
+W("A3 ★★ THE FAILURE VARIANT DESCRIBES A COMPILER FAILURE — no LLM anywhere",
+  /could not build/i.test(failureHtml) && /COMPILE FAILED/.test(failureHtml) &&
+  /COORDINATES_MISSING/.test(failureHtml) && /missing figma coordinates/.test(failureHtml) &&
+  !/LLM/i.test(failureHtml),
+  ["headline: \"The compiler could not build this order.\"",
+   "chip    : COMPILE FAILED",
+   "guard   : COORDINATES_MISSING     reason: \"missing figma coordinates\" (verbatim)",
+   "★ the string 'LLM' appears NOWHERE — the owner banned that route"]);
 
-W("A5 ★ the placeholder gate is prominent in BOTH, and in the subject line",
-  /33 placeholder links to replace/.test(compilerHtml) && /33 placeholder links to replace/.test(fallbackHtml) &&
-  /not sendable/i.test(compilerHtml) && /not sendable/i.test(fallbackHtml),
-  ["subject: \"TEST27-1907-compiler is built — 33 links to replace before sending\""]);
+W("A4 ★ the failure variant invents nothing: no numbers, no files that do not exist",
+  !/17\.81%|95\.93%|108 text blocks|Layout accuracy|Slice ratio/.test(failureHtml) &&
+  !/dropbox\.com/.test(failureHtml) && !/Build time/.test(failureHtml) &&
+  !/Colour scheme/.test(failureHtml) && /figma\.com/.test(failureHtml),
+  ["no proof numbers — the record carries none",
+   "no Dropbox link and no HTML link — nothing was built, so nothing is linked",
+   "no build time — secondsElapsed 0 on a refusal is a missing measurement, not '0s'",
+   "no colour scheme — darkMode is null, and null is not false",
+   "the Figma link SURVIVES: it is the design the lead sent us, and it still exists"]);
 
-W("A6 ★ the preview is INLINE in the .eml the owner opens — not an attachment",
-  /Content-Type: multipart\/related/.test(compilerEml) &&
-  /Content-Disposition: inline/.test(compilerEml) &&
-  !/Content-Disposition: attachment/.test(compilerEml),
-  ["multipart/related + Content-ID + Content-Disposition: inline",
-   "the string 'attachment' appears nowhere in the message"]);
+W("A5 ★ the placeholder warning is ONE LINE, and it is absent when the count is zero",
+  /33 placeholder links<\/strong> still point/.test(compilerHtml) &&
+  (compilerHtml.match(/not sendable/g) || []).length === 1 &&
+  !/Which links/.test(compilerHtml) && !/placeholder/i.test(failureHtml),
+  ["compiler: one amber line, count 33, 'not sendable' appears exactly once",
+   "★ the 25-line itemisation is GONE — the count and the consequence survive, the list does not",
+   "failure : nothing was built, so there is no warning to give"]);
 
-W("A7 it is a real email: tables, no flexbox/grid, inline styles, dark-client metas",
+W("A6 ★ the preview image is GONE, and the .eml is a clean multipart/alternative",
+  !/Content-Type: multipart\/related/.test(compilerEml) &&
+  /Content-Type: multipart\/alternative/.test(compilerEml) &&
+  !/Content-Disposition/.test(compilerEml) && !/<img[^>]*preview/i.test(compilerHtml),
+  ["nothing is inlined any more, so there is no related part and nothing to dispose of",
+   "★ the two logos load REMOTELY, with wordmark alt text — see A9"]);
+
+W("A7 it is a real email: tables, no flexbox/grid, inline styles, dark-client handling",
   !/display\s*:\s*flex/i.test(compilerHtml) && !/display\s*:\s*(inline-)?grid/i.test(compilerHtml) &&
   !/var\(--/.test(compilerHtml) && /role="presentation"/.test(compilerHtml) &&
-  /prefers-color-scheme: dark/.test(compilerHtml) && /<!--\[if mso\]>/.test(compilerHtml));
+  /prefers-color-scheme: dark/.test(compilerHtml) && /\[data-ogsc\]/.test(compilerHtml) &&
+  /<!--\[if mso\]>/.test(compilerHtml) && !/border-radius:\s*[1-9]/.test(compilerHtml) &&
+  !/<link[^>]+stylesheet|@import/i.test(compilerHtml),
+  ["prefers-color-scheme AND [data-ogsc] — Outlook.com's dark mode ignores the former",
+   "no webfont is fetched: the design is drawn for the fallback face"]);
 
-W("A8 it is Maveloper-generated: lime #C1FF72, 'Born at Mavlers', sharp edges",
-  compilerHtml.includes("#C1FF72") && /Born at Mavlers/.test(compilerHtml) &&
-  !/border-radius:\s*[1-9]/.test(compilerHtml));
+W("A8 ★★ 'BORN AT MAVLERS' IS RETIRED — it is 'CRAFTED BY MAVLERS' now",
+  !/Born at Mavlers/i.test(compilerHtml) && !/Born at Mavlers/i.test(failureHtml) &&
+  compilerHtml.includes("CRAFTED BY MAVLERS") && failureHtml.includes("CRAFTED BY MAVLERS"),
+  ["the retired phrase appears in neither variant, in neither part",
+   "★ it DOES still appear across the project KB and the /os footer — listed in",
+   "  EMAIL_REDESIGN_COMPLETE.md for a follow-up run, NOT edited here"]);
+
+W("A9 ★★ THE TWO REAL LOGOS, AND THE BLOCKED-IMAGE STATE",
+  compilerHtml.includes("Maveloper%20Logo%20Animation.gif") &&
+  compilerHtml.includes("DesignMavlers%20Logo%20Animation") &&
+  /alt="MAVELOPER"/.test(compilerHtml) && /alt="DESIGN MAVLERS"/.test(compilerHtml) &&
+  (compilerHtml.match(/<img\b/g) || []).length === 2 &&
+  /width="170" height="34"/.test(compilerHtml) && /width="60" height="60"/.test(compilerHtml) &&
+  compilerHtml.includes("Maveloper &middot; CRAFTED BY MAVLERS"),
+  ["masthead: 170x34 — the source GIF is 600x120, so the 5:1 ratio is exact",
+   "footer  : 60x60  — the source GIF is 500x500, a SQUARE mark, not a wordmark",
+   "both carry width AND height ATTRIBUTES, so a blocked image cannot collapse the layout",
+   "both alts read as the wordmark and are STYLED (font, weight, tracking, colour)",
+   "★ and the attribution is LIVE TEXT under the footer logo, so identity never",
+   "  depends on an image loading"]);
+
+W("A10 ★★ COLOUR ENCODES — a shipped order is lime, a failed one is red, all the way down",
+  compilerHtml.includes("#C1FF72") && !compilerHtml.includes("#FF5A47") &&
+  failureHtml.includes("#FF5A47") && !failureHtml.includes("#C1FF72") &&
+  (failureHtml.match(/rgba\(255,90,71,0\.\d+\)/g) || []).length === 3 &&
+  compilerHtml.includes("#E8C07D") && !failureHtml.includes("#E8C07D"),
+  ["lime  #C1FF72 — the deterministic route. Present in the ship, absent in the failure.",
+   "red   #FF5A47 — one job: the compile failed. Every band glow, the masthead ramp,",
+   "                the footer rule and the engine statement.",
+   "amber #E8C07D — one job: the lead must act. Present only where placeholders are.",
+   "yellow #FFDD2F — the house. In both, because the attribution does not change."]);
+
+W("A11 ★★ THE NARROW RENDER — a lead opens this on a phone",
+  compilerNarrow.includes("NARROW PROOF") && /max-width: 375px !important/.test(compilerNarrow) &&
+  /\.col2, \.col2b \{ display: block/.test(compilerNarrow.split("NARROW PROOF")[1]) &&
+  /\.em_sec  \{ padding: 34px 22px !important; \}/.test(compilerNarrow.split("NARROW PROOF")[1]) &&
+  compilerNarrow.includes(compilerHtml.slice(compilerHtml.indexOf("<body"), compilerHtml.indexOf("<body") + 400)),
+  ["the page is pinned to 375px and the email's OWN max-width:600px rules are",
+   "restated unconditionally — lifted verbatim out of the rendered document",
+   "the pair grids stack (col2/col2b → display:block), bands drop to 34px/22px padding",
+   "★ the <body> is byte-identical to the wide copy: only the <head> gained a block",
+   "★ NOT a screenshot. There is no headless browser in this repo and none is claimed."]);
+
+W("A12 ★★ THE ENCODED SIZE, AGAINST GMAIL'S ~102,400-BYTE CLIP THRESHOLD",
+  sizes["COMPILER ROUTE"].clipped === false && sizes["COMPILE FAILURE"].clipped === false &&
+  sizes["COMPILER ROUTE"].headroomPct > 50,
+  [`compiler: ${sizes["COMPILER ROUTE"].worstCaseBytes} encoded bytes worst-case ` +
+   `(qp ${sizes["COMPILER ROUTE"].quotedPrintableBytes} / base64 ${sizes["COMPILER ROUTE"].base64Bytes})` +
+   ` → ${sizes["COMPILER ROUTE"].headroomPct}% headroom`,
+   `failure : ${sizes["COMPILE FAILURE"].worstCaseBytes} encoded bytes worst-case` +
+   ` → ${sizes["COMPILE FAILURE"].headroomPct}% headroom`,
+   "the reference checks quoted-printable at +6%; this repo's own buildRfc822 emits",
+   "base64 at +33%, so the verdict is taken against the WORSE of the two"]);
 
 console.log("\n════════════════════════════════════════════════════════════════════");
 console.log("B. ★★ FAILS-FIRST — A TRANSPORT FAILURE MUST NOT BLOCK DELIVERY");
@@ -380,9 +524,14 @@ console.log("\n═════════════════════�
 console.log(`${broke === 0 ? "ALL WITNESSES HELD" : "WITNESSES BROKE"} — ${held} held, ${broke} broke`);
 console.log("════════════════════════════════════════════════════════════════════");
 console.log("\nOPEN THESE:");
-console.log(`  compiler route     : ${written["COMPILER ROUTE"].eml}`);
-console.log(`  LLM-fallback route : ${written["LLM-FALLBACK ROUTE"].eml}`);
-console.log("  (.eml opens in Outlook / Apple Mail / Thunderbird with the preview inline;");
-console.log("   the .html next to it opens in a browser for a faster look.)\n");
+for (const label of ["COMPILER ROUTE", "COMPILE FAILURE"]) {
+  console.log(`  ${label}`);
+  console.log(`    .eml           : ${written[label].eml}`);
+  console.log(`    .html (600px)  : ${written[label].html}`);
+  console.log(`    .html (375px)  : ${written[label].narrow}`);
+}
+console.log("  (.eml opens in Outlook / Apple Mail / Thunderbird; the .html next to it");
+console.log("   opens in a browser for a faster look, and the -narrow.html shows the");
+console.log("   phone stack without a device.)\n");
 
 process.exit(broke === 0 ? 0 : 1);
