@@ -285,7 +285,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         const resp = await fetch(`${cfg.bridgeUrl}/health`, {
           method: 'GET',
           headers: { 'ngrok-skip-browser-warning': 'true' },
-          signal: AbortSignal.timeout(5000),
+          signal: AbortSignal.timeout(Number(env.BRIDGE_PROBE_TIMEOUT_MS) || 15000),
         });
         online = resp.ok;
         if (!resp.ok) err = `bridge /health returned ${resp.status}`;
