@@ -1,6 +1,11 @@
 // =====================================================================
-// MAVELOPER FIGMA PARSER — v6.0.0
+// MAVELOPER FIGMA PARSER — v6.1.0-rtl
 // Converts a Figma frame node into the v5.5.0 designSpec JSON format.
+// v6.1.0-rtl (RTL Phase 2): detectTextDirection() — deterministic Unicode-range scan
+//   over already-captured el.text sets designSpec.text_direction (default "ltr", so
+//   every existing LTR email is unchanged) + per-run el.ltr_hint for latin/numeric/URL
+//   islands inside an RTL email. Self-contained, no new Figma dependency. NOT deployed
+//   to prod (Railway) until end-to-end RTL is proven on a real Hebrew/Arabic Figma design.
 // Bypasses Stage 1 vision entirely. Stage 2 + post-processors unchanged.
 //
 // INPUT:  Figma share URL + Figma API token
@@ -16,7 +21,8 @@
 
 const FIGMA_API_BASE = "https://api.figma.com/v1";
 const FIGMA_API_TIMEOUT_MS = 30 * 1000;
-const VALID_EMAIL_WIDTHS = [600, 640, 650, 680, 700];
+const EMAIL_WIDTH_MIN = 500;
+const EMAIL_WIDTH_MAX = 800;
 const EMAIL_WIDTH_TOLERANCE = 5; // px — allows 595 / 605 / 645 / etc.
 
 // Figma node types we care about (subset of the full Figma type system)
@@ -169,9 +175,19 @@ export function locateEmailFrame(rootNode) {
 
   // CASE 1: Direct FRAME or COMPONENT at email size
   if ((rootNode.type === "FRAME" || rootNode.type === "COMPONENT") && isEmailWidth(getNodeWidth(rootNode))) {
-    if (getNodeHeight(rootNode) < 300) {
+    // D15: a FIXED frame may declare less than it paints. Judge the painted
+    // extent; report the disagreement rather than letting it pass unrecorded.
+    const paintedH = getPaintedHeight(rootNode);
+    const declaredH = getNodeHeight(rootNode);
+    if (Math.abs(paintedH - declaredH) > 0.5) {
+      console.warn(
+        `[EXTENT_DISAGREEMENT] ${rootNode.id} "${rootNode.name}": declared ${declaredH.toFixed(3)}px, ` +
+        `paints ${paintedH.toFixed(3)}px (clips=${!!rootNode.clipsContent}, sizing=${rootNode.primaryAxisSizingMode || "none"})`
+      );
+    }
+    if (paintedH < 300) {
       throw new Error(
-        `Figma frame "${rootNode.name}" is ${Math.round(getNodeHeight(rootNode))}px tall — too short to be an email design (must be ≥ 300px). Right-click the actual email frame in Figma → Copy link to selection.`
+        `Figma frame "${rootNode.name}" is ${Math.round(paintedH)}px tall — too short to be an email design (must be ≥ 300px). Right-click the actual email frame in Figma → Copy link to selection.`
       );
     }
     return rootNode;
@@ -226,7 +242,8 @@ function collectEmailFrames(node, out = []) {
   if (node.visible === false) return out;
 
   if (node.type === "FRAME" || node.type === "COMPONENT") {
-    if (isEmailWidth(getNodeWidth(node)) && getNodeHeight(node) >= 300) {
+    // D15: judged on painted extent, not the declared box. Width rule untouched.
+    if (isEmailWidth(getNodeWidth(node)) && getPaintedHeight(node) >= 300) {
       out.push(node);
       return out; // don't descend further into a confirmed email frame
     }
@@ -251,8 +268,50 @@ function getNodeHeight(node) {
   return node?.absoluteBoundingBox?.height ?? 0;
 }
 
+// DEFECT 15 (C75) — PAINTED EXTENT.
+// absoluteBoundingBox is the frame's DECLARED box, which a FIXED-size frame may
+// state smaller than what it paints. absoluteRenderBounds is no better: on
+// liesl_1_253 both read 255 while Figma renders 585.467 — a 331px second footer
+// variant below the declared edge, 56% of the section.
+//
+// This was filed as TWO defects and ranked separately: DEFECT 4 (regions omitted
+// under a clean certificate) and DEFECT 5 (proof corpus outside the production
+// input domain). They are one bug. The ">= 300px" admission gate below reads the
+// declared 255, rejects the design as "too short to be an email", and the corpus
+// looks disjoint from the input domain as a consequence.
+//
+// Both clipsContent and a mask genuinely remove what lies outside, so both
+// terminate the union. Omitting the mask case over-reports a "Mask group" by ~19%
+// and would re-route icon content — the near-miss D13 recorded one defect over.
+function paintedExtent(node) {
+  const own = node?.absoluteBoundingBox;
+  if (!own) return null;
+  let b = { x: own.x, y: own.y, width: own.width, height: own.height };
+  const masked = (node.children || []).some((c) => c.isMask === true && c.visible !== false);
+  if (node.clipsContent || masked) return b;
+  for (const c of node.children || []) {
+    if (c.visible === false) continue;
+    const cb = paintedExtent(c);
+    if (!cb) continue;
+    const x0 = Math.min(b.x, cb.x), y0 = Math.min(b.y, cb.y);
+    const x1 = Math.max(b.x + b.width, cb.x + cb.width);
+    const y1 = Math.max(b.y + b.height, cb.y + cb.height);
+    b = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  }
+  return b;
+}
+
+// The height an admission gate must judge: what the frame PAINTS, never what it
+// declares. Deliberately NOT applied to getNodeHeight() itself — that function
+// feeds layout arithmetic throughout the parser, and silently enlarging every
+// frame there is a compiler-wide blast radius this change does not take on.
+function getPaintedHeight(node) {
+  const pe = paintedExtent(node);
+  return pe ? pe.height : getNodeHeight(node);
+}
+
 function isEmailWidth(width) {
-  return VALID_EMAIL_WIDTHS.some((w) => Math.abs(width - w) <= EMAIL_WIDTH_TOLERANCE);
+  return width >= EMAIL_WIDTH_MIN && width <= EMAIL_WIDTH_MAX;
 }
 
 // =====================================================================
@@ -906,7 +965,34 @@ function detectColumnSplits(sectionNode, content, grid) {
  * parentMap: built by buildParentMap() during initial node walk.
  */
 function extractEffectiveBg(node, parentMap, fallback = "#FFFFFF") {
-  let cur = node;
+  // Own fill always wins — an explicit section colour is never overridden.
+  //
+  // DEFECT 10 (second path): "own fill" presupposes the node HAS an interior to
+  // fill. When a bare TEXT node is promoted to a section — 1:210 "Recap Title",
+  // black glyphs inside a #F2F2F2 frame — its `fills` is the glyph colour, and
+  // returning it here paints the section black behind its own black text. The
+  // v6.3.0 ancestor walk above was written to stop white-on-white; this stops
+  // the black-on-black the same confusion produces from the other direction.
+  // Falling through lets the covering-child and ancestor rules find the real
+  // background (#F2F2F2 from parent 1:209).
+  const own = GLYPH_PAINT_TYPES.has(node.type) ? null : extractBgHex(node);
+  if (own) return own;
+
+  // DEFECT 8: before falling back to an ANCESTOR, consult a fully-covering
+  // painted DESCENDANT. This is the mirror of the v6.3.0 case: there, a
+  // transparent section inherited a dark ancestor; here, a transparent section
+  // is painted by a child that covers it edge to edge. That child's paint is
+  // what the recipient actually sees, and an ancestor fallback silently
+  // overwrites it with a WRONG value — worse than a dropped node, because a
+  // wrong value looks verified to every downstream oracle.
+  //
+  // Measured on usaa_1_188: 1:272 has fills:[] and a single child 1:273 with
+  // bbox identical to it (0,2636 650x374) painting #F0F0F0. The old walk
+  // returned the email frame's white. Also corrects 1:206 (black, read white).
+  const covered = coveringChildBg(node);
+  if (covered) return covered;
+
+  let cur = parentMap.get(node.id);
   while (cur) {
     const ownBg = extractBgHex(cur);
     if (ownBg) return ownBg;
@@ -914,6 +1000,55 @@ function extractEffectiveBg(node, parentMap, fallback = "#FFFFFF") {
   }
   return fallback;
 }
+
+/**
+ * DEFECT 8 helper. Descend the chain of children that cover `host` edge to
+ * edge and return the first solid fill found.
+ *
+ * Only EDGE-TO-EDGE covers count: a child painting part of the section is
+ * content, not background, and treating it as background would invent a colour
+ * for the uncovered remainder. The 0.5px tolerance absorbs Figma's fractional
+ * bounds without admitting a genuinely smaller box.
+ */
+function coveringChildBg(host) {
+  const s = host.absoluteBoundingBox;
+  if (!s) return null;
+  const covers = (c) => {
+    const b = c.absoluteBoundingBox;
+    if (!b) return false;
+    return b.x <= s.x + 0.5 && b.y <= s.y + 0.5 &&
+           b.x + b.width >= s.x + s.width - 0.5 &&
+           b.y + b.height >= s.y + s.height - 0.5;
+  };
+  let cur = host;
+  const seen = new Set();
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    // DEFECT 10: filter on TYPE as well as geometry. `fills` only means
+    // BACKGROUND on a node with an interior to fill. On TEXT it is the glyph
+    // colour; on VECTOR/LINE/STAR/POLYGON it is the artwork's own paint.
+    // Adopting either as a background is how 1:206 — a transparent frame whose
+    // single covering child is its own black body text — came to be painted
+    // #000000 and render black-on-black. The filter also gates the DESCENT:
+    // we may only tunnel through transparent CONTAINERS.
+    const kids = (cur.children || []).filter(
+      (c) => c.visible !== false && !GLYPH_PAINT_TYPES.has(c.type) && covers(c)
+    );
+    const painted = kids.find((c) => extractBgHex(c));
+    if (painted) return extractBgHex(painted);
+    cur = kids[0]; // keep descending through transparent covering wrappers
+  }
+  return null;
+}
+
+/**
+ * DEFECT 10. Node types whose `fills` is artwork or glyph paint rather than a
+ * background. Their colour is real and must still be rendered AS artwork — it
+ * simply may never be promoted to a container's background.
+ */
+const GLYPH_PAINT_TYPES = new Set([
+  "TEXT", "VECTOR", "LINE", "STAR", "POLYGON", "BOOLEAN_OPERATION",
+]);
 
 /**
  * Build a Map from nodeId → parent node, so we can walk ancestor chains
@@ -967,6 +1102,67 @@ function mapTextAlign(figmaAlign) {
     case "LEFT":
     case "JUSTIFIED":
     default: return "left";
+  }
+}
+
+// ─── v6.1.0-rtl (Phase 2): deterministic text-direction detection ────────────
+// Self-contained Unicode-range scan over already-captured text — NO new Figma
+// dependency. RTL-script LETTERS vs total LETTER content (digits / latin /
+// punctuation / whitespace / symbols are neutral and EXCLUDED from the
+// denominator). RTL-letters / letter-total > 0.4 => "rtl". Deterministic:
+// same text => same result. Default "ltr" so every existing LTR email is
+// unchanged. NOT deployed to prod until end-to-end is proven on a real RTL design.
+function isRtlChar(cp) {
+  return (cp >= 0x0590 && cp <= 0x05FF) ||   // Hebrew
+         (cp >= 0x0600 && cp <= 0x06FF) ||   // Arabic
+         (cp >= 0x0750 && cp <= 0x077F) ||   // Arabic Supplement
+         (cp >= 0xFB1D && cp <= 0xFB4F) ||   // Hebrew Presentation Forms
+         (cp >= 0xFB50 && cp <= 0xFDFF) ||   // Arabic Presentation Forms-A
+         (cp >= 0xFE70 && cp <= 0xFEFF);     // Arabic Presentation Forms-B
+}
+function isLtrLetter(cp) {
+  return (cp >= 0x0041 && cp <= 0x005A) ||   // A-Z
+         (cp >= 0x0061 && cp <= 0x007A) ||   // a-z
+         (cp >= 0x00C0 && cp <= 0x024F) ||   // Latin-1 Supplement + Latin Extended-A/B
+         (cp >= 0x0370 && cp <= 0x03FF) ||   // Greek
+         (cp >= 0x0400 && cp <= 0x04FF);     // Cyrillic
+}
+function countDirection(text, acc) {
+  if (typeof text !== "string") return;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (isRtlChar(cp)) { acc.rtl++; acc.letters++; }
+    else if (isLtrLetter(cp)) { acc.letters++; }
+    // neutral (digits, punctuation, whitespace, symbols) excluded from denominator
+  }
+}
+function detectTextDirection(text) {
+  const acc = { rtl: 0, letters: 0 };
+  countDirection(text, acc);
+  if (acc.letters === 0) return "ltr";          // no letters (digits/punct/empty) => ltr
+  return (acc.rtl / acc.letters) > 0.4 ? "rtl" : "ltr";
+}
+// Email-level: aggregate ALL text/cta runs across sections; the email is "rtl"
+// if its DOMINANT letter content is RTL (same 0.4 threshold over the aggregate).
+function computeSpecDirection(sections) {
+  const acc = { rtl: 0, letters: 0 };
+  for (const s of (sections || [])) {
+    for (const c of (s.content || [])) {
+      if (typeof c.text === "string") countDirection(c.text, acc);
+      if (typeof c.cta_text === "string") countDirection(c.cta_text, acc);
+    }
+  }
+  return (acc.letters > 0 && acc.rtl / acc.letters > 0.4) ? "rtl" : "ltr";
+}
+// Within an RTL email, flag purely-LTR runs (latin / numeric / URL islands) so
+// the framework (§DSF-RTL rule #2) can wrap them dir="ltr".
+function markLtrIslands(sections) {
+  for (const s of (sections || [])) {
+    for (const c of (s.content || [])) {
+      if (typeof c.text === "string" && c.text.trim() && detectTextDirection(c.text) === "ltr") {
+        c.ltr_hint = true;
+      }
+    }
   }
 }
 
@@ -1227,6 +1423,59 @@ function collect(node, out, ctx, isRoot = false) {
     const d = lineToDivider(node);
     if (d) out.push(d);
     return;
+  }
+
+  // ------ DEFECT 9: thin solid-filled RECTANGLE → divider ------
+  // A designer draws a rule two ways: as a LINE with a stroke, or as a thin
+  // RECTANGLE with a fill. Only the first was handled. The second matched
+  // neither the gate above nor CONTAINER_TYPES, so it fell into the silent
+  // `return` below and was DROPPED WITH NO RECORD — O1 counts 4 such bars on
+  // usaa_1_188 alone (1:243, 1:252, 1:261, 1:271 — 65x2, #FFCF06).
+  // lineToDivider() already falls back to a solid fill internally, so only this
+  // call-site gate was wrong.
+  //
+  // BOUNDED DELIBERATELY to 1-D bars. A solid SQUARE is not a rule: routing one
+  // here would render a 77x77 block as a 77px stripe — a worse defect than
+  // dropping it. Squares, ellipses and gradient bands stay dropped until the
+  // schema gains a box element kind (PARSER_DEFECTS.md D7 rank 1), which is a
+  // compiler-side decision, not a parser patch. Pinned by control D9-4.
+  if (node.type === "RECTANGLE" && !imgFill) {
+    const w = getNodeWidth(node), h = getNodeHeight(node);
+    const thin = Math.min(w, h), long = Math.max(w, h);
+    if (thin >= 1 && thin <= 4 && long >= thin * 8) {
+      const d = lineToDivider(node);
+      if (d) { out.push(d); return; }
+    }
+  }
+
+  // ------ DEFECT 13: zero-width stroked VECTOR → divider ------
+  // A designer draws a rule THREE ways: a LINE with a stroke (handled above), a
+  // thin RECTANGLE with a fill (D9, above), or a VECTOR path with a stroke and a
+  // DEGENERATE bbox — the pen-tool case. usaa_1_188's 1:353/1:355 are 0 x 19
+  // vertical separators, the last 2 P0 dropped nodes on that design.
+  //
+  // Why they reach here at all: isAtomicVisualUnit() rasterises a small vector
+  // behind `w > 0 && h > 0` (:1599), which a zero-width path fails. It is then
+  // neither a LINE nor a RECTANGLE nor a CONTAINER, so it hits the silent
+  // `return` immediately below. lineToDivider() already handles it — it rejects
+  // only BOTH dims being ~0 and reads colour from the stroke.
+  //
+  // BOUNDED TO THE DEGENERATE CASE ON PURPOSE. Gating on `thin <= 1` instead
+  // would also match 1:350 (0.86 x 32.24) — but that node passes `w > 0`, so the
+  // atomic path ALREADY emits it as an el:image and it is not dropped. Widening
+  // to `<= 1` would steal a 32px icon from the image path and render it as a 1px
+  // stripe. Gating on `thin <= 0` makes this EXACTLY complementary to the :1599
+  // rejection: the two sets provably cannot overlap. Pinned by control D13-4.
+  //
+  // A visible stroke is REQUIRED: a zero-width shape has no fill area, so the
+  // stroke is the only thing that renders. `long >= 8` excludes degenerate specks.
+  if (node.type === "VECTOR" && !imgFill) {
+    const w = getNodeWidth(node), h = getNodeHeight(node);
+    const thin = Math.min(w, h), long = Math.max(w, h);
+    if (thin <= 0 && long >= 8 && extractStrokeHex(node)) {
+      const d = lineToDivider(node);
+      if (d) { out.push(d); return; }
+    }
   }
 
   // ------ Non-container RECTANGLE / VECTOR without image fill: skip ------
@@ -1618,6 +1867,13 @@ function textNodeToSpec(node) {
     lh,
     color,
     align,
+    // DEFECT 6: carry Figma node identity, exactly as pushImageElement already
+    // does. Without it O1 can identity-match only the image path, so
+    // DROPPED_NODE / PHANTOM_NODE are inexpressible over every text node.
+    // Purely additive: contentEquals compares text elements field-wise (not by
+    // JSON.stringify), so collapseRepeats and dedupAdjacentSections are
+    // unaffected, and cc-runner's METADATA_KEYS already excludes _figmaNodeId.
+    _figmaNodeId: node.id,
   };
   if (transform) el.transform = transform;
   if (typeof style.letterSpacing === "number" && style.letterSpacing !== 0) {
@@ -1802,6 +2058,11 @@ function lineToDivider(node) {
 
   const orientation = w >= h ? "horizontal" : "vertical";
   return {
+    // DEFECT 9 / DEFECT 6: dividers were the last element kind emitted WITHOUT
+    // node identity. Emitting the bars without this raised content coverage but
+    // DROPPED O1's identity ratio 100.00% -> 92.98% (4 UNMATCHED) — the parser
+    // would have been more correct and less PROVABLE at the same time.
+    _figmaNodeId: node.id,
     el: "divider",
     orientation,
     color,
@@ -1897,6 +2158,153 @@ function buildPalette(spec) {
     }
   }
   return Array.from(set);
+}
+
+// =====================================================================
+// 9b. SLICE ROUTING — MANDATE line 48. Added C77 / DEFECT 17.
+//
+//   "blend modes, gaussian blur, masks, boolean ops and rotation CANNOT be
+//    expressed in email HTML. Detect them at parse time and route those
+//    sections STRAIGHT TO SLICE — do not waste repair cycles."
+//
+// Until now this parser had NO slice concept: `grep -i slice` returned only
+// Array.prototype.slice. Every one of the 66 nodes the design routes on
+// usaa_1_188 compiled FLAT — a masked group emitted as a plain box, a rotated
+// node emitted at its axis-aligned bounding box. That class of wrongness is
+// INVISIBLE to every other oracle here, because the geometry is right and only
+// the PAINT is wrong: O2 compares boxes and finds nothing to report.
+//
+// STRICTLY ADDITIVE. This is a read-only pass over the frame that appends ONE
+// new top-level field, `designSpec._sliceRouted`. It does not alter emission,
+// does not remove a node, and nothing downstream consumes it yet — routing is
+// REPORTED here so O1 and the O9 roadmap can count it. Making the compiler act
+// on it is a separate change with a real blast radius, deliberately not taken
+// on in the same edit that introduces the detection.
+//
+// THE RULE IS A PORT, NOT A NEW ONE. It mirrors oracle/figma-rest.mjs
+// `sliceReasons`, including BOTH hard-won suppressions, because an independent
+// second rule would drift from the one the rest of the pipeline routes on:
+//
+//   C20/C53  a zero-thickness axis-aligned LINE/VECTOR with a solid stroke is a
+//            BORDER, not a vector. Routing those re-slices the rules C53 freed
+//            and taints their parent frame, costing live text — measured at 3
+//            TEXT nodes on FRAME 1:351 alone.
+//   C56      a full, solid, unstroked ELLIPSE is `border-radius:50%`, not
+//            boolean geometry. arcData is what distinguishes a disc from a
+//            wedge, so it is read rather than assumed.
+//
+// Over-routing is the failure mode to fear here, and it is a QUIET one: a slice
+// is exact by definition, so slicing more raises the O9 slice ratio while every
+// accuracy check stays green. d17-sliceconcept-failsfirst pins both
+// suppressions as controls for exactly that reason.
+//
+// The walk does NOT short-circuit at a routed node. Each node is judged on its
+// own properties, matching buildDoc — a routed ancestor does not excuse its
+// children from being counted.
+// =====================================================================
+
+const _SR_TAU = Math.PI * 2;
+const _SR_BOOLEAN_OPS = new Set(["BOOLEAN_OPERATION", "VECTOR", "STAR", "POLYGON", "LINE", "ELLIPSE"]);
+const _SR_RULE_CAPABLE = new Set(["LINE", "VECTOR"]);
+
+const _srFirstVisible = (arr) => (arr || []).find((p) => p.visible !== false) || null;
+
+/** Rotation in degrees, derived from relativeTransform (Figma emits no angle). */
+function _srRotation(node) {
+  const t = node.relativeTransform;
+  if (!t || !t[0] || !t[1]) return 0;
+  const deg = (Math.atan2(t[1][0], t[0][0]) * 180) / Math.PI;
+  return Math.abs(deg) < 1e-9 ? 0 : Math.round(deg * 1000) / 1000;
+}
+
+/** Stroke weight, ZERO when the node carries no strokes at all. */
+function _srStrokeWidth(node) {
+  return (node.strokes || []).length ? (node.strokeWeight ?? 0) : 0;
+}
+
+/** C20/C53 — degenerate on exactly one axis, unrotated, solid stroke => border. */
+function _srIsAxisAlignedRule(node) {
+  if (!_SR_RULE_CAPABLE.has(node.type)) return false;
+  if (_srRotation(node)) return false;                  // diagonal -> real vector
+  const stroke = _srFirstVisible(node.strokes);
+  if (!_srStrokeWidth(node) || !stroke || stroke.type !== "SOLID") return false;
+  // A FILLED vector is arbitrary shape geometry (an icon outline), not a rule.
+  // LINE is exempt: it has no fill by construction, so the test would be inert.
+  if (node.type === "VECTOR" && _srFirstVisible(node.fills)) return false;
+  const bb = node.absoluteBoundingBox || { width: 0, height: 0 };
+  const degenerateY = Math.abs(bb.height ?? 0) < 0.5;
+  const degenerateX = Math.abs(bb.width ?? 0) < 0.5;
+  return degenerateY !== degenerateX;                   // exactly one axis collapsed
+}
+
+/** C56 — a full solid unstroked ellipse is a border-radius box. */
+function _srIsRadiusBox(node) {
+  if (node.type !== "ELLIPSE") return false;
+  const a = node.arcData;
+  const full = !a || (Math.abs(a.startingAngle ?? 0) < 1e-6 &&
+                      Math.abs((a.endingAngle ?? _SR_TAU) - _SR_TAU) < 1e-6 &&
+                      (a.innerRadius ?? 0) === 0);
+  if (!full) return false;                              // wedge / donut -> real geometry
+  const fill = _srFirstVisible(node.fills);
+  if (!fill || fill.type !== "SOLID") return false;     // unfilled or non-SOLID paint
+  if (_srStrokeWidth(node)) return false;               // border box, not this path
+  const bb = node.absoluteBoundingBox;
+  if (!bb || !(bb.width > 0) || !(bb.height > 0)) return false;
+  const isCircle = Math.abs(bb.width - bb.height) < 0.5;
+  // A circle is invariant under rotation — geometric fact, not a tolerance.
+  // A rotated OVAL genuinely changes its painted shape, so it stays routed.
+  if (_srRotation(node) && !isCircle) return false;
+  return true;
+}
+
+/**
+ * Why this node cannot be expressed in email HTML. Empty array = expressible.
+ * Each reason is NAMED so MANDATE O9 can rank the capabilities that would
+ * convert slices back to live text.
+ */
+export function sliceReasonsForNode(node) {
+  const reasons = [];
+  if (_srIsAxisAlignedRule(node)) return reasons;       // C20/C53 — short-circuits
+
+  const blend = node.blendMode ?? "PASS_THROUGH";
+  if (blend !== "PASS_THROUGH" && blend !== "NORMAL")
+    reasons.push({ property: "effect.blendMode", value: blend,
+                   why: "no CSS mix-blend-mode support in email clients" });
+
+  const blurs = (node.effects || []).filter((e) => e.visible !== false && /BLUR$/.test(e.type));
+  if (blurs.length)
+    reasons.push({ property: "effect.blur",
+                   value: blurs.map((b) => `${b.type}:${b.radius ?? 0}`).join(","),
+                   why: "no CSS filter support in email clients" });
+
+  if (node.isMask === true)
+    reasons.push({ property: "effect.mask", value: true,
+                   why: "no CSS mask support in email clients" });
+
+  const rot = _srRotation(node);
+  if (rot)
+    reasons.push({ property: "effect.rotation", value: rot,
+                   why: "no CSS transform support in email clients; AABB geometry would certify clean while the render is wrong" });
+
+  // C56 suppresses ONLY this reason — a masked or blurred ellipse has already
+  // accumulated its own reason above and still routes.
+  if (_SR_BOOLEAN_OPS.has(node.type) && !_srIsRadiusBox(node))
+    reasons.push({ property: "node.type", value: node.type,
+                   why: "vector/boolean geometry has no HTML equivalent" });
+
+  return reasons;
+}
+
+/** Read-only pass over the frame. Hidden nodes are not routed — nothing paints them. */
+function collectSliceRouting(root) {
+  const out = [];
+  (function walk(node) {
+    if (!node || node.visible === false) return;
+    const reasons = sliceReasonsForNode(node);
+    if (reasons.length) out.push({ id: node.id, name: node.name, type: node.type, reasons });
+    for (const child of node.children || []) walk(child);
+  })(root);
+  return out;
 }
 
 // =====================================================================
@@ -1996,6 +2404,8 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
 
     const section = {
       n: sections.length + 1,
+      // DEFECT 6: the section frame's Figma identity. See textNodeToSpec.
+      _figmaNodeId: node.id,
       type: "body_text", // re-assigned below
       bg,
       pad,
@@ -2106,6 +2516,15 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
     band_count: dedupedSections.length,
   };
 
+  // v6.1.0-rtl (Phase 2): deterministic RTL detection over already-captured text.
+  // Default "ltr" (every existing LTR email is byte-unchanged). When "rtl", flag
+  // purely-LTR runs as ltr_hint for the framework's dir="ltr" islands (§DSF-RTL).
+  // NOT deployed to prod until end-to-end is proven on a real RTL Figma design.
+  designSpec.text_direction = computeSpecDirection(dedupedSections);
+  if (designSpec.text_direction === "rtl") {
+    markLtrIslands(dedupedSections);
+  }
+
   // RC-1 brand-font wiring: also emit brand_font + font_stack so the framework's
   // existing brand-font machinery (DSF-1, the @import, the validator's hard
   // brand-font check) keys off a populated field instead of staying dormant.
@@ -2120,6 +2539,13 @@ export async function figmaToDesignSpec({ figmaUrl, token, fetchImpl = fetch, de
 
   designSpec._palette = buildPalette(designSpec);
   designSpec.palette_used = designSpec._palette;
+
+  // C77 / DEFECT 17 — MANDATE line 48. Additive: a new top-level field, read by
+  // O1 and the O9 roadmap. Walked from the EMAIL FRAME (not contentRoot) so the
+  // node universe matches the REST doc the oracle compares against. Nothing in
+  // the emission path reads this yet — see the section 9b header for why acting
+  // on it is deliberately a separate change.
+  designSpec._sliceRouted = collectSliceRouting(emailFrame);
 
   // v6.1.0: _figmaNodeId on image elements is intentionally left in the spec
   // here. The server's Phase B image-export step uses it to match Dropbox
