@@ -7536,6 +7536,10 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       orderId, esp, darkMode, fonts, ledger, generatedBy,
       imageCount: images.length, generatedAt: new Date().toISOString(),
       provenance: jobMeta.provenance || null,
+      // D119: the certificate carries the list of elements Figma could not supply.
+      // delivery-notes.txt must name them too - the brief requires the absence to be
+      // visible in BOTH human-facing files, not just the certificate.
+      certificate: jobMeta.certificate || null,
     });
     const certificateText = buildCertificateText({
       generatedBy, certificate: jobMeta.certificate, orderId,

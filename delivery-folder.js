@@ -455,7 +455,7 @@ export function deriveWordFatalLedger(html) {
 }
 
 // ── delivery-notes.txt ────────────────────────────────────────────────
-export function buildDeliveryNotes({ orderId, esp, darkMode, fonts, ledger, generatedBy, imageCount, generatedAt, provenance } = {}) {
+export function buildDeliveryNotes({ orderId, esp, darkMode, fonts, ledger, generatedBy, imageCount, generatedAt, provenance, certificate } = {}) {
   const lines = [];
   lines.push("MAVELOPER — DELIVERY NOTES");
   lines.push("==========================");
@@ -499,6 +499,80 @@ export function buildDeliveryNotes({ orderId, esp, darkMode, fonts, ledger, gene
     }
   }
   lines.push("");
+  // ★★ D119 — ELEMENTS FIGMA COULD NOT SUPPLY, NAMED HERE TOO.
+  //    The compiler now ships an email missing such an element rather than failing
+  //    the order — but ONLY after proving the element declares no fill, stroke,
+  //    effect or text anywhere in its own Figma subtree and has nothing placed
+  //    inside it. The absence must be visible in BOTH human-facing files, so it is
+  //    printed here as well as in certificate.txt, and printed even when the count
+  //    is zero: "none" is a claim, silence is not.
+  {
+    const cert = certificate && typeof certificate === "object" ? certificate : null;
+    const list = Array.isArray(cert && cert.assetsUnavailable) ? cert.assetsUnavailable : [];
+    const n = (cert && typeof cert.assetsUnavailableCount === "number")
+      ? cert.assetsUnavailableCount : list.length;
+    lines.push("ELEMENTS MISSING FROM THIS EMAIL");
+    lines.push("--------------------------------");
+    if (!cert) {
+      lines.push("  (no compiler certificate reached this delivery — see certificate.txt)");
+    } else if (!n) {
+      lines.push("  NONE — Figma supplied every asset the design asked for.");
+    } else {
+      lines.push(`  ${n} layer(s) are ABSENT. Figma returned no image for them.`);
+      lines.push("  Each was checked first: no fill, no stroke, no effect and no text");
+      lines.push("  anywhere inside it, and nothing else in the design was placed inside");
+      lines.push("  it — so no visible content is missing from your email.");
+      for (const o of list) {
+        const box = o && o.box ? ` (${Number(o.box.w).toFixed(2)} x ${Number(o.box.h).toFixed(2)} px)` : "";
+        lines.push(`    - node ${(o && o.node) || "?"}  ${JSON.stringify(o && o.name != null ? o.name : "")}${box}`);
+        if (o && o.figmaReason) lines.push(`        Figma said : ${o.figmaReason}`);
+        if (o && o.why) lines.push(`        Checked    : ${o.why}`);
+      }
+    }
+    lines.push("");
+  }
+  // ── ★★ D133: WHAT IN THIS EMAIL IS NOT EXACT ──────────────────────────────
+  // The section above answers "is anything MISSING". This answers the different
+  // question the compiler can now raise: "is anything PRESENT BUT NOT EXACT".
+  // They are deliberately separate headings — a developer who reads "nothing is
+  // missing" and stops must not thereby be told nothing is approximate.
+  //
+  // Printed at zero for the same reason as the block above: "none" is a claim,
+  // silence is not. Written in the recipient's language, not the compiler's —
+  // no guard names, no line numbers, and every element named so the imperfection
+  // can be seen WITHOUT OPENING THE HTML.
+  {
+    const cert = certificate && typeof certificate === "object" ? certificate : null;
+    const appr = Array.isArray(cert && cert.approximated) ? cert.approximated : [];
+    const degr = Array.isArray(cert && cert.degradedSlices) ? cert.degradedSlices : [];
+    const n = (cert && typeof cert.notExactCount === "number") ? cert.notExactCount : appr.length + degr.length;
+    lines.push("WHAT IN THIS EMAIL IS NOT EXACT");
+    lines.push("-------------------------------");
+    if (!cert) {
+      lines.push("  (no compiler certificate reached this delivery — see certificate.txt)");
+    } else if (!n) {
+      lines.push("  NOTHING — every element took the compiler's exact path.");
+    } else {
+      lines.push(`  ${n} element(s) could not be reproduced exactly.`);
+      lines.push("  EVERY ONE OF THEM IS IN YOUR EMAIL. Nothing was dropped, no section was");
+      lines.push("  collapsed, and no live text was turned into a picture to make this work.");
+      lines.push("  What is imperfect about each one is stated below.");
+      for (const a of appr) {
+        lines.push(`    - node ${(a && a.id) || "?"}  ${JSON.stringify(a && a.name != null ? a.name : "")}  [${a && a.type}]`);
+        lines.push(`        shown as   : ${a && a.route}`);
+        lines.push(`        not exact  : ${a && a.outline}`);
+        lines.push(`        kept       : ${a && a.preserved}`);
+      }
+      for (const d of degr) {
+        lines.push(`    - node ${(d && d.nodeId) || "?"}  [image slice]`);
+        lines.push(`        expected   : ${d && d.expected}   Figma returned: ${d && d.received}`);
+        if (d && d.originPx) lines.push(`        off by     : ${d.originPx.x}px across, ${d.originPx.y}px down`);
+        if (d && d.residualPx) lines.push(`        off by     : ${d.residualPx.w}px wide, ${d.residualPx.h}px tall`);
+        lines.push(`        shipped    : ${d && d.what}`);
+      }
+    }
+    lines.push("");
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -578,6 +652,65 @@ export function buildCertificateText({ generatedBy, certificate, orderId, proven
   if (c.deliveredVerified != null) {
     lines.push("");
     lines.push(`Delivered-file re-verification: ${c.deliveredVerified ? "PASSED (final bytes matched the frozen proof)" : "SEE PROVENANCE"}`);
+  }
+  // ★★ D119 — ELEMENTS FIGMA COULD NOT SUPPLY. A hole must never be silent.
+  //    The compiler now ships an email that is missing such an element rather than
+  //    failing the order — but ONLY after proving the element declares no fill,
+  //    stroke, effect or text anywhere in its own Figma subtree AND has nothing
+  //    adopted into it. This section names every one, so a developer sees exactly
+  //    what is absent without opening the file. Printed even when the count is 0,
+  //    because "none" is a claim and silence is not.
+  {
+    const list = Array.isArray(c.assetsUnavailable) ? c.assetsUnavailable : [];
+    const n = typeof c.assetsUnavailableCount === "number" ? c.assetsUnavailableCount : list.length;
+    lines.push("");
+    if (!n) {
+      lines.push("Elements missing from this email: NONE — Figma supplied every asset requested.");
+    } else {
+      lines.push(`★ ELEMENTS MISSING FROM THIS EMAIL: ${n}`);
+      lines.push("  Figma returned no image for the layers below, so they are ABSENT from the");
+      lines.push("  delivered html. Each was checked first: none declares a fill, a stroke, an");
+      lines.push("  effect or any text anywhere inside it, and nothing else in the design was");
+      lines.push("  placed inside it — so no visible content is missing. They are listed here");
+      lines.push("  so the absence is known rather than discovered.");
+      for (const o of list) {
+        lines.push(`    - node ${o.node || "?"}  ${JSON.stringify(o.name ?? "")}` +
+          (o.box ? `  (${Number(o.box.w).toFixed(2)} x ${Number(o.box.h).toFixed(2)} px)` : ""));
+        if (o.figmaReason) lines.push(`        Figma said : ${o.figmaReason}`);
+        if (o.why)         lines.push(`        Checked    : ${o.why}`);
+      }
+    }
+  }
+  // ★★ D133 — ELEMENTS PRESENT BUT NOT EXACT. The mirror of the block above, in
+  // certificate.txt as well as delivery-notes.txt, because the owner's rule is
+  // that a degradation reaches BOTH human-facing files. Printed at zero.
+  {
+    const appr = Array.isArray(c.approximated) ? c.approximated : [];
+    const degr = Array.isArray(c.degradedSlices) ? c.degradedSlices : [];
+    const n = typeof c.notExactCount === "number" ? c.notExactCount : appr.length + degr.length;
+    lines.push("");
+    if (!n) {
+      lines.push("Elements not reproduced exactly: NONE — every element took the exact path.");
+    } else {
+      lines.push(`★ ELEMENTS NOT REPRODUCED EXACTLY: ${n}`);
+      lines.push("  The compiler could not reproduce these exactly, so it did the most faithful");
+      lines.push("  thing available and recorded what it could not match. EVERY ONE IS PRESENT");
+      lines.push("  in the delivered html: nothing was dropped, no section collapsed, and no");
+      lines.push("  live text was baked into a picture.");
+      for (const a of appr) {
+        lines.push(`    - node ${a.id || "?"}  ${JSON.stringify(a.name ?? "")}  [${a.type}]`);
+        lines.push(`        shown as   : ${a.route}`);
+        lines.push(`        not exact  : ${a.outline}`);
+        lines.push(`        kept       : ${a.preserved}`);
+      }
+      for (const d of degr) {
+        lines.push(`    - node ${d.nodeId || "?"}  [image slice]`);
+        lines.push(`        expected   : ${d.expected}   Figma returned: ${d.received}`);
+        if (d.originPx)   lines.push(`        off by     : ${d.originPx.x}px across, ${d.originPx.y}px down`);
+        if (d.residualPx) lines.push(`        off by     : ${d.residualPx.w}px wide, ${d.residualPx.h}px tall`);
+        lines.push(`        shipped    : ${d.what}`);
+      }
+    }
   }
   // Mobile disclosure (ITEM-5). ALWAYS honest and self-contained; enriched if the caller
   // threads certificate.mobile from the compiler-provenance sidecar. The certificate must
