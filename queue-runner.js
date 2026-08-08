@@ -5,6 +5,14 @@
  * os_queue one order at a time, using supabaseAdmin (SERVICE_ROLE, bypasses RLS)
  * and the SAME priority engine the UI uses (queue-priority.js).
  *
+ * ★ THAT ENGINE IS NOW FIFO. The order queued first is dispatched first;
+ * `manual_rank` is the one human override; a row already `processing` holds
+ * position one. Buffered deadlines, the fairness lock and the §3b barrier are
+ * gone from BOTH copies — see the header of queue-priority.js for why. This file
+ * changed in exactly two ways: it stopped passing a `newlyLocking` array into the
+ * plan, and it stopped persisting `locked`/`locked_at` back to os_queue. No
+ * column was dropped and the claim/dispatch/settle path is untouched.
+ *
  * SHIPPED DARK: nothing runs unless RUNNER_ENABLED === "true". createQueueRunner
  * is always constructed (so the /runner/status + /queue/run-next routes have an
  * object to talk to), but start() no-ops when disabled — behaviour is unchanged.
@@ -191,7 +199,14 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         return { dispatched: null, reason: 'engine busy (row processing)' };
       }
 
-      // C. PLAN + PERSIST LOCKS.
+      // C. PLAN. Ordering only — this section no longer WRITES anything.
+      //
+      // ★ THE SELECT LIST IS UNCHANGED ON PURPOSE. `effective_deadline`, `locked`
+      // and `locked_at` are no longer read by the plan, and `tat_hours` is read
+      // only to build the dispatch body below (never to order). They stay
+      // selected because the columns keep their history and this row shape is
+      // what the rest of the tick passes around; narrowing the select would be a
+      // second, unrelated change riding along with the ordering one.
       const { data: activeRows, error: activeErr } = await supabaseAdmin
         .from('os_queue')
         .select('id,order_id,tat_hours,uploaded_at,status,lead_user_id,manual_rank,effective_deadline,locked,locked_at,figma_url,esp,dark_mode,job_id')
@@ -201,17 +216,15 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         return { dispatched: null, reason: `active load failed: ${activeErr.message}` };
       }
       const rows = activeRows ?? [];
-      const newlyLocking = [];
-      const plan = computeQueuePlan(rows, Date.now(), newlyLocking);
+      const plan = computeQueuePlan(rows, Date.now());
 
-      // Persist any NEW locks the plan produced (server is the single writer).
-      for (const p of plan.pending) {
-        const orig = rows.find((r) => r.id === p.row.id);
-        if (p.locked && orig && !orig.locked) {
-          await updateRow(p.row.id, { locked: true, locked_at: p.lockedAt ?? new Date().toISOString() });
-          log('info', 'Runner: persisted new lock', { id: p.row.id, order: p.row.order_id });
-        }
-      }
+      // ★ THE LOCK PERSIST THAT USED TO LIVE HERE IS DELETED. It read the plan's
+      // `newlyLocking` / `p.locked` and fired an `UPDATE os_queue SET locked,
+      // locked_at` on every row the deadline engine decided had run out of slack.
+      // Nothing has read those two columns since the console dropped its own copy
+      // of the lock, so this was a write-only side effect inside a poll loop: it
+      // stamped rows on a schedule and no screen or query ever looked. FIFO has no
+      // lock to persist. The columns keep every value they already hold.
 
       // D. PICK — first plan.pending row that is pending AND has no job_id.
       const dispatchable = rows.filter((r) => r.status === 'pending' && !r.job_id);
