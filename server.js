@@ -21,6 +21,7 @@ import { createQueueRunner } from "./queue-runner.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
+import { uploadImagesWithConcurrency, readConcurrency } from "./dropbox-upload.js";
 import {
   sanitizeOrderId,
   collectReferencedUrls,
@@ -184,7 +185,29 @@ const ALLOWED_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 // v5.5.0 tunables â€” extracted from inline magic numbers
 const STAGE1_MAX_RETRIES = 3;
 const STAGE1_RETRY_INITIAL_BACKOFF_MS = 3000;
-const DROPBOX_BATCH_SIZE = 3;
+// ── ★ DROPBOX UPLOAD CONCURRENCY — A RAILWAY SETTING, NOT A COMMIT ──────────
+// Was a hardcoded 3. THE RECORDED REASON, and it is a belief rather than an
+// incident: commit 4cc586e "fix: reduce Dropbox batch size + retry failed
+// uploads (v1.3.6)", 14 Apr 2026, moved it 5 → 3 in the same diff that added the
+// failedImages retry queue, and rewrote the doc comment from "batches of 5 for
+// speed without hitting rate limits" to "batches of 3 with retry logic for
+// rate-limited requests". No 429 is quoted, no error text, no order id, no
+// measurement — and the value has not moved since. It is reported here rather
+// than deleted, because the person who wrote it may have been looking at
+// something the commit does not record.
+//
+// WHAT DROPBOX ACTUALLY DOCUMENTS for the endpoints this code names — filesUpload
+// (/2/files/upload) and sharingCreateSharedLinkWithSettings — is NOT a published
+// requests-per-second figure. It is: 429 `too_many_requests` with a Retry-After
+// header, and 429 `too_many_write_operations` when concurrent writes contend for
+// a lock on the SAME namespace, which is exactly what N parallel uploads into one
+// order folder do. There is no documented number to be 3 or 12 units of, so the
+// old value could not have been derived from the docs either.
+//
+// The default is 12. Reverting is `DROPBOX_UPLOAD_CONCURRENCY=3` in Railway and a
+// restart — deliberately not a commit, because the width is the thing under test
+// and the owner must be able to put it back at 02:00 without a deploy.
+const DROPBOX_BATCH_SIZE = readConcurrency(process.env.DROPBOX_UPLOAD_CONCURRENCY, 12, 1, 32);
 const DROPBOX_BATCH_RETRY_DELAY_MS = 2000;
 const DROPBOX_RETRY_INTERVAL_MS = 500;
 // images/ prune (dropbox-prune.js): how hard to retry a rate-limited delete, and
@@ -493,60 +516,34 @@ async function uploadToDropbox(filePath, fileBuffer) {
 
 /**
  * Upload all images to Dropbox for a given order.
- * Uploads in parallel batches of 3 with retry logic for rate-limited requests.
+ * Bounded-concurrency worker pool at DROPBOX_BATCH_SIZE (env
+ * DROPBOX_UPLOAD_CONCURRENCY, default 12) with one serial retry sweep.
  * Returns a map: { "hero.jpg": "https://dl.dropboxusercontent.com/..." }
+ *
+ * ★ THE SCHEDULER LIVES IN dropbox-upload.js so the failure path can be exercised
+ * without a live order — see that file's header. This wrapper injects the real
+ * uploadToDropbox, so the bytes, the Dropbox paths and the returned URLs are
+ * produced by the same call as before; imageUrlMap keys are inserted in INPUT
+ * order, which is what Stage 2's === IMAGE ASSETS REFERENCE === block renders.
+ *
+ * ALL THREE CALL SITES SHARE THIS ONE FUNCTION: the PDF path, Figma Phase B
+ * (before Stage 2), and /bridge-callback's compiler slice upload (after the
+ * callback). One width setting moves all three.
  */
 async function uploadImagesToDropbox(orderId, images, logFn) {
   const folderPath = getDropboxFolderPath(orderId);
-  const imageUrlMap = {};
-  const failedImages = [];
-
-  logFn("info", `Uploading ${images.length} images to Dropbox (parallel, batch size ${DROPBOX_BATCH_SIZE})`, { orderId });
-
-  for (let i = 0; i < images.length; i += DROPBOX_BATCH_SIZE) {
-    const batch = images.slice(i, i + DROPBOX_BATCH_SIZE);
-    const results = await Promise.allSettled(
-      batch.map(async (img) => {
-        const dropboxFilePath = `${folderPath}/images/${img.filename}`;
-        const { directUrl, sharedUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-        logFn("info", `Dropbox URL for ${img.filename}`, {
-          sharedUrl: redactUrl(sharedUrl),
-          directUrl: redactUrl(directUrl),
-        });
-        return { filename: img.filename, directUrl };
-      })
-    );
-    for (let j = 0; j < results.length; j++) {
-      const result = results[j];
-      if (result.status === "fulfilled") {
-        imageUrlMap[result.value.filename] = result.value.directUrl;
-      } else {
-        logFn("warn", `Upload failed for ${batch[j].filename}, queued for retry`, { error: result.reason?.message || String(result.reason) });
-        failedImages.push(batch[j]);
-      }
-    }
-  }
-
-  // Retry failed images one at a time with a delay
-  if (failedImages.length > 0) {
-    logFn("info", `Retrying ${failedImages.length} failed uploads after ${DROPBOX_BATCH_RETRY_DELAY_MS}ms delay`);
-    await sleepMs(DROPBOX_BATCH_RETRY_DELAY_MS);
-
-    for (const img of failedImages) {
-      try {
-        const dropboxFilePath = `${folderPath}/images/${img.filename}`;
-        const { directUrl } = await uploadToDropbox(dropboxFilePath, img.buffer);
-        imageUrlMap[img.filename] = directUrl;
-        logFn("info", `Retry succeeded for ${img.filename}`);
-      } catch (retryErr) {
-        logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr.message });
-      }
-      await sleepMs(DROPBOX_RETRY_INTERVAL_MS);
-    }
-  }
-
-  logFn("info", `Dropbox upload complete: ${Object.keys(imageUrlMap).length}/${images.length} succeeded`, { orderId });
-  return imageUrlMap;
+  return uploadImagesWithConcurrency({
+    images,
+    folderPath,
+    uploadOne: (dropboxFilePath, buffer) => uploadToDropbox(dropboxFilePath, buffer),
+    logFn,
+    concurrency: DROPBOX_BATCH_SIZE,
+    retryDelayMs: DROPBOX_BATCH_RETRY_DELAY_MS,
+    interRetryMs: DROPBOX_RETRY_INTERVAL_MS,
+    sleep: sleepMs,
+    orderId,
+    redact: redactUrl,
+  });
 }
 
 /**
@@ -4299,8 +4296,40 @@ app.use(cors({
   credentials: false,
 }));
 
+// ── ★ CALLBACK TRANSFER, MEASURED (instrument only — nothing is optimised) ───
+// The bridge POSTs /bridge-callback with a base64 compilerAssets payload the
+// owner has seen between 1.0 and 19.4 MB, over a free ngrok tunnel from India to
+// Railway, against the 35mb limit below. NOTHING HAS EVER TIMED IT. It is inside
+// the 205 seconds that TEST12-1413 spent outside the engine's own 74, and it is
+// currently an inference.
+//
+// It must be measured HERE, around express.json, and not in the route handler:
+// by the time the handler runs the body is already buffered and parsed, so the
+// handler cannot see the transfer at all. The first middleware stamps arrival —
+// which for a large body is roughly when the HEADERS land, since express.json
+// then reads the stream to completion — and the second stamps the moment the
+// parsed body exists. The difference is tunnel transfer + JSON parse together;
+// they are not separated, and the log says so rather than implying a clean split.
+//
+// Scoped to /bridge-callback by path so no other route pays a clock read, and
+// req.id does not exist yet (it is assigned by the middleware below this one),
+// so the values are stashed on req and logged by the route.
+app.use((req, _res, next) => {
+  if (req.method === "POST" && req.path === "/bridge-callback") {
+    req._bodyRecvStart = Date.now();
+    const cl = Number(req.headers["content-length"]);
+    req._bodyRecvBytes = Number.isFinite(cl) ? cl : null;
+  }
+  next();
+});
+
 // Increased from 8mb to 35mb to accommodate PDF (5MB) + ZIP (25MB) after base64 inflation
 app.use(express.json({ limit: "35mb" }));
+
+app.use((req, _res, next) => {
+  if (req._bodyRecvStart) req._bodyRecvMs = Date.now() - req._bodyRecvStart;
+  next();
+});
 
 app.use((req, res, next) => {
   req.id = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -5845,7 +5874,9 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     let imageUrlMap = {};
     let previewImageUrl = null;
     let previewBufferForStage2 = null;  // v6.6.0: held for Stage 2 visual input
-    let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0, bgImageCount: 0 };
+    // renderMs / uploadMs are new and additive: durationMs was the whole phase in
+    // one number, so nobody could say which half cost what. All three now ship.
+    let imageExportReport = { rendered: 0, uploaded: 0, patched: 0, missing: 0, durationMs: 0, renderMs: 0, uploadMs: 0, bgImageCount: 0 };
     const imageExportStartTime = Date.now();
 
     try {
@@ -5908,6 +5939,16 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
         });
 
         // Inline images + preview: composited renders via /v1/images
+        // ── ★ THE FIGMA RENDER PHASE, SPLIT OUT (instrument only) ─────────────
+        // WHAT THE LOGS ALREADY SHOWED: "Phase B: image export complete" carries
+        // a durationMs, but it is the duration of the WHOLE phase — Figma render,
+        // PNG download, raw bg-image fetch, the Dropbox upload, the spec patch and
+        // the preview upload, in one number. Asking "how long does Figma take" of
+        // that number is unanswerable, which is why it has never been answered.
+        // renderMs is the /v1/images call plus the signed-URL PNG downloads
+        // (PNG_DOWNLOAD_CONCURRENCY=5 in figma-image-export.js) and NOTHING else,
+        // so it can be subtracted from the phase and from the upload.
+        const tRenderStart = Date.now();
         const bufferMap = allNodeIds.length > 0
           ? await renderFigmaNodes({
               fileKey,
@@ -5916,7 +5957,19 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
               logFn: (level, msg, meta) => log(level, msg, { requestId: req.id, ...meta }),
             })
           : new Map();
+        imageExportReport.renderMs = Date.now() - tRenderStart;
         imageExportReport.rendered = bufferMap.size;
+        let renderedBytes = 0;
+        for (const b of bufferMap.values()) renderedBytes += b?.length || 0;
+        log("info", "Phase B: Figma render + PNG download complete", {
+          requestId: req.id,
+          requested: allNodeIds.length,
+          returned: bufferMap.size,
+          missing: allNodeIds.length - bufferMap.size,
+          renderMs: imageExportReport.renderMs,
+          bytes: renderedBytes,
+          mb: Number((renderedBytes / 1048576).toFixed(2)),
+        });
 
         // v6.5.0: Background images use RAW image-ref URLs (no compositing).
         // This prevents the "double print" bug where /v1/images bakes child
@@ -5991,7 +6044,9 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
           }
 
           if (dropboxImages.length > 0) {
+            const tUploadStart = Date.now();
             imageUrlMap = await uploadImagesToDropbox(orderId, dropboxImages, log);
+            imageExportReport.uploadMs = Date.now() - tUploadStart;
             imageExportReport.uploaded = Object.keys(imageUrlMap).length;
           }
 
@@ -6848,6 +6903,33 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(400).json({ error: "Missing bridgeJobId" });
   }
 
+  // ── ★ THE CALLBACK TRANSFER, STATED IN THE LOG ──────────────────────────────
+  // recvMs is tunnel-transfer AND JSON parse together (see the middleware pair
+  // above express.json) — the two are not separated and this line must not be
+  // read as if they were. bytes is the wire Content-Length, i.e. the base64
+  // payload as it crossed ngrok, NOT the decoded PNG total; assetBytesBase64
+  // below is the share of it that is compiler slice images. `limitBytes` is
+  // printed beside them so a payload approaching 35mb is visible BEFORE it is
+  // rejected, rather than after.
+  const _assetB64 = compilerAssets && typeof compilerAssets === "object"
+    ? Object.values(compilerAssets).reduce((s, v) => s + (typeof v === "string" ? v.length : 0), 0)
+    : 0;
+  log("info", "/bridge-callback payload received", {
+    requestId: req.id,
+    bridgeJobId,
+    recvMs: req._bodyRecvMs ?? null,
+    bytes: req._bodyRecvBytes ?? null,
+    mb: req._bodyRecvBytes != null ? Number((req._bodyRecvBytes / 1048576).toFixed(2)) : null,
+    limitBytes: 35 * 1024 * 1024,
+    mbPerSec: req._bodyRecvBytes != null && req._bodyRecvMs > 0
+      ? Number((req._bodyRecvBytes / 1048576 / (req._bodyRecvMs / 1000)).toFixed(2))
+      : null,
+    assetCount: compilerAssets && typeof compilerAssets === "object" ? Object.keys(compilerAssets).length : 0,
+    assetBytesBase64: _assetB64,
+    htmlBytes: typeof html === "string" ? html.length : 0,
+    hasError: Boolean(error),
+  });
+
   // â”€â”€ Durable path: find the maveloper_jobs row by bridgeJobId â”€â”€â”€â”€â”€â”€
   // The row was tagged with `__BRIDGE__:<bridgeJobId>` in error_message
   // at dispatch time (see callClaudeCodeBridge). We look it up here.
@@ -7503,10 +7585,13 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
       return null; // dropped â†’ stays an absolute URL in the html (never a dead local ref)
     });
     const images = materialized.filter(Boolean);
+    const tImagesMs = Date.now() - imagesStart;
     log("info", "Approve images step complete", {
       requestId: req.id, orderId,
       referenced: urlList.length, inPlace: nInPlace, copied: nCopy, downloaded: nDownload, failed: nFailed,
-      imagesMs: Date.now() - imagesStart,
+      imagesMs: tImagesMs,
+      // the width this ran at, so the number can be read against the setting
+      concurrency: DROPBOX_BATCH_SIZE,
     });
 
     // Localise ONLY the URLs we actually materialised (a failed one stays an
@@ -8035,6 +8120,40 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
         requestId: req.id, orderId,
       });
     }
+
+    // ── ★ /approve, END TO END, IN ONE LINE (instrument only) ─────────────────
+    // FALSIFIED PREMISE, reported rather than obeyed: this phase was NOT invisible.
+    // /approve already emitted imagesMs, shareLinkMs, msFromApproveStart,
+    // housekeepingMs, pruneMs and gateMs. What did NOT exist is a SINGLE line
+    // holding the whole route and its parts together, so reading the cost of the
+    // ~108-file delivery folder meant subtracting timestamps across six log lines
+    // and hoping none were interleaved with another order's. That is the gap, and
+    // it is a smaller gap than the brief assumed.
+    //
+    // ★ AND THE REST OF THE ROUTE WAS GENUINELY UNTIMED: the confirmation email
+    // (a Dropbox share link for the html, a preview.png download, an SMTP send)
+    // and the idempotency record sit BETWEEN the last timed stage and this line,
+    // and no clock has ever been on them. totalMs minus the named parts is
+    // `unaccountedMs`, which is exactly that stretch — named as unaccounted rather
+    // than attributed to anything, because nothing here has measured it yet.
+    const tApproveTotalMs = Date.now() - startTime;
+    const _named = tImagesMs + (tHousekeepingStart - tShareStart) + tPruneMs + tGateMs;
+    log("info", "Approve: route complete (end to end)", {
+      requestId: req.id, orderId,
+      totalMs: tApproveTotalMs,
+      imagesMs: tImagesMs,
+      shareLinkMs: tHousekeepingStart - tShareStart,
+      pruneMs: tPruneMs,
+      gateMs: tGateMs,
+      unaccountedMs: tApproveTotalMs - _named,
+      referencedImages: urlList.length,
+      materialised: images.length,
+      concurrency: DROPBOX_BATCH_SIZE,
+      // ★ THIS RUNS AFTER finished_at. It is not in the engine clock and it is not
+      // in the queue row's start-to-finish span; it is time the lead waits that no
+      // existing measurement contains.
+      afterFinishedAt: true,
+    });
 
     res.json({
       dropboxUrl,
