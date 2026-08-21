@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -224,6 +224,8 @@ const STAGE1_RETRY_API_TIMEOUT_MS = 240 * 1000;     // 4 min for clean-regenerat
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 180 * 1000;       // 3 min â€” must allow in-flight Stage 2 to finish
 
 const ALLOWED_ORIGINS = [
+  "https://mavloper.dev",
+  "https://www.mavloper.dev",
   "https://maveloper.vercel.app",
   "https://maveloper.lovable.app",
   "http://localhost:3000",
