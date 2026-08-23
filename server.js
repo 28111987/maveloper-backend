@@ -6045,11 +6045,35 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
             dropboxImages.push({ filename, buffer: buf });
           }
 
-          if (dropboxImages.length > 0) {
+          // SKIP2 — the deterministic compiler does not read designSpec image src.
+          // On a compiler order these Figma NODE EXPORTS are uploaded to Dropbox,
+          // patched into a spec nobody reads, and then dropped. Skip the upload when
+          // BOTH hold:
+          //   (a) this request routes to the Claude Code bridge — the SAME
+          //       getRequestedEngine(req) === "claude-code" expression the Stage 2
+          //       branch below uses to decide it calls the bridge at all; and
+          //   (b) AI_ENGINE_NO_FALLBACK === "true", so the bridge catch returns 502
+          //       and the Anthropic fallback — the ONLY consumer of the imageSection
+          //       built from this map — is unreachable.
+          // If AI_ENGINE_NO_FALLBACK is unset or anything other than "true", this is
+          // false and the upload runs EXACTLY as today. The preview upload below is
+          // NOT in this block and still fires on every order; the Figma render and
+          // download above are untouched; the raw background-image fetch is untouched.
+          const skipPhaseBUpload =
+            getRequestedEngine(req) === "claude-code" &&
+            process.env.AI_ENGINE_NO_FALLBACK === "true";
+
+          if (!skipPhaseBUpload && dropboxImages.length > 0) {
             const tUploadStart = Date.now();
             imageUrlMap = await uploadImagesToDropbox(orderId, dropboxImages, log);
             imageExportReport.uploadMs = Date.now() - tUploadStart;
             imageExportReport.uploaded = Object.keys(imageUrlMap).length;
+          } else if (skipPhaseBUpload && dropboxImages.length > 0) {
+            log("info", "Phase B: node-export upload SKIPPED (compiler order, fallback disabled)", {
+              requestId: req.id,
+              orderId,
+              wouldHaveUploaded: dropboxImages.length,
+            });
           }
 
           // Patch designSpec â€” covers both content[].src and section.bg_image.src
