@@ -6059,9 +6059,15 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
           // false and the upload runs EXACTLY as today. The preview upload below is
           // NOT in this block and still fires on every order; the Figma render and
           // download above are untouched; the raw background-image fetch is untouched.
-          const skipPhaseBUpload =
-            getRequestedEngine(req) === "claude-code" &&
-            process.env.AI_ENGINE_NO_FALLBACK === "true";
+          // NOLLM (23 Aug): the second conjunct is GONE. It existed only to keep the
+          // Anthropic fallback fed with public image URLs; that fallback has been
+          // removed from the bridge catch below, so on a compiler order NOTHING reads
+          // the imageSection built from this map. The skip is now UNCONDITIONAL on
+          // compiler orders and can no longer be re-armed by an env var change.
+          // The claude-code conjunct STAYS: a genuine non-compiler order still takes
+          // the deliberate LLM route in the else branch below and still needs these
+          // uploads, so it must keep uploading exactly as today.
+          const skipPhaseBUpload = getRequestedEngine(req) === "claude-code";
 
           if (!skipPhaseBUpload && dropboxImages.length > 0) {
             const tUploadStart = Date.now();
@@ -6307,48 +6313,28 @@ ${specs.join("\n\n")}
           assetSink: compilerAssetSink,
         });
       } catch (err) {
-        // v9.0.3: AI_ENGINE_NO_FALLBACK protects against silent Anthropic billing
-        // when the bridge is misconfigured or under repair. Set this env var to
-        // "true" on Railway during Claude Code testing so failures surface to the
-        // client as 502s instead of triggering an expensive Anthropic fallback
-        // (a single Stage 2 Sonnet 4-6 call costs ~$2 in tokens).
-        const noFallback = process.env.AI_ENGINE_NO_FALLBACK === "true";
-
-        if (noFallback) {
-          log("error", "Claude Code bridge failed; fallback DISABLED (AI_ENGINE_NO_FALLBACK=true)", {
-            requestId: req.id,
-            error: err.message,
-          });
-          return res.status(502).json({
-            error: "Claude Code bridge failed and automatic fallback is disabled.",
-            details: err.message,
-            requestId: req.id,
-            engineUsed: "claude-code-failed-no-fallback",
-            hint: "Either fix the bridge (check ngrok + cc-runner.mjs) or unset AI_ENGINE_NO_FALLBACK on Railway to re-enable Anthropic fallback.",
-          });
-        }
-
-        log("error", "Claude Code bridge failed; falling back to Anthropic API", {
+        // NOLLM (23 Aug): the Anthropic fallback is REMOVED. A bridge failure on a
+        // compiler order now ALWAYS returns the 502 below -- the same 502 this arm
+        // already returned whenever AI_ENGINE_NO_FALLBACK was "true" -- with no env
+        // var able to route the order back to the slow LLM path.
+        // This branch was the ONLY consumer, on the claude-code path, of the
+        // imageSection built from the Phase B node-export upload, which is why the
+        // skip guard above no longer needs its AI_ENGINE_NO_FALLBACK conjunct.
+        // Response shape preserved verbatim: same 502 status, same four keys, same
+        // engineUsed "claude-code-failed-no-fallback", so downstream readers are
+        // byte-identical. The else branch below is the DELIBERATE LLM route for a
+        // non-compiler engine and is UNTOUCHED; it still consumes userContent.
+        log("error", "Claude Code bridge failed; fallback DISABLED (AI_ENGINE_NO_FALLBACK=true)", {
           requestId: req.id,
           error: err.message,
         });
-        engineUsed = "console-fallback";
-        // Automatic fallback to Anthropic API so the user still gets output.
-        const stage2Response = await anthropic.messages.create({
-          model: CLAUDE_MODEL,
-          max_tokens: 64000,
-          system: [{ type: "text", text: STAGE2_PROMPT, cache_control: { type: "ephemeral" } }],
-          messages: [{ role: "user", content: userContent }],
+        return res.status(502).json({
+          error: "Claude Code bridge failed and automatic fallback is disabled.",
+          details: err.message,
+          requestId: req.id,
+          engineUsed: "claude-code-failed-no-fallback",
+          hint: "Either fix the bridge (check ngrok + cc-runner.mjs) or unset AI_ENGINE_NO_FALLBACK on Railway to re-enable Anthropic fallback.",
         });
-        const stage2TextBlock = stage2Response.content?.find((b) => b.type === "text");
-        if (!stage2TextBlock?.text) {
-          return res.status(502).json({
-            error: "HTML generation failed (Claude Code AND Anthropic API both failed)",
-            details: err.message,
-            requestId: req.id,
-          });
-        }
-        html_raw = stage2TextBlock.text;
       }
     } else {
       // â”€â”€â”€ Original Anthropic API path (UNCHANGED from v8.1.1) â”€â”€â”€
