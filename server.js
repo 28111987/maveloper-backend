@@ -4242,7 +4242,10 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       PENDING_BRIDGE_JOBS.delete(bridgeJobId);
     }
     const errText = await dispatchResp.text().catch(() => "(no body)");
-    throw new Error(`Bridge rejected dispatch with status ${dispatchResp.status}: ${errText.substring(0, 500)}`);
+    const errBody = errText.trimStart().startsWith("<")
+      ? "BRIDGE UNREACHABLE - the tunnel returned an HTML error page, not the bridge. The laptop or ngrok was down."
+      : errText.substring(0, 500);
+    throw new Error(`Bridge rejected dispatch with status ${dispatchResp.status}: ${errBody}`);
   }
 
   log("info", "Bridge accepted job â€” waiting for callback", {
