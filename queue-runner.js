@@ -38,6 +38,14 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
     orphanMs: Number(env.ORPHAN_MS) || 5 * 60 * 1000,     //   300,000
     stuckMs: Number(env.STUCK_MS) || 60 * 60 * 1000,      // 3,600,000
     heartbeatMs: Number(env.HEARTBEAT_MS) || 30000,
+    // PER-SPACE QUEUES. Owner's rule: every space builds one email at a time,
+    // immediately, always; a space's second email waits for its own first; no
+    // space ever waits for another space. Unset (the default) keeps the single
+    // global lock this runner has always used.
+    perSpaceQueue: String(env.PER_SPACE_QUEUE || '').toLowerCase() === 'true',
+    // Dispatch ceiling per tick. A cost and blast-radius guard only. It cannot
+    // make one space wait for another by more than a single poll interval.
+    maxDispatchPerTick: Number(env.MAX_DISPATCH_PER_TICK) || 10,
     bridgeUrl: env.MAC_BRIDGE_URL || null,
   };
 
@@ -94,6 +102,57 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
   }
 
   // ---- the tick ----
+
+  // CLAIM + DISPATCH for ONE queue row. Sections E and F were moved here
+  // unchanged so the global path and the per-space path share one
+  // implementation. Returns the same shape tick() has always returned.
+  async function claimAndDispatch(pick, now) {
+      // E. ATOMIC CLAIM — the .eq(status,pending).is(job_id,null) guards ARE the lock.
+      const { data: claimed, error: claimErr } = await supabaseAdmin
+        .from('os_queue')
+        .update({ status: 'processing', started_at: new Date().toISOString() })
+        .eq('id', pick.id)
+        .eq('status', 'pending')
+        .is('job_id', null)
+        .select();
+      if (claimErr) {
+        log('warn', 'Runner: claim update errored', { id: pick.id, error: claimErr.message });
+        return { dispatched: null, reason: `claim errored: ${claimErr.message}` };
+      }
+      if (!claimed || claimed.length === 0) {
+        return { dispatched: null, reason: 'claim lost (raced)' };
+      }
+
+      // F. DISPATCH — reuse the existing async path IN-PROCESS. Exactly the 5 client fields.
+      const jobBody = {
+        figmaUrl: pick.figma_url,
+        darkMode: pick.dark_mode,
+        orderId: pick.order_id,
+        tatHours: Number(pick.tat_hours),
+      };
+      if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
+
+      const requestId = `runner_${now}_${runnerReqCounter++}`;
+      let jobId;
+      try {
+        const result = await startFigmaJobAsync({ body: jobBody, requestId, user: null, headers: {} });
+        if (result && result.error) {
+          throw new Error(`${result.error}${result.details ? `: ${result.details}` : ''}`);
+        }
+        jobId = result && result.jobId;
+        if (!jobId) throw new Error('async path returned no jobId');
+      } catch (err) {
+        const msg = `Runner dispatch failed: ${err.message}`;
+        await settleFailed(pick.id, msg);
+        log('error', 'Runner: dispatch failed', { id: pick.id, order: pick.order_id, error: err.message });
+        return { dispatched: null, reason: msg };
+      }
+
+      // On success → persist job_id onto the os_queue row (the poller/adopt watches it).
+      await updateRow(pick.id, { job_id: jobId });
+      log('info', 'Runner: dispatched order', { id: pick.id, order: pick.order_id, jobId, requestId });
+      return { dispatched: pick.order_id, reason: 'dispatched', jobId };
+  }
 
   async function tick() {
     if (isTicking) return { dispatched: null, reason: 'tick already in progress' };
@@ -190,12 +249,19 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         });
       }
 
-      // B. CONCURRENCY GUARD — re-read processing AFTER §A settled the finished ones.
+      // B. CONCURRENCY GUARD - re-read processing AFTER section A settled the
+      //    finished ones.
+      //
+      //    WITH PER_SPACE_QUEUE THE GUARD IS PER SPACE, NOT GLOBAL. The select
+      //    also reads org_id so a space is judged busy on its OWN rows alone.
+      //    With the flag unset the early return below is the original global
+      //    lock, unchanged: one processing row anywhere holds the whole runner.
       const { data: stillProc } = await supabaseAdmin
         .from('os_queue')
-        .select('id')
+        .select('id,org_id')
         .eq('status', 'processing');
-      if (stillProc && stillProc.length > 0) {
+      const busyOrgs = new Set((stillProc ?? []).map((r) => String(r.org_id ?? 'null')));
+      if (!cfg.perSpaceQueue && stillProc && stillProc.length > 0) {
         return { dispatched: null, reason: 'engine busy (row processing)' };
       }
 
@@ -226,6 +292,39 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       // stamped rows on a schedule and no screen or query ever looked. FIFO has no
       // lock to persist. The columns keep every value they already hold.
 
+      // D-PER-SPACE - one dispatch per IDLE space, up to the per-tick ceiling.
+      //    A space with a row already processing is skipped. Every other space
+      //    dispatches its own next order in this same tick. Ordering WITHIN a
+      //    space is computeQueuePlan(), unchanged, now called once per space.
+      if (cfg.perSpaceQueue) {
+        const byOrg = new Map();
+        for (const r of rows) {
+          const k = String(r.org_id ?? 'null');
+          if (!byOrg.has(k)) byOrg.set(k, []);
+          byOrg.get(k).push(r);
+        }
+
+        const sent = [];
+        for (const [orgKey, orgRows] of byOrg) {
+          if (sent.length >= cfg.maxDispatchPerTick) break;
+          if (busyOrgs.has(orgKey)) continue;
+          const orgDispatchable = orgRows.filter((r) => r.status === 'pending' && !r.job_id);
+          if (orgDispatchable.length === 0) continue;
+          const orgPlan = computeQueuePlan(orgRows, Date.now());
+          const top = orgPlan.pending.find((p) => orgDispatchable.some((d) => d.id === p.row.id));
+          if (!top) continue;
+          const orgPick = orgDispatchable.find((d) => d.id === top.row.id);
+          if (!orgPick) continue;
+          const res = await claimAndDispatch(orgPick, now);
+          if (res && res.dispatched) sent.push(res.dispatched);
+        }
+        if (sent.length === 0) {
+          return { dispatched: null, reason: 'no idle space with dispatchable pending' };
+        }
+        log('info', 'Runner: per-space tick dispatched', { count: sent.length, orders: sent });
+        return { dispatched: sent.join(','), reason: 'dispatched (per-space)', count: sent.length };
+      }
+
       // D. PICK — first plan.pending row that is pending AND has no job_id.
       const dispatchable = rows.filter((r) => r.status === 'pending' && !r.job_id);
       if (dispatchable.length === 0) return { dispatched: null, reason: 'no dispatchable pending' };
@@ -234,51 +333,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       const pick = dispatchable.find((d) => d.id === topPending.row.id);
       if (!pick) return { dispatched: null, reason: 'no dispatchable pending' };
 
-      // E. ATOMIC CLAIM — the .eq(status,pending).is(job_id,null) guards ARE the lock.
-      const { data: claimed, error: claimErr } = await supabaseAdmin
-        .from('os_queue')
-        .update({ status: 'processing', started_at: new Date().toISOString() })
-        .eq('id', pick.id)
-        .eq('status', 'pending')
-        .is('job_id', null)
-        .select();
-      if (claimErr) {
-        log('warn', 'Runner: claim update errored', { id: pick.id, error: claimErr.message });
-        return { dispatched: null, reason: `claim errored: ${claimErr.message}` };
-      }
-      if (!claimed || claimed.length === 0) {
-        return { dispatched: null, reason: 'claim lost (raced)' };
-      }
+      return await claimAndDispatch(pick, now);
 
-      // F. DISPATCH — reuse the existing async path IN-PROCESS. Exactly the 5 client fields.
-      const jobBody = {
-        figmaUrl: pick.figma_url,
-        darkMode: pick.dark_mode,
-        orderId: pick.order_id,
-        tatHours: Number(pick.tat_hours),
-      };
-      if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
-
-      const requestId = `runner_${now}_${runnerReqCounter++}`;
-      let jobId;
-      try {
-        const result = await startFigmaJobAsync({ body: jobBody, requestId, user: null, headers: {} });
-        if (result && result.error) {
-          throw new Error(`${result.error}${result.details ? `: ${result.details}` : ''}`);
-        }
-        jobId = result && result.jobId;
-        if (!jobId) throw new Error('async path returned no jobId');
-      } catch (err) {
-        const msg = `Runner dispatch failed: ${err.message}`;
-        await settleFailed(pick.id, msg);
-        log('error', 'Runner: dispatch failed', { id: pick.id, order: pick.order_id, error: err.message });
-        return { dispatched: null, reason: msg };
-      }
-
-      // On success → persist job_id onto the os_queue row (the poller/adopt watches it).
-      await updateRow(pick.id, { job_id: jobId });
-      log('info', 'Runner: dispatched order', { id: pick.id, order: pick.order_id, jobId, requestId });
-      return { dispatched: pick.order_id, reason: 'dispatched', jobId };
     } catch (err) {
       log('error', 'Runner: tick crashed', { error: err.message, stack: err.stack?.substring(0, 600) });
       return { dispatched: null, reason: `tick crashed: ${err.message}` };
