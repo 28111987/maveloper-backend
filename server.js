@@ -18,6 +18,7 @@ import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
+import { createSpacesRoutes } from "./spaces.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
@@ -8226,6 +8227,8 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 // to), but .start() no-ops unless RUNNER_ENABLED === "true" â€” the dark build
 // never ticks, never heartbeats, never writes. See queue-runner.js.
 // =====================================================================
+createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
+
 const queueRunner = createQueueRunner({
   supabaseAdmin,
   startFigmaJobAsync,
