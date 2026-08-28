@@ -394,6 +394,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       orphanMs: cfg.orphanMs,
       stuckMs: cfg.stuckMs,
       heartbeatMs: cfg.heartbeatMs,
+      perSpaceQueue: cfg.perSpaceQueue,
+      maxDispatchPerTick: cfg.maxDispatchPerTick,
       supabase: !!supabaseAdmin,
     });
     if (!cfg.enabled) return;
