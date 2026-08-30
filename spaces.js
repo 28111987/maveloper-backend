@@ -71,6 +71,10 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
         const [people, queue, owner] = await Promise.all([
           supabaseAdmin.from('email_allowlist').select('email', { count: 'exact', head: true }).eq('org_id', o.id),
           supabaseAdmin.from('os_queue').select('id', { count: 'exact', head: true }).eq('org_id', o.id),
+          // WHO the space belongs to. The destructure asked for this and the query
+          // was never added, so owner was undefined on every row and the column
+          // read none for every space.
+          supabaseAdmin.from('email_allowlist').select('email').eq('org_id', o.id).eq('role', 'owner').limit(1),
         ]);
         rows.push({
           ...o,
