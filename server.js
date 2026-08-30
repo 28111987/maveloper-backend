@@ -4314,7 +4314,10 @@ app.use(cors({
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
-  methods: ["GET", "POST"],
+  // DELETE is here for /os/spaces/:slug. Without it the browser refuses the
+  // preflight and the request never leaves, which reads on screen as a dialog
+  // that closes and does nothing.
+  methods: ["GET", "POST", "DELETE"],
   credentials: false,
 }));
 
