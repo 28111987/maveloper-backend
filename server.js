@@ -379,18 +379,25 @@ const supabaseAdmin = supabaseConfigured
 // =====================================================================
 
 /**
- * Verifies a Supabase JWT sent in the `Authorization: Bearer <token>` header.
- * On success, populates `req.user` with `{ id, email, role }` and calls next().
- * On failure, returns 401.
+ * VERIFIED BY SUPABASE, NOT BY A SHARED SECRET.
  *
- * Use on routes that require auth:
- *   app.post('/api/drafts/save-generated', requireAuth, handler);
+ * This read jwt.verify(token, SUPABASE_JWT_SECRET, { algorithms: ['HS256'] }).
+ * Supabase has since moved the project to asymmetric signing keys and now issues
+ * ES256 tokens, so every valid token was rejected with 'invalid algorithm' and
+ * EVERY authenticated route answered 401: run-next, provenance and spaces alike.
+ * Generation kept working only because /generate uses optionalAuth, which never
+ * rejects - so the failure was invisible on the one path anybody was watching.
+ *
+ * Asking Supabase is the fix rather than adding ES256 to the list: the algorithm
+ * is Supabase's to choose and it has changed once already. getUser verifies the
+ * signature against the project's own keys, so the next rotation costs nothing.
+ * It also checks revocation, which a local signature check cannot.
  */
-function requireAuth(req, res, next) {
-  if (!SUPABASE_JWT_SECRET) {
+async function requireAuth(req, res, next) {
+  if (!supabaseAdmin) {
     return res.status(503).json({
       error: "Auth not configured",
-      details: "Backend is missing SUPABASE_JWT_SECRET. Contact admin.",
+      details: "Backend has no Supabase client. Contact admin.",
     });
   }
 
@@ -401,14 +408,17 @@ function requireAuth(req, res, next) {
   }
 
   try {
-    const decoded = jwt.verify(match[1], SUPABASE_JWT_SECRET, {
-      algorithms: ["HS256"],
-      audience: "authenticated",
-    });
+    const { data, error } = await supabaseAdmin.auth.getUser(match[1]);
+    if (error || !data?.user) {
+      return res.status(401).json({
+        error: "Invalid or expired token",
+        details: error?.message || "Supabase did not recognise this token",
+      });
+    }
     req.user = {
-      id: decoded.sub,
-      email: decoded.email,
-      role: decoded.role,
+      id: data.user.id,
+      email: data.user.email,
+      role: data.user.role,
     };
     return next();
   } catch (err) {
@@ -420,27 +430,33 @@ function requireAuth(req, res, next) {
 }
 
 /**
- * Populates `req.user` if a valid token is present, but never rejects the
- * request. Use on /generate so existing clients keep working while also
- * tagging generation output with user_id when a user is identified.
+ * Populates req.user if a valid token is present, but NEVER rejects. Used on
+ * /generate so existing clients keep working while generation output is tagged
+ * with user_id when a user is identified.
+ *
+ * IT HAD THE SAME HS256 DEFECT AS requireAuth AND IT FAILED SILENTLY, which is
+ * worse: it never rejected, so every order kept succeeding while user_id was
+ * quietly null on all of them. A guard that fails loudly gets fixed; one that
+ * fails open loses data for as long as nobody looks.
  */
-function optionalAuth(req, res, next) {
-  if (!SUPABASE_JWT_SECRET) return next();
+async function optionalAuth(req, res, next) {
+  if (!supabaseAdmin) return next();
 
   const authHeader = req.headers.authorization || "";
   const match = authHeader.match(/^Bearer\s+(.+)$/);
   if (!match) return next();
 
   try {
-    const decoded = jwt.verify(match[1], SUPABASE_JWT_SECRET, {
-      algorithms: ["HS256"],
-      audience: "authenticated",
-    });
-    req.user = { id: decoded.sub, email: decoded.email, role: decoded.role };
+    const { data } = await supabaseAdmin.auth.getUser(match[1]);
+    if (data?.user) {
+      req.user = { id: data.user.id, email: data.user.email, role: data.user.role };
+    }
   } catch {
-    // Ignore â€” treat as anonymous.
+    // Deliberately swallowed: this middleware identifies when it can and stays
+    // out of the way when it cannot. Rejecting here would break /generate for
+    // every caller that has no token at all, which is the case it exists for.
   }
-  next();
+  return next();
 }
 
 // =====================================================================
