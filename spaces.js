@@ -68,19 +68,25 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
       // everything still appears. An absent space reads as absent, not as zero.
       const rows = [];
       for (const o of orgs ?? []) {
-        const [people, queue, owner] = await Promise.all([
+        const [people, queue, owner, last] = await Promise.all([
           supabaseAdmin.from('email_allowlist').select('email', { count: 'exact', head: true }).eq('org_id', o.id),
           supabaseAdmin.from('os_queue').select('id', { count: 'exact', head: true }).eq('org_id', o.id),
           // WHO the space belongs to. The destructure asked for this and the query
           // was never added, so owner was undefined on every row and the column
           // read none for every space.
           supabaseAdmin.from('email_allowlist').select('email').eq('org_id', o.id).eq('role', 'owner').limit(1),
+          // WHEN THE SPACE LAST DELIVERED. A count of orders says how much a
+          // client has ever done; this says whether they are still doing it, which
+          // is the question a space with 297 orders and nothing since June raises.
+          supabaseAdmin.from('os_queue').select('finished_at').eq('org_id', o.id)
+            .eq('status', 'delivered').order('finished_at', { ascending: false }).limit(1),
         ]);
         rows.push({
           ...o,
           people: people.count ?? null,
           orders: queue.count ?? null,
           ownerEmail: owner?.data?.[0]?.email ?? null,
+          lastActiveAt: last?.data?.[0]?.finished_at ?? null,
         });
       }
       return res.json({ spaces: rows, platformOwners: owners.length });
