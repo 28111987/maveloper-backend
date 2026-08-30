@@ -68,11 +68,16 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
       // everything still appears. An absent space reads as absent, not as zero.
       const rows = [];
       for (const o of orgs ?? []) {
-        const [people, queue] = await Promise.all([
+        const [people, queue, owner] = await Promise.all([
           supabaseAdmin.from('email_allowlist').select('email', { count: 'exact', head: true }).eq('org_id', o.id),
           supabaseAdmin.from('os_queue').select('id', { count: 'exact', head: true }).eq('org_id', o.id),
         ]);
-        rows.push({ ...o, people: people.count ?? null, orders: queue.count ?? null });
+        rows.push({
+          ...o,
+          people: people.count ?? null,
+          orders: queue.count ?? null,
+          ownerEmail: owner?.data?.[0]?.email ?? null,
+        });
       }
       return res.json({ spaces: rows, platformOwners: owners.length });
     } catch (err) {
@@ -94,17 +99,18 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
     }
 
     try {
-      // The slug is the identity. Refuse a collision rather than suffixing: a
-      // silently renamed space is a space nobody can find again, and a deleted
-      // space keeps its slug so it can never be recycled.
+      // ONLY A LIVE SPACE BLOCKS A NAME. A closed one used to block it forever, on
+      // the reasoning that a slug is an identity and identities are never recycled.
+      // It is not: the identity is orgs.id, which is what org_id points at on every
+      // table and what RLS filters on. The slug is a label, and retiring a label
+      // stopped nobody - the same client under the next name went straight through.
+      // A rule that only appears to protect something is worse than no rule.
       const { data: clash } = await supabaseAdmin
-        .from('orgs').select('id,is_deleted').eq('slug', slug).maybeSingle();
+        .from('orgs').select('id,is_deleted').eq('slug', slug).eq('is_deleted', false).maybeSingle();
       if (clash) {
         return res.status(409).json({
-          error: 'The slug "' + slug + '" is already taken',
-          details: clash.is_deleted
-            ? 'It belonged to a space that has been deleted. Slugs are never reused, so this one is retired permanently. Choose another.'
-            : 'A live space already uses it. Choose another.',
+          error: 'A live space is already called ' + name,
+          details: 'Two open spaces cannot share one name. Choose another.',
         });
       }
 
@@ -185,7 +191,7 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
       log('warn', 'spaces: deleted', { slug, revoked, by: req.user?.email });
       return res.json({
         ok: true, slug, revoked: revoked ?? 0,
-        note: 'The space is closed and its people can no longer sign in. Its orders and audit rows are kept, and the slug is retired permanently.',
+        note: 'The space is closed and its people can no longer sign in. Its orders and audit rows are kept.',
       });
     } catch (err) {
       log('error', 'spaces: delete failed', { error: err.message });
