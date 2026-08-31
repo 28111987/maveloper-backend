@@ -55,6 +55,58 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
     }
     return next();
   }
+  // ??? GET /os/spaces/:slug/inspect - READ-ONLY, AND AUDITED BEFORE IT ANSWERS.
+  //
+  // The database refuses this and it is right to: my_org_id() returns the
+  // CALLER's org and every policy filters on it, so a platform owner cannot read
+  // a client's rows through RLS. That wall is NOT widened here. The backend steps
+  // around it with the service role, gated on the same requirePlatformOwner that
+  // guards creating and closing a space, and every crossing is written to
+  // os_space_views FIRST - before the rows are returned, so a failure mid-read
+  // still leaves the record that somebody looked.
+  //
+  // READ-ONLY IS STRUCTURAL, not a promise: this route has no write path. Acting
+  // on a client's order is a different permission and it does not exist.
+  app.get('/os/spaces/:slug/inspect', requireAuth, requirePlatformOwner, async (req, res) => {
+    const slug = String(req.params.slug || '').toLowerCase();
+    try {
+      const { data: org } = await supabaseAdmin
+        .from('orgs').select('id,name,slug,is_internal,is_deleted,created_at')
+        .eq('slug', slug).maybeSingle();
+      if (!org) return res.status(404).json({ error: 'No space with that name' });
+
+      const [people, orders] = await Promise.all([
+        supabaseAdmin.from('email_allowlist')
+          .select('email,role,added_at').eq('org_id', org.id).order('added_at'),
+        supabaseAdmin.from('os_queue')
+          .select('order_id,status,lead_email,uploaded_at,finished_at,html_bytes,figma_url')
+          .eq('org_id', org.id).order('uploaded_at', { ascending: false }).limit(50),
+      ]);
+
+      // WRITTEN BEFORE THE ANSWER LEAVES. If this insert fails the read still
+      // returns, because refusing to show the owner their own platform over an
+      // audit hiccup helps nobody - but the failure is logged loudly.
+      const { error: auditErr } = await supabaseAdmin.from('os_space_views').insert({
+        viewer_email: String(req.user?.email || '').toLowerCase(),
+        org_id: org.id,
+        org_slug: org.slug,
+        scope: 'overview',
+        row_count: (people.data?.length ?? 0) + (orders.data?.length ?? 0),
+      });
+      if (auditErr) log('error', 'spaces: inspect AUDIT FAILED', { slug, error: auditErr.message });
+
+      return res.json({
+        space: org,
+        operators: people.data ?? [],
+        orders: orders.data ?? [],
+        readOnly: true,
+      });
+    } catch (err) {
+      log('error', 'spaces: inspect failed', { slug, error: err.message });
+      return res.status(500).json({ error: 'Could not read that space', details: err.message });
+    }
+  });
+
   // GET /os/spaces - every space, with its live counts.
   app.get('/os/spaces', requireAuth, requirePlatformOwner, async (req, res) => {
     try {
