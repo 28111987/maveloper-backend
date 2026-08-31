@@ -183,9 +183,31 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
       // SEED THE FIRST OWNER IN THE SAME REQUEST. A space with no owner is
       // unreachable: nobody can sign in, and nobody can invite anybody. If this
       // fails the org is removed rather than left as an orphan.
-      const { error: seedErr } = await supabaseAdmin.from('email_allowlist').insert({
-        email: ownerEmail, is_owner: true, role: 'owner', org_id: org.id,
-      });
+      // ??? TWO SEATS, ONE STATEMENT. The client's owner, and the platform owner
+      // who created the space.
+      //
+      // The second is what makes a space REACHABLE by its creator at all.
+      // my_org_id() reads profiles.org_id and every RLS policy follows it, so
+      // entering a client space means pointing that column at this org - and
+      // set_my_org refuses an org the caller holds no seat in. No seat here, no
+      // way in later, however senior the account.
+      //
+      // ?? IT IS HIDDEN FROM THE CLIENT'S OPERATORS LIST, AND THAT IS A DECISION
+      // TAKEN PROVISIONALLY, NOT A DESIGN. It means a screen built to be honest
+      // carries a blind spot and a client cannot audit access they cannot see.
+      // The argument for declaring it instead is written up in
+      // MAVLOPER_PENDING_HIDDEN_SEAT_31AUG2026.md and is to be revisited before
+      // the first space is handed over.
+      //
+      // ONE INSERT, so the rollback below covers both rows. A space with an owner
+      // its creator cannot reach is as broken as one with no owner at all.
+      const platformSeats = owners.map((o) => ({
+        email: o, is_owner: false, role: 'member', org_id: org.id,
+      })).filter((r) => r.email !== ownerEmail);
+      const { error: seedErr } = await supabaseAdmin.from('email_allowlist').insert([
+        { email: ownerEmail, is_owner: true, role: 'owner', org_id: org.id },
+        ...platformSeats,
+      ]);
       if (seedErr) {
         await supabaseAdmin.from('orgs').delete().eq('id', org.id);
         throw new Error('the space was rolled back because its first owner could not be added: ' + seedErr.message);
