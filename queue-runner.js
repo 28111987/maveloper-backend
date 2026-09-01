@@ -284,7 +284,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       // second, unrelated change riding along with the ordering one.
       const { data: activeRows, error: activeErr } = await supabaseAdmin
         .from('os_queue')
-        .select('id,order_id,tat_hours,uploaded_at,status,lead_user_id,manual_rank,effective_deadline,locked,locked_at,figma_url,esp,dark_mode,job_id')
+        .select('id,order_id,org_id,tat_hours,uploaded_at,status,lead_user_id,manual_rank,effective_deadline,locked,locked_at,figma_url,esp,dark_mode,job_id')
         .in('status', ['pending', 'processing']);
       if (activeErr) {
         log('warn', 'Runner: active-rows load failed', { error: activeErr.message });
