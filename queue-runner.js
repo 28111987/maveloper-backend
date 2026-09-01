@@ -316,15 +316,14 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         const sent = [];
         for (const [orgKey, orgRows] of byOrg) {
           if (sent.length >= cfg.maxDispatchPerTick) break;
-        // TEMPORARY INSTRUMENTATION - 01 Sep. Four theories about why a space
-        // dispatched twice have failed on a read, so the runner now states what
-        // it actually saw instead of leaving it to be inferred afterwards.
-        log('info', 'Runner: per-space decision', {
-          orgKey,
-          busy: Array.from(busyOrgs),
-          isBusy: busyOrgs.has(orgKey),
-          processingRows: (stillProc ?? []).length,
-        });
+        // THE PER-SPACE LOCK, and it is the whole rule: a space never builds two
+        // orders at once, and never waits for another space.
+        //
+        // It did not hold until 01 Sep because org_id was missing from the plan's
+        // select list above, so every row's key came out as the string 'null' and
+        // matched nothing in busyOrgs. The guard was correct; the data reaching it
+        // was empty. The diagnosis, and the log line that found it in one tick,
+        // are in MAVLOPER_PER_SPACE_LOCK_DIAGNOSIS_01SEP2026.md.
         if (busyOrgs.has(orgKey)) continue;
           const orgDispatchable = orgRows.filter((r) => r.status === 'pending' && !r.job_id);
           if (orgDispatchable.length === 0) continue;
