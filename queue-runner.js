@@ -316,7 +316,16 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         const sent = [];
         for (const [orgKey, orgRows] of byOrg) {
           if (sent.length >= cfg.maxDispatchPerTick) break;
-          if (busyOrgs.has(orgKey)) continue;
+        // TEMPORARY INSTRUMENTATION - 01 Sep. Four theories about why a space
+        // dispatched twice have failed on a read, so the runner now states what
+        // it actually saw instead of leaving it to be inferred afterwards.
+        log('info', 'Runner: per-space decision', {
+          orgKey,
+          busy: Array.from(busyOrgs),
+          isBusy: busyOrgs.has(orgKey),
+          processingRows: (stillProc ?? []).length,
+        });
+        if (busyOrgs.has(orgKey)) continue;
           const orgDispatchable = orgRows.filter((r) => r.status === 'pending' && !r.job_id);
           if (orgDispatchable.length === 0) continue;
           const orgPlan = computeQueuePlan(orgRows, Date.now());
