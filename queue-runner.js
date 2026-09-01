@@ -256,10 +256,19 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       //    also reads org_id so a space is judged busy on its OWN rows alone.
       //    With the flag unset the early return below is the original global
       //    lock, unchanged: one processing row anywhere holds the whole runner.
-      const { data: stillProc } = await supabaseAdmin
+      // THE SECOND SCAN READS ITS ERROR TOO. The scan at line 165 already does,
+      // and fails closed; this one destructured data alone and threw the error
+      // away, so a failure here left busyOrgs EMPTY and every space read as idle.
+      // On 31 Aug two orders in the SAME space overlapped by eighty seconds
+      // because of it. A guard that fails open does the wrong thing quietly.
+      const { data: stillProc, error: stillErr } = await supabaseAdmin
         .from('os_queue')
         .select('id,org_id')
         .eq('status', 'processing');
+      if (stillErr) {
+        log('warn', 'Runner: per-space busy scan failed - dispatching nothing this tick', { error: stillErr.message });
+        return { dispatched: null, reason: 'cannot read which spaces are busy' };
+      }
       const busyOrgs = new Set((stillProc ?? []).map((r) => String(r.org_id ?? 'null')));
       if (!cfg.perSpaceQueue && stillProc && stillProc.length > 0) {
         return { dispatched: null, reason: 'engine busy (row processing)' };
