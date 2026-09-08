@@ -362,8 +362,53 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
 
   // ---- heartbeat: probe the Mac bridge and persist runner_status ----
 
+  // DO NOT WAKE THE ENGINE WHEN THERE IS NOTHING TO DO. MEASURED 07-08 SEP:
+  //   GET /health every 60 seconds is 1,440 requests a day, and EVERY REQUEST RESETS
+  //   CLOUD RUN IS IDLE-SHUTDOWN TIMER while instance-based billing charges the whole
+  //   instance lifetime. 42 orders x 6 minutes = 4.2 hours of real build time against
+  //   720 hours billed - 99.4 percent idle, Rs 88.67 per email of which about Rs 2 is
+  //   compute. Widening the interval to 30 minutes HALVED it and could never do more:
+  //   Cloud Run keeps an instance warm about 15 minutes after a request, so a 30-minute
+  //   poll leaves the container awake HALF of every hour, forever. The owner watched the
+  //   bill move Rs 6 in minutes with no order running and was right.
+  //   engine_online is written to runner_status and READ BY NOTHING IN THIS BACKEND -
+  //   git grep confirms it. Its only consumer is the status light in the console. So a
+  //   stale light while the queue is empty costs nothing, and the moment an order
+  //   arrives the dispatch tick (a SEPARATE timer at RUNNER_POLL_MS, which never calls
+  //   /health) wakes the engine anyway and the next heartbeat reports the truth.
+  //   GENERATION SPEED IS UNAFFECTED: dispatch does not depend on engine_online.
+  //   counts() is the same Supabase query the status route already makes; Supabase is
+  //   not billed per request and never touches Cloud Run.
   async function heartbeat() {
     state.runnerLastSeen = new Date().toISOString();
+    if (!(Number(env.HEARTBEAT_ALWAYS) === 1)) {
+      try {
+        const c = await counts();
+        // counts() SWALLOWS ITS OWN ERROR and returns {processing:null,pending:null} on
+        //   any Supabase failure, so Number(null)||0 would read as ZERO WORK and skip the
+        //   probe forever during an outage - the console would never learn the engine was
+        //   down. NULL MEANS UNKNOWN AND UNKNOWN MUST PROBE. Only two real zeroes skip.
+        const p = c.pending, q = c.processing;
+        const known = Number.isFinite(Number(p)) && p !== null && Number.isFinite(Number(q)) && q !== null;
+        if (known && Number(p) === 0 && Number(q) === 0) {
+          state.engineOnline = null;
+          state.engineError = "idle - not probed (no pending or processing orders)";
+          try {
+            await supabaseAdmin.from("runner_status").upsert({
+              id: "singleton",
+              runner_last_seen: state.runnerLastSeen,
+              engine_online: null,
+              engine_last_ok: state.engineLastOk,
+              engine_error: state.engineError,
+              updated_at: new Date().toISOString(),
+            });
+          } catch (e) { log("warn", "Runner: idle runner_status upsert threw", { error: e.message }); }
+          return;
+        }
+      } catch (e) {
+        log("warn", "Runner: idle check failed, probing anyway", { error: e.message });
+      }
+    }
     let online = false;
     let err = null;
     if (cfg.bridgeUrl) {
