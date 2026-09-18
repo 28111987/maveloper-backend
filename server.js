@@ -23,6 +23,11 @@ import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
 import { uploadImagesWithConcurrency, readConcurrency } from "./dropbox-upload.js";
+// ★★ RUN 3 - PER-SPACE FIGMA CREDENTIALS. Built dark in runs 1 and 2; MOUNTED here.
+// Everything this module does fails OPEN to the global Mavlers token, so a space
+// with nothing stored behaves exactly as it does today.
+import { resolveFigmaToken, describeResolution, credentialProvenanceLine } from "./figma-credential.js";
+import { createFigmaCredentialRoutes } from "./figma-credential-routes.js";
 import {
   sanitizeOrderId,
   collectReferencedUrls,
@@ -4128,7 +4133,7 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, log, assetSink }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, log, assetSink }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
   }
@@ -4194,6 +4199,29 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     };
   }
 
+  // ── ★★ RUN 3: THE CREDENTIAL'S ONE HOP TO THE ENGINE. ───────────────────
+  // The engine (_autonomous_24H) makes its OWN Figma calls and reads
+  // $FIGMA_TOKEN to do it. The bridge box has no Supabase client and no service
+  // role, so it cannot resolve a credential itself - the backend, which just
+  // did, hands it over here.
+  //
+  // ★ IT TRAVELS IN THE POST BODY, WHICH IS THE SAFE CHANNEL OF THE THREE.
+  //   - argv is world-readable to any other process on the box (`ps`, Task
+  //     Manager), AND bridge-server.mjs:270 prints every flag verbatim into
+  //     retained logs. Two independent leaks. Never argv.
+  //   - a file the child reads by a path printed in a log is the same leak with
+  //     an extra step.
+  //   - this body already carries the design spec over the same authenticated
+  //     HTTPS hop, and the bridge does not log it. The bridge puts this value
+  //     straight into the spawn `env` and nowhere else.
+  //
+  // ★ SEPARATE FROM payload.figma ON PURPOSE. That object is logged by name at
+  // bridge-server.mjs:267 (`figma coords threaded: fileKey=... nodeId=...`).
+  // Putting the token inside it would have printed it on the very next line.
+  if (typeof figmaToken === "string" && figmaToken) {
+    payload.figmaToken = figmaToken;
+  }
+
   log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
     requestId,
     maveloperJobId,
@@ -4203,6 +4231,9 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     specSections: designSpec?.sections?.length || 0,
     hasReference: !!referenceHtml,
     hasImage: !!designImageBase64,
+    // A BOOLEAN, never the value. Enough to answer "did the engine get a token
+    // for this order at all" from the logs without the logs holding one.
+    figmaTokenThreaded: Boolean(payload.figmaToken),
   });
 
   // Set up the promise BEFORE dispatching, so a fast bridge can't race the
@@ -5794,10 +5825,44 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
       });
     }
 
-    if (!figmaConfigured) {
+    // ── ★★ RUN 3: RESOLVE THIS ORDER'S FIGMA CREDENTIAL. ────────────────────
+    // This is the point at which an order stops being "a Maveloper order" and
+    // becomes "an order belonging to a space". `orgId` arrives on the body from
+    // queue-runner.js, which joins it off os_queue.org_id.
+    //
+    // ★ IT CANNOT FAIL THE ORDER. Every error path inside resolveFigmaToken -
+    // no org, no table, Supabase down, row absent, revoked, expired, wrong
+    // sealing key, malformed - lands on `globalToken`, which is the same
+    // FIGMA_API_TOKEN this handler used before this block existed. A space with
+    // no credential is byte-identical to today.
+    const figmaCred = await resolveFigmaToken(req.body?.orgId, {
+      db: supabaseAdmin,
+      globalToken: FIGMA_API_TOKEN,
+    });
+    const figmaToken = figmaCred.token;
+
+    // ★ THE ONLY SAFE SHAPE TO LOG. describeResolution replaces `token` with a
+    // BOOLEAN, so there is no code path by which this line can print a
+    // credential - the value is simply not present in the object being
+    // serialised. log() at :4365 JSON-stringifies its extras with NO REDACTION,
+    // which is exactly why what is handed to it must be incapable of carrying a
+    // secret rather than merely trusted not to.
+    log("info", "Figma credential resolved", {
+      requestId: req.id,
+      ...describeResolution(figmaCred),
+    });
+
+    // ★ THE GUARD NOW ASKS THE QUESTION IT MEANT TO ASK. It used to test the
+    // module-scope FIGMA_API_TOKEN. That would 503 a space that HAS pasted its
+    // own working credential merely because the Mavlers global was unset. When
+    // no space credential exists the resolved token IS the global, so this is
+    // identical to the old check in every case that exists today.
+    if (!figmaToken) {
       return res.status(503).json({
         error: "Figma not configured",
-        details: "FIGMA_API_TOKEN env var is not set on the backend. Contact the Maveloper admin.",
+        details:
+          "No Figma credential is available for this order. Either set the FIGMA_API_TOKEN env var " +
+          "on the backend, or add this space's own Figma token in the space settings.",
         requestId: req.id,
       });
     }
@@ -5814,7 +5879,9 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     try {
       figmaResult = await figmaToDesignSpec({
         figmaUrl,
-        token: FIGMA_API_TOKEN,
+        // ★ RUN 3 SITE 1 OF 3. Reads the client's design file. Was the Mavlers
+        // global; is now this space's own credential when one is stored.
+        token: figmaToken,
         devOverrides: { emailWidth, primaryFont, secondaryFont },
       });
     } catch (figmaErr) {
@@ -5978,7 +6045,8 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
           ? await renderFigmaNodes({
               fileKey,
               nodeIds: allNodeIds,
-              token: FIGMA_API_TOKEN,
+              // ★ RUN 3 SITE 2 OF 3. Renders nodes out of the client's file.
+              token: figmaToken,
               logFn: (level, msg, meta) => log(level, msg, { requestId: req.id, ...meta }),
             })
           : new Map();
@@ -6003,7 +6071,8 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
           try {
             const refsNeeded = bgImageNodes.filter((b) => b.imageRef).map((b) => b.imageRef);
             if (refsNeeded.length > 0) {
-              const rawUrlMap = await fetchRawImageRefUrls({ fileKey, token: FIGMA_API_TOKEN });
+              // ★ RUN 3 SITE 3 OF 3. Fetches raw image-ref URLs from the file.
+              const rawUrlMap = await fetchRawImageRefUrls({ fileKey, token: figmaToken });
               for (const bg of bgImageNodes) {
                 if (!bg.imageRef) continue;
                 const signedUrl = rawUrlMap.get(bg.imageRef);
@@ -6332,6 +6401,11 @@ ${specs.join("\n\n")}
           figmaFileKey: fileKey,
           figmaNodeId: nodeId,
           figmaDesignWidth: finalWidth,
+          // ★★ RUN 3: THE SAME credential this handler resolved and used for its
+          // own three Figma calls. The engine re-reads the design from Figma
+          // itself, so it needs the identical token or the two halves of one
+          // order would read from two different Figma accounts.
+          figmaToken,
           log,
           assetSink: compilerAssetSink,
         });
@@ -6463,6 +6537,14 @@ ${specs.join("\n\n")}
       imageExportReport,                                    // v6.1.0: visibility into export status
       model: CLAUDE_MODEL,                                  // v7.0.0: diagnostic â€” which Claude model produced this
       engineUsed,                                           // v9.0.2: "claude-code" | "console" | "console-fallback"
+      // ★★ RUN 3 - THE PROVENANCE SIGNAL. WHICH FIGMA ACCOUNT PAID FOR THIS.
+      // A silent fallback to the Mavlers token is INVISIBLE FOREVER unless every
+      // delivered order says which credential produced it. Two fields, neither
+      // of which can carry the token: a one-line sentence for a human, and the
+      // structured resolution (whose `token` is a boolean by construction) for
+      // anything that wants to assert on it.
+      figmaCredential: credentialProvenanceLine(figmaCred),
+      figmaCredentialDetail: describeResolution(figmaCred),
       referenceHtmlUsed: Boolean(REFERENCE_CACHE.get(fileKey)), // v8.0.0: was a human-coded reference injected
       figmaSource: {
         fileKey,
@@ -6712,9 +6794,22 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
         const ppAssertions = Array.isArray(result.body.postProcessAssertions)
           ? result.body.postProcessAssertions
           : [];
-        const progressMsg = ppAssertions.length > 0
+        // RUN 3 - THE PROVENANCE SIGNAL, MADE DURABLE.
+        // The response body is ephemeral: the queue runner is the caller and
+        // nothing persists it. progress_message IS persisted, IS returned by
+        // /job-status, and IS what the console already reads. v9.7.0 set this
+        // precedent by surfacing post-process assertions the same way.
+        //
+        // NOT A SIDECAR FILE. Provenance sidecars in this system have been
+        // clobbered before - D117/D121 disclosures were overwritten and 0 of 79
+        // sidecars ever carried them. A column on the job row cannot be
+        // silently overwritten by a later, unrelated writer.
+        const credLine = typeof result.body.figmaCredential === "string"
+          ? " | " + result.body.figmaCredential
+          : "";
+        const progressMsg = (ppAssertions.length > 0
           ? `Generation complete in ${durationSec}s â€” POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
-          : `Generation complete in ${durationSec}s`;
+          : `Generation complete in ${durationSec}s`) + credLine;
         await updateJobStatus(jobId, {
           status: "completed",
           result_html: result.body.html,
@@ -8247,6 +8342,14 @@ app.post("/approve", generateLimiter, optionalAuth, async (req, res) => {
 // never ticks, never heartbeats, never writes. See queue-runner.js.
 // =====================================================================
 createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
+
+// THE MOUNT. Until this line existed, figma-credential-routes.js was imported by
+// nothing, so all four routes 404d and no client could store a token - the whole
+// per-space credential path was inert. Same shape as createSpacesRoutes directly
+// above: same app, same supabaseAdmin, same requireAuth, same log, same env.
+// Fails OPEN. A space with no stored credential still resolves to the global
+// Mavlers token, so every existing order path behaves exactly as it does today.
+createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 
 const queueRunner = createQueueRunner({
   supabaseAdmin,

@@ -61,6 +61,11 @@ function row(o) {
     esp: "none",
     dark_mode: false,
     lead_user_id: "lead-1",
+    // ★ RUN 3. `org_id` is in the runner's select list and now rides the dispatch
+    // body. Default NULL, which is what every historical os_queue row actually
+    // holds - so the 53 assertions above this line keep exercising the
+    // no-credential path unchanged.
+    org_id: o.org_id ?? null,
   };
 }
 
@@ -468,6 +473,66 @@ function makeSupabaseFake(tables) {
   });
   const result = await runner.tick();
   ok(result.dispatched === "OF-picked", `manual_rank decides the dispatch (got ${result.dispatched})`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ★★ RUN 3 — THE org_id JOIN, AND THE NULL CASE IT MUST SURVIVE.
+// ═══════════════════════════════════════════════════════════════════════
+// The dispatch body is the ONLY channel by which generation can learn which
+// space an order belongs to. These assertions drive the REAL createQueueRunner
+// against the REAL fake Supabase and read the body it actually dispatched.
+{
+  const dispatchWith = async (orgId) => {
+    const rows = [row({ id: "solo", uploaded_at: iso(T0 - H), org_id: orgId })];
+    const { supabaseAdmin } = makeSupabaseFake({ os_queue: rows, maveloper_jobs: [] });
+    let body = null;
+    const runner = createQueueRunner({
+      supabaseAdmin,
+      startFigmaJobAsync: async (a) => { body = a.body; return { jobId: "job-org" }; },
+      log: () => {},
+      env: { RUNNER_ENABLED: "true" },
+    });
+    const res = await runner.tick();
+    return { body, res };
+  };
+
+  // ── THE HAPPY PATH ───────────────────────────────────────────────────
+  const ORG = "11111111-2222-3333-4444-555555555555";
+  {
+    const { body, res } = await dispatchWith(ORG);
+    ok(res.dispatched === "OF-solo", "JOIN: the row still dispatches normally");
+    ok(body != null && body.orgId === ORG,
+       `JOIN: a real org_id REACHES the dispatch body (got ${JSON.stringify(body && body.orgId)})`);
+  }
+
+  // ── ★ THE NULL CASE, TESTED EXPLICITLY. NOT JUST THE HAPPY PATH. ─────
+  // Historical orders carry a null org_id. The requirement is that the key is
+  // ABSENT, never the string "null" - a truthy "null" would sail past every
+  // downstream guard and then match no credential row, which resolves to the
+  // global token and looks EXACTLY like a space with nothing stored.
+  for (const [name, value] of [
+    ["null", null],
+    ["undefined", undefined],
+    ["empty string", ""],
+    ['the literal string "null"', "null"],
+    ['the literal string "undefined"', "undefined"],
+  ]) {
+    let body = null, threw = null;
+    try { ({ body } = await dispatchWith(value)); } catch (e) { threw = e; }
+    ok(threw === null, `JOIN/NULL: org_id = ${name} DOES NOT THROW`);
+    ok(body != null && !("orgId" in body),
+       `JOIN/NULL: org_id = ${name} OMITS the key entirely (got ${JSON.stringify(body && body.orgId)})`);
+    ok(body != null && body.orgId !== "null",
+       `JOIN/NULL: org_id = ${name} never becomes the STRING "null" (the lock bug)`);
+  }
+
+  // ── THE NON-REGRESSION. The other four fields are untouched. ─────────
+  {
+    const { body } = await dispatchWith(ORG);
+    ok(body.figmaUrl === "https://figma.com/file/solo" && body.orderId === "OF-solo"
+       && body.tatHours === 24 && body.darkMode === false,
+       "JOIN: the pre-existing dispatch fields are byte-identical");
+  }
 }
 
 // ── summary ───────────────────────────────────────────────────────────

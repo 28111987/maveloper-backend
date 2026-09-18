@@ -29,6 +29,11 @@
  */
 
 import { computeQueuePlan } from './queue-priority.js';
+// ★ The org-id normaliser lives WITH the resolver that consumes it, not as a
+// second copy here. One regex in four places is the defect asset-refs.js was
+// written to end, and an org-id rule that drifts between the producer and the
+// consumer reintroduces the "null" string bug on whichever side falls behind.
+import { normalisedOrgId as normaliseOrgId } from './figma-credential.js';
 
 export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env }) {
   const cfg = {
@@ -131,6 +136,30 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         tatHours: Number(pick.tat_hours),
       };
       if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
+
+      // ── ★★ THE JOIN. THE ONE LINE THAT MAKES AN ORDER USE ITS OWN SPACE'S
+      //    FIGMA CREDENTIAL. ────────────────────────────────────────────────
+      // `org_id` has been in the select list at the active-rows query all along
+      // (see section C). It simply never entered the dispatch body, so every
+      // order reached generation with no idea which space it belonged to and
+      // generation had no choice but the one global Mavlers token.
+      //
+      // ★ WHY normaliseOrgId AND NOT `String(pick.org_id ?? 'null')`.
+      // THAT EXACT SHAPE IS THE PER-SPACE LOCK BUG. Stringifying a null id
+      // turned every orgKey into the literal text "null", the lock silently
+      // never matched, and FOUR THEORIES WERE CHECKED AND ALL FOUR WERE WRONG
+      // before anyone read the select list. A literal "null" is truthy, so it
+      // sails past every `if (!orgId)` guard downstream and then matches no row
+      // - which resolves to the global token and is INDISTINGUISHABLE from a
+      // space that simply has no credential stored.
+      //
+      // So: set the key ONLY when there is a real id. Historical rows have a
+      // null org_id (they have a null user_id already), and for those the key is
+      // ABSENT rather than present-and-garbage. resolveFigmaToken then takes its
+      // `no-org-id` branch and returns the GLOBAL TOKEN WITHOUT THROWING, which
+      // is exactly today's behaviour for every order that predates this feature.
+      const orgId = normaliseOrgId(pick.org_id);
+      if (orgId !== null) jobBody.orgId = orgId;
 
       const requestId = `runner_${now}_${runnerReqCounter++}`;
       let jobId;
