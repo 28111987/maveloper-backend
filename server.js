@@ -236,6 +236,24 @@ const ALLOWED_ORIGINS = [
   "https://maveloper.lovable.app",
   "http://localhost:3000",
   "http://localhost:5173",
+  // ★ THE CONSOLE'S ACTUAL DEV PORT, and its absence has been costing reviews.
+  //   vite.config.ts pins `port: 8080`, so a developer running `npm run dev`
+  //   serves from an origin this list did not carry - while carrying 3000 and
+  //   5173, which nothing serves on. Every backend-backed panel therefore read
+  //   "Failed to fetch" locally, so the Admin screen could not be looked at
+  //   before it shipped. Four console deploys went out unreviewed for this
+  //   reason alone.
+  //
+  //   ★ AND A LOCALHOST ORIGIN IN A PRODUCTION ALLOW-LIST IS SAFE, which is
+  //   worth stating because it looks wrong at a glance. An Origin header is
+  //   set by the browser and cannot be forged by a page: a site at evil.com
+  //   sends Origin: https://evil.com and is refused. The only way a request
+  //   arrives claiming http://localhost:8080 is if it came from a page served
+  //   on that port on the reader's OWN machine - which means somebody is
+  //   already running code there, and CORS is no longer the boundary that
+  //   matters. It also carries no credentials: `credentials: false` below, so
+  //   no cookie or session rides along with it.
+  "http://localhost:8080",
 ];
 
 // =====================================================================
