@@ -306,6 +306,19 @@ section("5. THE WIRING — ★ RUN 3 INVERTED THIS SECTION ON PURPOSE");
        src !== "" && /figma-credential/.test(src),
        src === "" ? `${f} could not be read — the check is vacuous` : "the wiring is GONE; orders are back on the Mavlers token");
   }
+
+  // ★ FIGMA OAUTH RUN 1 PAYS FOR ITS TWO ADDITIONS TO §5b's exclusion set,
+  // the same way run 3 paid for server.js and queue-runner.js above: each
+  // excluded file is asserted here to actually reference the credential
+  // subsystem, by name, so the exclusion cannot hide a reference that has
+  // nothing to do with reuse.
+  for (const f of ["figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs"]) {
+    let src = "";
+    try { src = _rf(_here + f, "utf8"); } catch { /* handled below */ }
+    ok(`5  ${f} reuses the credential subsystem's helpers (figma oauth run 1)`,
+       src !== "" && /figma-credential/.test(src),
+       src === "" ? `${f} could not be read — the check is vacuous` : "no figma-credential reference found - the exclusion in §5b is unpaid for");
+  }
 }
 
 // ===========================================================================
@@ -335,7 +348,23 @@ section("5b. THE OLD NO-OP CHECK, KEPT FOR THE FILES THAT ARE STILL UNMOUNTED");
   // here and then asserted PRESENT by name in §5, so the exclusion cannot hide
   // a missing wiring - it is the same pay-for-your-exclusion discipline run 2
   // used for the figma-credential* prefix.
-  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js"]);
+  //
+  // ★ FIGMA OAUTH RUN 1 ADDS THREE MORE, AND PAYS FOR ALL THREE BELOW.
+  // figma-oauth.js unseals a stored OAuth token with figma-credential-
+  // crypto.js's EXISTING helpers rather than writing new crypto (the brief's
+  // explicit instruction), figma-oauth-routes.js reuses figma-credential-
+  // routes.js's createRequireSpaceAdmin and sendSafe rather than
+  // re-implementing the same "only a space admin may manage this space's
+  // Figma credential" gate and the same response leak gate a second time, and
+  // figma-oauth.test.mjs (this run's own new test file) imports the resolver
+  // and the crypto module to build its fixtures - the same reason THIS file
+  // is excluded from itself via the `.startsWith("figma-credential")` filter
+  // just below. All three are BY-DESIGN reuse of the credential subsystem's
+  // own exported helpers, not a leak of the resolver into an unrelated file -
+  // which is exactly what this exclusion list exists to tell apart, and
+  // exactly why each addition here is paid for by name immediately below
+  // rather than silently widening the filter.
+  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs"]);
   const files = readdirSync(here).filter(f =>
     (f.endsWith(".js") || f.endsWith(".mjs")) && !f.startsWith("figma-credential") && !WIRED_BY_DESIGN.has(f));
   const importers = files.filter(f => {

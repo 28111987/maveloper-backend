@@ -925,16 +925,41 @@ await ta("7a  server.js MOUNTS the credential routes (import AND call)", async (
   );
 });
 
-// The module must still be reached by ONE file and no other. A second mount would
-// register all four routes twice, and the duplicate would answer some requests.
-await ta("7a2 exactly one file in the backend reaches figma-credential-routes", async () => {
+// The module must still be MOUNTED by ONE file and no other. A second mount
+// would register all four routes twice, and the duplicate would answer some
+// requests.
+//
+// ★ FIGMA OAUTH RUN 1 adds a SECOND, NON-MOUNTING importer: figma-oauth-
+// routes.js reuses createRequireSpaceAdmin and sendSafe from this file (the
+// SAME space-admin gate and the SAME response leak gate, rather than a second
+// copy of either) but never calls createFigmaCredentialRoutes itself, so it
+// cannot double-register these four routes. The two questions - "who reaches
+// this file's exports" and "who mounts its routes" - are now different
+// questions, and are asserted separately rather than collapsed back into one
+// deepEqual that a legitimate reuse would fail.
+await ta("7a2 figma-credential-routes is reached only by server.js (mounts it) and figma-oauth-routes.js (reuses its helpers)", async () => {
   const dir = new URL("./", import.meta.url);
   const files = fs.readdirSync(dir).filter((f) => /\.(js|mjs)$/.test(f) && !/^figma-credential/.test(f));
   const importers = files.filter((f) =>
     /figma-credential-routes/.test(fs.readFileSync(new URL("./" + f, import.meta.url), "utf8")),
   );
-  assert.deepEqual(importers, ["server.js"], "expected server.js alone to mount the routes, got: " + importers.join(", "));
+  assert.deepEqual(
+    importers.slice().sort(),
+    ["figma-oauth-routes.js", "server.js"],
+    "expected exactly server.js and figma-oauth-routes.js to reach this file, got: " + importers.join(", "),
+  );
   assert.ok(files.length > 10, "only " + files.length + " files scanned - the scan is not reaching the repo");
+});
+
+await ta("7a3 figma-oauth-routes.js reuses createRequireSpaceAdmin/sendSafe but does NOT mount a second copy of these routes", async () => {
+  let src = "";
+  try {
+    src = fs.readFileSync(new URL("./figma-oauth-routes.js", import.meta.url), "utf8");
+  } catch { /* reported below */ }
+  assert.ok(src.length > 0, "figma-oauth-routes.js could not be read - this check is vacuous");
+  assert.ok(/createRequireSpaceAdmin/.test(src), "figma-oauth-routes.js no longer reuses createRequireSpaceAdmin");
+  assert.ok(/\bsendSafe\b/.test(src), "figma-oauth-routes.js no longer reuses sendSafe");
+  assert.ok(!/createFigmaCredentialRoutes\(/.test(src), "figma-oauth-routes.js calls createFigmaCredentialRoutes(...) - that would double-mount these four routes");
 });
 
 // ★★ INVERTED BY RUN 3. Runs 1 and 2 asserted server.js did not mention the

@@ -26,8 +26,14 @@ import { uploadImagesWithConcurrency, readConcurrency } from "./dropbox-upload.j
 // ★★ RUN 3 - PER-SPACE FIGMA CREDENTIALS. Built dark in runs 1 and 2; MOUNTED here.
 // Everything this module does fails OPEN to the global Mavlers token, so a space
 // with nothing stored behaves exactly as it does today.
-import { resolveFigmaToken, describeResolution, credentialProvenanceLine } from "./figma-credential.js";
+import { resolveFigmaToken, describeResolution } from "./figma-credential.js";
 import { createFigmaCredentialRoutes } from "./figma-credential-routes.js";
+// ★★ FIGMA OAUTH RUN 1 - resolveFigmaCredential tries this space's OAuth
+// connection first and falls through to resolveFigmaToken UNCHANGED when
+// there is none. Fails OPEN exactly like the resolver it wraps: a space with
+// no OAuth connection and no pasted token behaves exactly as it does today.
+import { resolveFigmaOAuth, shapeOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
+import { createFigmaOAuthRoutes } from "./figma-oauth-routes.js";
 import {
   sanitizeOrderId,
   collectReferencedUrls,
@@ -5853,10 +5859,24 @@ app.post("/generate-from-figma", generateLimiter, optionalAuth, async (req, res)
     // sealing key, malformed - lands on `globalToken`, which is the same
     // FIGMA_API_TOKEN this handler used before this block existed. A space with
     // no credential is byte-identical to today.
-    const figmaCred = await resolveFigmaToken(req.body?.orgId, {
-      db: supabaseAdmin,
-      globalToken: FIGMA_API_TOKEN,
-    });
+    // ── ★★ FIGMA OAUTH RUN 1: OAUTH FIRST, PASTED-TOKEN RESOLVER UNCHANGED. ──
+    // Tries this space's connected Figma OAuth account first. When there is
+    // none, oauthCred is null and figmaCred becomes the result of THIS SAME
+    // resolveFigmaToken(...) call the code made before this block existed -
+    // not a re-shaped copy of it, the actual call, so a space with no OAuth
+    // connection is byte-identical to today. shapeOAuthResolution (figma-
+    // oauth.js) is the one place the OAuth-to-resolution mapping is written;
+    // resolveFigmaCredential in that file performs this same composition for
+    // its own test coverage, but this call site inlines it rather than
+    // calling that wrapper, so this file keeps a real, direct call to
+    // resolveFigmaToken in its own text.
+    const oauthCred = await resolveFigmaOAuth(req.body?.orgId, { db: supabaseAdmin });
+    const figmaCred = oauthCred
+      ? shapeOAuthResolution(oauthCred, req.body?.orgId)
+      : await resolveFigmaToken(req.body?.orgId, {
+          db: supabaseAdmin,
+          globalToken: FIGMA_API_TOKEN,
+        });
     const figmaToken = figmaCred.token;
 
     // ★ THE ONLY SAFE SHAPE TO LOG. describeResolution replaces `token` with a
@@ -6561,7 +6581,7 @@ ${specs.join("\n\n")}
       // of which can carry the token: a one-line sentence for a human, and the
       // structured resolution (whose `token` is a boolean by construction) for
       // anything that wants to assert on it.
-      figmaCredential: credentialProvenanceLine(figmaCred),
+      figmaCredential: figmaCredentialProvenanceLine(figmaCred),
       figmaCredentialDetail: describeResolution(figmaCred),
       referenceHtmlUsed: Boolean(REFERENCE_CACHE.get(fileKey)), // v8.0.0: was a human-coded reference injected
       figmaSource: {
@@ -8368,6 +8388,11 @@ createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 // Fails OPEN. A space with no stored credential still resolves to the global
 // Mavlers token, so every existing order path behaves exactly as it does today.
 createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
+
+// THE OAUTH MOUNT. Same shape as the two calls directly above. Fails OPEN: a
+// space with no OAuth connection (no row, or org_figma_oauth not yet created)
+// resolves through resolveFigmaToken exactly as it does today.
+createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 
 const queueRunner = createQueueRunner({
   supabaseAdmin,
