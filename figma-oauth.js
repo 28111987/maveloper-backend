@@ -170,7 +170,15 @@ export async function exchangeCode({ code, clientId, clientSecret, redirectUri, 
     accessToken: body.access_token,
     refreshToken: typeof body.refresh_token === "string" ? body.refresh_token : null,
     expiresIn: Number.isFinite(Number(body.expires_in)) ? Number(body.expires_in) : null,
-    userId: body.user_id != null ? String(body.user_id) : null,
+    // ★ user_id_string FIRST. Figma documents the numeric `user_id` as
+    // deprecated: a Figma id can exceed 2^53, and JSON.parse rounds it before
+    // String() ever sees it (the first live row stored 1261019814302791000,
+    // trailing zeros and all). The numeric field is kept only as a fallback
+    // for a response that carries nothing else.
+    userId:
+      typeof body.user_id_string === "string" && body.user_id_string
+        ? body.user_id_string
+        : body.user_id != null ? String(body.user_id) : null,
     error: null,
   };
 }
@@ -236,6 +244,84 @@ export async function refreshAccessToken({ refreshToken, clientId, clientSecret,
     expiresIn: Number.isFinite(Number(body.expires_in)) ? Number(body.expires_in) : null,
     error: null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// WHO THE TOKEN BELONGS TO.
+// ---------------------------------------------------------------------------
+
+/** How long the callback waits for GET /v1/me before storing the connection without a name. */
+export const FIGMA_ME_TIMEOUT_MS = 5000;
+
+/**
+ * GET FIGMA_ME_URL with an OAuth access token, returning the connected
+ * account's { id, email, handle }.
+ *
+ * ★ BEARER, NOT X-Figma-Token. The callback used to make this call with the
+ * X-Figma-Token header the pasted-token test uses. Figma documents that an
+ * OAuth token authenticates with `Authorization: Bearer`; the call failed, the
+ * failure was swallowed without a trace, and the first live row was written
+ * with figma_email and figma_handle null.
+ *
+ * ★ NEVER THROWS AND NEVER FAILS THE CONNECTION. A non-200, a timeout, a
+ * network error or a body without a string email or handle all land on
+ * `{ ok: false, note }`. The caller stores the connection anyway, with the
+ * account unnamed and `note` saying why. A working connection with no label
+ * is worth more than a label that can break a working connection.
+ */
+export async function fetchFigmaIdentity({ accessToken, fetchImpl = null, timeoutMs = FIGMA_ME_TIMEOUT_MS }) {
+  const doFetch = fetchImpl || globalThis.fetch;
+  const none = { ok: false, id: null, email: null, handle: null, note: null };
+
+  if (!accessToken || typeof accessToken !== "string") {
+    return { ...none, note: "No access token to identify the account with." };
+  }
+
+  const controller = new AbortController();
+  let timer = null;
+  // The race, not just the abort signal, is what guarantees the bound: a
+  // fetch that ignores its signal must still not hold the callback open.
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve("timeout");
+    }, timeoutMs);
+  });
+
+  try {
+    const work = (async () => {
+      const r = await doFetch(FIGMA_ME_URL, {
+        method: "GET",
+        headers: { Authorization: "Bearer " + accessToken },
+        signal: controller.signal,
+      });
+      if (!r || !r.ok) return { ...none, note: "Figma's /v1/me answered " + (r ? r.status : "nothing") + "." };
+      let me = null;
+      try {
+        me = await r.json();
+      } catch {
+        return { ...none, note: "Figma's /v1/me answered 200 with a body that is not JSON." };
+      }
+      const email = me && typeof me.email === "string" && me.email ? me.email : null;
+      const handle = me && typeof me.handle === "string" && me.handle ? me.handle : null;
+      if (!email && !handle) {
+        return { ...none, note: "Figma's /v1/me answered 200 without an email or a handle." };
+      }
+      const id = me.id != null && me.id !== "" ? String(me.id) : null;
+      return { ok: true, id, email, handle, note: null };
+    })();
+
+    const out = await Promise.race([work, timedOut]);
+    if (out === "timeout") {
+      work.catch(() => {});
+      return { ...none, note: "Figma's /v1/me did not answer within " + timeoutMs + " ms." };
+    }
+    return out;
+  } catch {
+    return { ...none, note: "Could not reach Figma's /v1/me." };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +536,8 @@ export default {
   buildAuthorizeUrl,
   exchangeCode,
   refreshAccessToken,
+  FIGMA_ME_TIMEOUT_MS,
+  fetchFigmaIdentity,
   resolveFigmaOAuth,
   shapeOAuthResolution,
   resolveFigmaCredential,

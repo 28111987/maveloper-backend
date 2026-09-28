@@ -746,7 +746,36 @@ await ta("5c  the file check uses depth=1, and is reported SEPARATELY from auth"
   assert.ok(/not visible/.test(res.body.file.note));
 });
 
-await ta("5d  Figma's response body is never echoed into ours", async () => {
+// ★ RUN 8. Both test-route calls now pick their header through figmaAuthHeaders.
+// A pasted figd_ token must send EXACTLY what it sent before: X-Figma-Token, and
+// NO Authorization header. REGRESSION GUARDS: these pass on the old code too.
+await ta("5c2 ★ run 8: figd_ on /v1/me -> X-Figma-Token, and NO Authorization", async () => {
+  let seen = null;
+  const { app } = mount(seatedAs(ADMIN), {
+    fetchImpl: async (url, opts) => { seen = opts; return { ok: true, status: 200, json: async () => ({}) }; },
+  });
+  await run(app.routes["post /os/spaces/:slug/figma-credential/test"], reqAs(ADMIN, { token: FAKE_TOKEN }), makeRes());
+  assert.equal(seen.headers["X-Figma-Token"], FAKE_TOKEN);
+  assert.ok(!Object.keys(seen.headers).some((k) => k.toLowerCase() === "authorization"), "an Authorization header was added to a pasted token");
+});
+
+await ta("5c3 ★ run 8: figd_ on the /v1/files check -> X-Figma-Token, and NO Authorization", async () => {
+  const calls = [];
+  const { app } = mount(seatedAs(ADMIN), {
+    fetchImpl: async (url, opts) => { calls.push({ url, opts }); return { ok: true, status: 200, json: async () => ({}) }; },
+  });
+  await run(
+    app.routes["post /os/spaces/:slug/figma-credential/test"],
+    reqAs(ADMIN, { token: FAKE_TOKEN, figmaUrl: "https://www.figma.com/design/AbCdEfGhIjKl1234/Spec" }),
+    makeRes(),
+  );
+  const fileCall = calls.find((c) => c.url.includes("/v1/files/"));
+  assert.ok(fileCall, "the file check did not run");
+  assert.equal(fileCall.opts.headers["X-Figma-Token"], FAKE_TOKEN);
+  assert.ok(!Object.keys(fileCall.opts.headers).some((k) => k.toLowerCase() === "authorization"), "an Authorization header was added to a pasted token");
+});
+
+await ta("5dFigma's response body is never echoed into ours", async () => {
   const { app } = mount(seatedAs(ADMIN), {
     fetchImpl: async () => ({
       ok: false,

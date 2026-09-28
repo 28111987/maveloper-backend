@@ -59,6 +59,7 @@ import {
   CREDENTIAL_TABLE,
 } from "./figma-credential.js";
 import { readKey, sealToken, openToken, lastFour, KEY_ENV } from "./figma-credential-crypto.js";
+import { figmaAuthHeaders } from "./figma-auth-header.js";
 
 /**
  * ★ THE EXPLICIT COLUMN LIST, AND IT IS THE ONLY ONE IN THIS FILE.
@@ -720,7 +721,7 @@ export function createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, l
     const result = { testing, auth: null, file: null };
 
     try {
-      const r = await doFetch(FIGMA_TEST_ENDPOINT, { headers: { "X-Figma-Token": token } });
+      const r = await doFetch(FIGMA_TEST_ENDPOINT, { headers: figmaAuthHeaders(token) });
       // ★ THE BODY IS READ FOR TWO NAMED FIELDS AND DISCARDED. It is never
       // spread into the response and never handed to log(): a response body is
       // attacker-influenced text and this run's whole subject is what reaches a
@@ -753,7 +754,7 @@ export function createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, l
     if (result.auth?.ok && key) {
       try {
         const r = await doFetch("https://api.figma.com/v1/files/" + encodeURIComponent(key) + "?depth=1", {
-          headers: { "X-Figma-Token": token },
+          headers: figmaAuthHeaders(token),
         });
         result.file = {
           ok: r.ok,

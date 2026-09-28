@@ -19,6 +19,8 @@
 // - Image refs are recorded; actual export is Phase B
 // =====================================================================
 
+import { figmaAuthHeaders } from "./figma-auth-header.js";
+
 const FIGMA_API_BASE = "https://api.figma.com/v1";
 const FIGMA_API_TIMEOUT_MS = 30 * 1000;
 const EMAIL_WIDTH_MIN = 500;
@@ -110,7 +112,7 @@ export async function fetchFigmaNode({ fileKey, nodeId, token, fetchImpl = fetch
   let response;
   try {
     response = await fetchImpl(url, {
-      headers: { "X-Figma-Token": token },
+      headers: figmaAuthHeaders(token),
       signal: controller.signal,
     });
   } catch (err) {

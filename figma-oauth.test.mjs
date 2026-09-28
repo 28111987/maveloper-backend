@@ -24,7 +24,9 @@ import {
   resolveFigmaOAuth,
   resolveFigmaCredential,
   figmaCredentialProvenanceLine,
+  fetchFigmaIdentity,
 } from "./figma-oauth.js";
+import { createFigmaOAuthRoutes } from "./figma-oauth-routes.js";
 import { readKey, sealToken, openToken, isSealed } from "./figma-credential-crypto.js";
 import { resolveFigmaToken, CREDENTIAL_TABLE, credentialProvenanceLine } from "./figma-credential.js";
 import { readFileSync } from "node:fs";
@@ -509,6 +511,202 @@ section("9. THE PROVENANCE LINE — OAUTH GETS ITS OWN SENTENCE, EVERYTHING ELSE
     ok("9d  no em dash (osVoice house rule)", !l.includes("—"), l);
     ok("9d  pure ASCII", /^[\x20-\x7E]*$/.test(l), l);
     ok("9d  never carries the token", !l.includes(FAKE_ACCESS_TOKEN));
+  }
+}
+
+// ===========================================================================
+section("10. ★★ WHO THE TOKEN BELONGS TO — /v1/me, WRITTEN FROM FIGMA'S DOC");
+// ===========================================================================
+// DOC LITERALS, NOT the module's constants. Figma: an OAuth token authenticates
+// with `Authorization: Bearer <TOKEN>`; GET /v1/me answers
+// { id, email, handle, img_url } with id as a STRING. The first live callback
+// sent X-Figma-Token, got a non-200, and stored email/handle as null.
+const DOC_ME_URL = "https://api.figma.com/v1/me";
+const DOC_ME_BODY = { id: "1261019814302791123", email: "designer@acme.example", handle: "Acme Designer", img_url: "https://example.invalid/avatar.png" };
+const meFetch = (answer) => async (url, opts) => {
+  if (url !== DOC_ME_URL) throw new Error("unexpected url " + url);
+  return answer(url, opts);
+};
+{
+  let seen = null;
+  const good = await fetchFigmaIdentity({
+    accessToken: FAKE_ACCESS_TOKEN,
+    fetchImpl: async (url, opts) => { seen = { url, opts }; return { ok: true, status: 200, json: async () => DOC_ME_BODY }; },
+  });
+  // Would catch: reading the wrong keys (e.g. `name`/`user.email`) or losing the string id.
+  ok("10a a 200 in Figma's documented shape yields id, email and handle",
+     good.ok === true && good.id === DOC_ME_BODY.id && good.email === DOC_ME_BODY.email && good.handle === DOC_ME_BODY.handle, JSON.stringify(good));
+  // Would catch: calling a different endpoint (a wrong constant agrees with itself; this literal does not).
+  ok("10b ★ it GETs the DOC /v1/me URL (literal, not the module's constant)", seen && seen.url === DOC_ME_URL && String(seen.opts?.method || "GET").toUpperCase() === "GET", seen && seen.url);
+  // Would catch: THE LIVE BUG. The old callback sent X-Figma-Token, which Figma does not accept for an OAuth token.
+  ok("10c ★ the OAuth token travels as Authorization: Bearer, and NOT as X-Figma-Token",
+     headerOf(seen.opts, "Authorization") === "Bearer " + FAKE_ACCESS_TOKEN && headerOf(seen.opts, "X-Figma-Token") === undefined,
+     JSON.stringify(seen.opts?.headers));
+  // Would catch: the token leaking into the URL, where it would land in proxy and access logs.
+  ok("10d the token is not in the URL", !seen.url.includes(FAKE_ACCESS_TOKEN));
+
+  // NON-200. What Figma answers the old X-Figma-Token call with an OAuth token.
+  const forbidden = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: meFetch(async () => ({ ok: false, status: 403, json: async () => ({ status: 403, err: "Invalid token" }) })) });
+  // Would catch: treating any answer as success, or reading email out of Figma's error body.
+  ok("10e a 403 -> ok:false, identity all null, NO THROW, reason names the status",
+     forbidden.ok === false && forbidden.email === null && forbidden.handle === null && forbidden.id === null && /403/.test(forbidden.note || ""), JSON.stringify(forbidden));
+
+  const notJson = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: meFetch(async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("Unexpected token <"); } })) });
+  // Would catch: an unguarded r.json() throwing up into the callback and 500ing a good connection.
+  ok("10f a 200 whose body is not JSON -> ok:false with a reason, NO THROW", notJson.ok === false && notJson.email === null && /not JSON/.test(notJson.note || ""), JSON.stringify(notJson));
+
+  const emptyBody = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: meFetch(async () => ({ ok: true, status: 200, json: async () => ({}) })) });
+  // Would catch: reporting ok:true for an empty body, which would record a "named" account with no name.
+  ok("10g a 200 with an EMPTY body -> ok:false with a reason", emptyBody.ok === false && /without an email or a handle/.test(emptyBody.note || ""), JSON.stringify(emptyBody));
+
+  const wrongTypes = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: meFetch(async () => ({ ok: true, status: 200, json: async () => ({ id: 7, email: { value: "x" }, handle: 12 }) })) });
+  // Would catch: `me.email ?? null` style code, which would write an object or a number into a text column.
+  ok("10h a 200 with non-string email/handle -> ok:false, nothing stored from it", wrongTypes.ok === false && wrongTypes.email === null && wrongTypes.handle === null, JSON.stringify(wrongTypes));
+
+  const nullBody = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: meFetch(async () => ({ ok: true, status: 200, json: async () => null })) });
+  // Would catch: `me.email` on a null body throwing a TypeError.
+  ok("10i a 200 with a JSON null body -> ok:false, NO THROW", nullBody.ok === false && nullBody.email === null, JSON.stringify(nullBody));
+
+  const unreachable = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, fetchImpl: async () => { throw new Error("ECONNRESET"); } });
+  // Would catch: a network rejection escaping the helper.
+  ok("10j a network failure -> ok:false, NO THROW", unreachable.ok === false && /reach/.test(unreachable.note || ""), JSON.stringify(unreachable));
+
+  // A fetch that NEVER settles and ignores its abort signal. The bound must come from the helper itself.
+  const t0 = Date.now();
+  const hung = await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, timeoutMs: 60, fetchImpl: async () => new Promise(() => {}) });
+  const took = Date.now() - t0;
+  // Would catch: no timeout, or a timeout that only aborts the signal (a fetch that ignores it would hang the callback forever).
+  ok("10k a hanging /v1/me resolves ok:false within the timeout, even if fetch ignores the abort", hung.ok === false && /did not answer/.test(hung.note || "") && took < 2000, `took ${took}ms, ${JSON.stringify(hung)}`);
+
+  // Would catch: an abort signal that is never passed, so a real undici fetch keeps its socket open after the timeout.
+  let sawSignal = null;
+  await fetchFigmaIdentity({ accessToken: FAKE_ACCESS_TOKEN, timeoutMs: 30, fetchImpl: async (u, o) => { sawSignal = o.signal; return new Promise(() => {}); } });
+  ok("10l the timeout ABORTS the underlying request", sawSignal && sawSignal.aborted === true);
+}
+
+// ===========================================================================
+section("11. ★ THE EXCHANGE'S USER ID — user_id_string, BECAUSE THE NUMBER ROUNDS");
+// ===========================================================================
+{
+  // Figma's documented token body, parsed from RAW TEXT exactly as r.json()
+  // would, so the numeric user_id is rounded the way it is in production.
+  const raw = '{"user_id_string":"1261019814302791123","user_id":1261019814302791123,"access_token":"' + FAKE_ACCESS_TOKEN + '","token_type":"bearer","expires_in":7776000,"refresh_token":"' + FAKE_REFRESH_TOKEN + '"}';
+  const r = await exchangeCode({ code: "c", clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectUri: REDIRECT_URI,
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => JSON.parse(raw) }) });
+  // Would catch: THE LIVE ROUNDING. String(user_id) on this body gives "1261019814302791200", not the real id.
+  ok("11a userId is the EXACT user_id_string, not the rounded number", r.userId === "1261019814302791123", r.userId);
+  ok("11a control: the numeric user_id really does round in JS (not blind)", String(JSON.parse(raw).user_id) !== "1261019814302791123");
+  // Would catch: the change to userId disturbing the fields that already worked live.
+  ok("11b the fields that already worked are unchanged: accessToken, refreshToken, expiresIn",
+     r.ok === true && r.accessToken === FAKE_ACCESS_TOKEN && r.refreshToken === FAKE_REFRESH_TOKEN && r.expiresIn === 7776000);
+}
+
+// ===========================================================================
+section("12. ★★ THE CALLBACK ROUTE — /v1/me CAN NAME THE ACCOUNT, AND CAN NEVER FAIL THE CONNECTION");
+// ===========================================================================
+// Drives the REAL createFigmaOAuthRoutes handlers (the auth middleware is
+// skipped by taking the last handler of each route; requireSpaceAdmin has its
+// own suite in the credential routes' test file, not named here because
+// that suite's 7a2 text-scans for its filename). The upserted row is captured
+// and its sealed tokens are opened with the real crypto module.
+{
+  const SPACE = { id: ORG, slug: "acme-space" };
+  const USER_ID = "33333333-4444-5555-6666-777777777777";
+  const EXCHANGE_TEXT = '{"user_id_string":"1261019814302791123","user_id":1261019814302791123,"access_token":"' + FAKE_ACCESS_TOKEN + '","token_type":"bearer","expires_in":7776000,"refresh_token":"' + FAKE_REFRESH_TOKEN + '"}';
+
+  async function runCallback(meAnswer) {
+    const handlers = {};
+    const app = {
+      get(path, ...h) { handlers["GET " + path] = h[h.length - 1]; },
+      post(path, ...h) { handlers["POST " + path] = h[h.length - 1]; },
+      delete(path, ...h) { handlers["DELETE " + path] = h[h.length - 1]; },
+    };
+    const upserts = [];
+    const supabaseAdmin = { from: (table) => ({ upsert: async (row, opts) => { upserts.push({ table, row, opts }); return { error: null }; } }) };
+    const logs = [];
+    const meCalls = [];
+    const fetchImpl = async (url, opts) => {
+      if (url === DOC_TOKEN_URL) return { ok: true, status: 200, json: async () => JSON.parse(EXCHANGE_TEXT) };
+      if (url === DOC_ME_URL) { meCalls.push(opts); return meAnswer(opts); }
+      throw new Error("unexpected url " + url);
+    };
+    createFigmaOAuthRoutes({
+      app, supabaseAdmin, requireAuth: () => {}, log: (lvl, msg, extra) => logs.push({ lvl, msg, extra }),
+      env: { FIGMA_OAUTH_CLIENT_ID: CLIENT_ID, FIGMA_OAUTH_CLIENT_SECRET: CLIENT_SECRET, FIGMA_OAUTH_REDIRECT_URI: REDIRECT_URI, FIGMA_CRED_KEY: TEST_KEY_HEX },
+      fetchImpl,
+    });
+    const mkRes = () => ({ statusCode: null, body: null, status(n) { this.statusCode = n; return this; }, json(b) { this.body = b; return this; } });
+    const startRes = mkRes();
+    await handlers["GET /os/spaces/:slug/figma-oauth/start"]({ space: SPACE, params: { slug: SPACE.slug } }, startRes);
+    const res = mkRes();
+    const t0 = Date.now();
+    await handlers["POST /os/spaces/:slug/figma-oauth/callback"]({ space: SPACE, user: { id: USER_ID }, params: { slug: SPACE.slug }, body: { code: "AUTH_CODE_123", state: startRes.body?.state } }, res);
+    return { res, upserts, logs, meCalls, took: Date.now() - t0, row: upserts[0]?.row };
+  }
+
+  // THE EXCHANGE-FIELDS CHECK, shared by every scenario below: whatever /v1/me
+  // does, the row must carry the tokens, expiry, scopes and flags that the
+  // live exchange already got right.
+  function exchangeFieldsIntact(row) {
+    if (!row) return "no row was upserted";
+    const p = [];
+    if (openToken(row.access_token, TEST_KEY).token !== FAKE_ACCESS_TOKEN) p.push("access_token does not open to the exchanged token");
+    if (openToken(row.refresh_token, TEST_KEY).token !== FAKE_REFRESH_TOKEN) p.push("refresh_token does not open to the exchanged token");
+    const days = (new Date(row.expires_at).getTime() - Date.now()) / 86400000;
+    if (!(days > 89.9 && days <= 90)) p.push("expires_at is " + days.toFixed(3) + " days out, not 90");
+    if (row.scopes !== "current_user:read,file_content:read,file_metadata:read") p.push("scopes " + row.scopes);
+    if (row.is_active !== true) p.push("is_active " + row.is_active);
+    if (row.org_id !== ORG) p.push("org_id " + row.org_id);
+    if (row.connected_by !== USER_ID) p.push("connected_by " + row.connected_by);
+    return p.join("; ");
+  }
+
+  // 12a. 200 in the documented shape.
+  {
+    // Modelled on Figma, not on the code: /v1/me honours an OAuth token only
+    // as `Authorization: Bearer`, and refuses anything else with a 403. A fake
+    // that answered 200 to any header passed against the OLD route too.
+    const r = await runCallback(async (opts) =>
+      headerOf(opts, "Authorization") === "Bearer " + FAKE_ACCESS_TOKEN
+        ? { ok: true, status: 200, json: async () => DOC_ME_BODY }
+        : { ok: false, status: 403, json: async () => ({ status: 403, err: "Invalid token" }) });
+    // Would catch: THE LIVE DEFECT end to end. The old route stored null here because its X-Figma-Token call was refused.
+    ok("12a a 200 from /v1/me -> the stored row carries figma_email and figma_handle",
+       r.res.statusCode === 200 && r.row?.figma_email === DOC_ME_BODY.email && r.row?.figma_handle === DOC_ME_BODY.handle, JSON.stringify({ status: r.res.statusCode, email: r.row?.figma_email, handle: r.row?.figma_handle }));
+    // Would catch: a route that fetches identity but still sends the wrong header.
+    ok("12a ...and the route's /v1/me call used Authorization: Bearer", r.meCalls.length === 1 && headerOf(r.meCalls[0], "Authorization") === "Bearer " + FAKE_ACCESS_TOKEN && headerOf(r.meCalls[0], "X-Figma-Token") === undefined);
+    // Would catch: the rounded exchange id winning over Figma's exact string id.
+    ok("12a ...figma_user_id is the exact string id", r.row?.figma_user_id === DOC_ME_BODY.id, r.row?.figma_user_id);
+    // Would catch: a success path that leaves a stale failure note on the row.
+    ok("12a ...and last_refresh_note is null on success", r.row && r.row.last_refresh_note === null);
+    // Would catch: the console read shape not carrying the new values back to the caller.
+    ok("12a ...the response's credential shape names the account", r.res.body?.connected === true && r.res.body?.credential?.figmaEmail === DOC_ME_BODY.email && r.res.body?.credential?.figmaHandle === DOC_ME_BODY.handle);
+    const e = exchangeFieldsIntact(r.row);
+    ok("12a the exchange fields that already worked are unchanged", e === "", e);
+  }
+
+  // 12b-12e. Every way /v1/me can fail: the connection MUST still succeed.
+  const failures12 = [
+    ["12b a NON-200 (403)", async () => ({ ok: false, status: 403, json: async () => ({ status: 403, err: "Invalid token" }) }), /403/],
+    ["12c a 200 with a NON-JSON body", async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("Unexpected token <"); } }), /not JSON/],
+    ["12d a 200 with an EMPTY body", async () => ({ ok: true, status: 200, json: async () => ({}) }), /without an email or a handle/],
+    ["12e a network failure", async () => { throw new Error("ECONNRESET"); }, /reach/],
+  ];
+  for (const [name, answer, noteRe] of failures12) {
+    const r = await runCallback(answer);
+    // Would catch: ANY implementation where an identity failure turns into a 4xx/5xx or skips the write. This is the brief's single most important line.
+    ok(`${name} -> the connection STILL SUCCEEDS (200, connected:true, row written)`,
+       r.res.statusCode === 200 && r.res.body?.connected === true && r.upserts.length === 1 && r.upserts[0].table === OAUTH_TABLE, JSON.stringify({ status: r.res.statusCode, body: r.res.body, upserts: r.upserts.length }));
+    // Would catch: reading identity out of an error body, or a stale value leaking in.
+    ok(`${name} -> identity absent (email and handle null)`, r.row && r.row.figma_email === null && r.row.figma_handle === null);
+    // Would catch: the old route's silent swallow. The reason must be readable on the row.
+    ok(`${name} -> the reason is recorded on last_refresh_note`, r.row && typeof r.row.last_refresh_note === "string" && noteRe.test(r.row.last_refresh_note) && !r.row.last_refresh_note.includes("—"), r.row && r.row.last_refresh_note);
+    // Would catch: the fallback id being lost when /v1/me fails, or being the rounded number.
+    ok(`${name} -> figma_user_id falls back to the exchange's exact user_id_string`, r.row && r.row.figma_user_id === "1261019814302791123", r.row && r.row.figma_user_id);
+    const e = exchangeFieldsIntact(r.row);
+    ok(`${name} -> the exchange fields are unchanged`, e === "", e);
+    // Would catch: a failure that is recorded but never logged, so nobody watching Railway sees it.
+    ok(`${name} -> a warn log names the failure, without the token`, r.logs.some((l) => l.lvl === "warn" && /identity/.test(l.msg)) && !JSON.stringify(r.logs).includes(FAKE_ACCESS_TOKEN));
   }
 }
 

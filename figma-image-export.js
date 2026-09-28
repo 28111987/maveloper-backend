@@ -17,6 +17,8 @@
 //   - Some nodes may return null (rare, treat as soft failure)
 // =====================================================================
 
+import { figmaAuthHeaders } from "./figma-auth-header.js";
+
 const FIGMA_API_BASE = "https://api.figma.com/v1";
 const FIGMA_API_TIMEOUT_MS = 60 * 1000;  // images can take longer than node fetch
 const FIGMA_RENDER_SCALE = 2;             // 2x for retina-friendly email
@@ -44,7 +46,7 @@ const PNG_DOWNLOAD_CONCURRENCY = 5;       // parallel downloads from signed URLs
  */
 export async function fetchRawImageRefUrls({ fileKey, token, fetchImpl = fetch }) {
   const url = `${FIGMA_API_BASE}/files/${fileKey}/images`;
-  const response = await fetchImpl(url, { headers: { "X-Figma-Token": token } });
+  const response = await fetchImpl(url, { headers: figmaAuthHeaders(token) });
   if (!response.ok) {
     throw new Error(`Figma /v1/files/.../images returned ${response.status}`);
   }
@@ -185,7 +187,7 @@ async function fetchRenderUrls({ fileKey, nodeIds, token, logFn, fetchImpl }) {
     let response;
     try {
       response = await fetchImpl(url, {
-        headers: { "X-Figma-Token": token },
+        headers: figmaAuthHeaders(token),
         signal: controller.signal,
       });
     } catch (err) {
@@ -201,7 +203,7 @@ async function fetchRenderUrls({ fileKey, nodeIds, token, logFn, fetchImpl }) {
       // Figma's rate limit: backoff once, retry this batch
       logFn("warn", "Figma /v1/images rate-limited (429); waiting 5s then retrying batch");
       await sleep(5000);
-      const retryResponse = await fetchImpl(url, { headers: { "X-Figma-Token": token } });
+      const retryResponse = await fetchImpl(url, { headers: figmaAuthHeaders(token) });
       if (!retryResponse.ok) {
         throw new Error(`Figma /v1/images still rate-limited after retry: ${retryResponse.status}`);
       }

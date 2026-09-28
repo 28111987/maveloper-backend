@@ -43,11 +43,12 @@
  */
 
 import crypto from "node:crypto";
-import { createRequireSpaceAdmin, sendSafe, FIGMA_TEST_ENDPOINT } from "./figma-credential-routes.js";
+import { createRequireSpaceAdmin, sendSafe } from "./figma-credential-routes.js";
 import { readKey, sealToken, KEY_ENV } from "./figma-credential-crypto.js";
 import {
   buildAuthorizeUrl,
   exchangeCode,
+  fetchFigmaIdentity,
   OAUTH_TABLE,
   DEFAULT_SCOPES,
 } from "./figma-oauth.js";
@@ -228,23 +229,19 @@ export function createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, e
       return sendSafe(res, 500, { error: "Could not store that connection", details: sealedAccess.error || sealedRefresh.error }, log);
     }
 
-    // WHO THIS CONNECTS TO. Best-effort: a failure here still stores a working
-    // connection, just without the label the console would otherwise show.
-    let figmaUserId = exchange.userId;
-    let figmaEmail = null;
-    let figmaHandle = null;
-    try {
-      const meRes = await doFetch(FIGMA_TEST_ENDPOINT, {
-        headers: { "X-Figma-Token": exchange.accessToken },
-      });
-      if (meRes.ok) {
-        const me = await meRes.json().catch(() => ({}));
-        figmaUserId = me?.id != null ? String(me.id) : figmaUserId;
-        figmaEmail = me?.email ?? null;
-        figmaHandle = me?.handle ?? null;
-      }
-    } catch {
-      // Connection still stored; the console shows it with no account label.
+    // WHO THIS CONNECTS TO. Best-effort: fetchFigmaIdentity never throws, and
+    // a failure still stores a working connection, just without the label the
+    // console would otherwise show. The reason goes on last_refresh_note, the
+    // row's only free-text diagnostic column, so an unnamed account is
+    // explainable by reading the row. This used to call /v1/me with the
+    // X-Figma-Token header and drop any failure without a trace.
+    const identity = await fetchFigmaIdentity({ accessToken: exchange.accessToken, fetchImpl: doFetch });
+    const figmaUserId = identity.id || exchange.userId;
+    const figmaEmail = identity.email;
+    const figmaHandle = identity.handle;
+    const identityNote = identity.ok ? null : "Connected, but the Figma account was not named. " + identity.note;
+    if (!identity.ok) {
+      log("warn", "figma-oauth: account identity not recorded", { slug: req.space.slug, note: identity.note });
     }
 
     const nowIso = new Date().toISOString();
@@ -264,7 +261,7 @@ export function createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, e
       updated_at: nowIso,
       last_refresh_at: null,
       last_refresh_ok: null,
-      last_refresh_note: null,
+      last_refresh_note: identityNote,
     };
 
     try {
