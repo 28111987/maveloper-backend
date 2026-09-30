@@ -11,7 +11,6 @@
     "check": "node --check server.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.40.0",
     "@supabase/supabase-js": "2.45.0",
     "adm-zip": "^0.5.16",
     "cors": "^2.8.5",

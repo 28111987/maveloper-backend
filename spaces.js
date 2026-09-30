@@ -18,7 +18,7 @@
  * service-role key server-side and leaves those policies untouched.
  */
 
-function platformOwners(env) {
+export function platformOwners(env) {
   return String(env.PLATFORM_OWNERS || '')
     .split(/[,\s]+/)
     .map((s) => s.trim().toLowerCase())
