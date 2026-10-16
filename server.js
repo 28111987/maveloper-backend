@@ -14,6 +14,8 @@ import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner } from "./queue-runner.js";
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
 import { createRouteDoors } from "./route-doors.js";
+import { createOrderActions } from "./order-actions.js";
+import { plainReason, figmaCannotOpen, accountNameOf, NO_FIGMA_ACCOUNT, lateResultNote, lateResultDelivered } from "./order-words.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
@@ -2434,6 +2436,99 @@ const MAC_BRIDGE_SECRET = process.env.MAC_BRIDGE_SECRET || "change-me-in-env";
 const PENDING_BRIDGE_JOBS = new Map();
 const BRIDGE_JOB_MAX_WAIT_MS = 45 * 60 * 1000; // 45 min hard ceiling
 
+// ── RUN 17: THE DISPATCH, THE STOP, AND WHO STARTED WHAT ─────────────────────
+// L3. An engine that is still starting must never fail a good order. Measured
+// 16 OCT: Cloud Run start-up 21 to 58 s, and TEST16-2115 failed at 60.8 s against
+// the old fixed 60 s dispatch abort while the engine built it anyway. So: wait
+// for the engine's GET /health first (bounded by ENGINE_HEALTH_WAIT_MS, default
+// and maximum 120 s, attempts of up to 20 s each), and only then send ONE
+// /generate, with BRIDGE_DISPATCH_TIMEOUT_MS (default 120 s). The bridge does
+// NOT refuse a second /generate with the same bridgeJobId (bridge-server.mjs:167
+// makes a new job for every POST), so a dispatch is NEVER retried. If the
+// dispatch still gives up, the job keeps its bridge record (delivery_meta.bridge)
+// so a result that arrives later is delivered or recorded, never dropped (L4).
+const ENGINE_HEALTH_WAIT_MS = Math.min(Number(process.env.ENGINE_HEALTH_WAIT_MS) || 120000, 120000);
+const BRIDGE_DISPATCH_TIMEOUT_MS = Number(process.env.BRIDGE_DISPATCH_TIMEOUT_MS) || 120000;
+// L5. The jobs THIS process started. After a restart the set is empty, which is
+// how the runner tells a job whose preparing process is gone.
+const LOCAL_JOBS = new Set();
+// K6 STOP. Jobs a person stopped: never dispatched after this, and their result
+// is recorded as discarded if it arrives.
+const STOPPED_JOBS = new Set();
+
+/** T4: one structured line per backend stage of an order. Never a secret, a token or an email. */
+function stage(name, fields = {}) {
+  const safe = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined) continue;
+    if (typeof v === "string" && (/@/.test(v) || /figd_|figu_|Bearer|eyJ/.test(v))) continue;
+    safe[k] = v;
+  }
+  console.log(JSON.stringify({ level: "info", msg: "order stage", stage: name, ts: new Date().toISOString(), ...safe }));
+}
+
+/** Merge into maveloper_jobs.delivery_meta without erasing what is already there. */
+async function mergeDeliveryMeta(jobId, patch) {
+  if (!supabaseAdmin || !jobId) return false;
+  try {
+    const { data } = await supabaseAdmin.from("maveloper_jobs").select("delivery_meta").eq("id", jobId).maybeSingle();
+    const dm = data && data.delivery_meta && typeof data.delivery_meta === "object" ? data.delivery_meta : {};
+    const { error } = await supabaseAdmin.from("maveloper_jobs").update({ delivery_meta: { ...dm, ...patch } }).eq("id", jobId);
+    if (error) { log("warn", "delivery_meta merge failed", { jobId, error: error.message }); return false; }
+    return true;
+  } catch (e) {
+    log("warn", "delivery_meta merge threw", { jobId, error: e.message });
+    return false;
+  }
+}
+
+/** L3: wait until the engine answers /health, at most ENGINE_HEALTH_WAIT_MS. */
+async function waitForEngineHealth(requestId) {
+  const t0 = Date.now();
+  let attempts = 0;
+  while (Date.now() - t0 < ENGINE_HEALTH_WAIT_MS) {
+    attempts++;
+    const left = ENGINE_HEALTH_WAIT_MS - (Date.now() - t0);
+    try {
+      const r = await fetch(`${MAC_BRIDGE_URL}/health`, {
+        method: "GET",
+        headers: { "ngrok-skip-browser-warning": "true" },
+        signal: AbortSignal.timeout(Math.max(1000, Math.min(20000, left))),
+      });
+      if (r.ok) return { ok: true, ms: Date.now() - t0, attempts };
+    } catch { /* starting, or unreachable: try again until the bound */ }
+    await new Promise((res) => setTimeout(res, Math.min(3000, Math.max(0, ENGINE_HEALTH_WAIT_MS - (Date.now() - t0)))));
+  }
+  log("warn", "engine did not answer /health within the bound", { requestId, waitedMs: Date.now() - t0, attempts });
+  return { ok: false, ms: Date.now() - t0, attempts };
+}
+
+/** L1: does the engine still hold this job? Only an explicit { known: false } is "unknown". */
+async function probeEngineJob(bridgeJobId) {
+  if (!MAC_BRIDGE_URL) return "unreachable";
+  try {
+    const r = await fetch(`${MAC_BRIDGE_URL}/jobs/${encodeURIComponent(bridgeJobId)}`, {
+      headers: { "X-Bridge-Secret": MAC_BRIDGE_SECRET, "ngrok-skip-browser-warning": "true" },
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = await r.json().catch(() => null);
+    if (body && body.known === true) return "known";
+    if (body && body.known === false) return "unknown";
+    if (r.status === 404) return "unsupported";
+    return "unreachable";
+  } catch {
+    return "unreachable";
+  }
+}
+
+/** K6 STOP: forget the bridge job of a stopped order, in this process. */
+function forgetStoppedJob(jobId) {
+  STOPPED_JOBS.add(jobId);
+  for (const [bridgeJobId, entry] of PENDING_BRIDGE_JOBS) {
+    if (entry.maveloperJobId === jobId) settleBridgeJob(bridgeJobId, { error: "stopped by a person" });
+  }
+}
+
 function settleBridgeJob(bridgeJobId, payload) {
   const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
   if (!entry) return false;
@@ -2471,9 +2566,23 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, log, assetSink }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
+  }
+  // RUN 17: a person stopped this order while it was being prepared. Nothing is sent.
+  if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+    throw new Error("stopped by a person before dispatch");
+  }
+  // RUN 17 L3: the engine must be up before the one dispatch is sent.
+  const tDispatch = Date.now();
+  const health = await waitForEngineHealth(requestId);
+  if (!health.ok) {
+    stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, healthAttempts: health.attempts, sent: false, orderId, requestId });
+    throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+  }
+  if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+    throw new Error("stopped by a person before dispatch");
   }
 
   // Thread the selected ESP onto the spec so cc-runner (PART I) can emit
@@ -2507,6 +2616,14 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       // The /bridge-callback endpoint searches by this stashed value.
       error_message: `__BRIDGE__:${bridgeJobId}`,
     }, requestId);
+    // RUN 17: the same bridgeJobId, kept where no failure write overwrites it
+    // (a failure rewrites error_message), plus WHICH Figma credential read the
+    // design, so the durable callback path can name it too (T3). The line is
+    // built by figmaCredentialProvenanceLine and can never carry the token.
+    await mergeDeliveryMeta(maveloperJobId, {
+      bridge: { bridgeJobId, dispatchedAt: new Date().toISOString(), orderId: orderId || null },
+      ...(typeof figmaCredentialLine === "string" && figmaCredentialLine ? { figmaCredential: figmaCredentialLine } : {}),
+    });
   }
 
   const payload = {
@@ -2587,11 +2704,15 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
         reject(new Error(`Bridge did not call back within ${BRIDGE_JOB_MAX_WAIT_MS / 60000} minutes`));
       }
     }, BRIDGE_JOB_MAX_WAIT_MS);
-    PENDING_BRIDGE_JOBS.set(bridgeJobId, { resolve, reject, timer, requestId, startedAt: Date.now() });
+    PENDING_BRIDGE_JOBS.set(bridgeJobId, { resolve, reject, timer, requestId, maveloperJobId: maveloperJobId || null, startedAt: Date.now() });
   });
+  // A stop that lands while this promise is unsettled rejects it; nobody awaits
+  // it until the dispatch answers, so the rejection must not go unhandled.
+  resultPromise.catch(() => {});
 
   // Fire the dispatch. Bridge should respond 202 in <1 second.
   let dispatchResp;
+  const tPost = Date.now();
   try {
     dispatchResp = await fetch(`${MAC_BRIDGE_URL}/generate`, {
       method: "POST",
@@ -2601,11 +2722,13 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
         "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify(payload),
-      // Short signal â€” dispatch should be near-instant. If it takes more
-      // than 60 sec, something is wrong at the network layer.
-      signal: AbortSignal.timeout(60 * 1000),
+      // RUN 17: was a fixed 60 s, which an engine start of 60.8 s beat on
+      // 16 OCT. The engine has answered /health by now; this bounds the one
+      // POST. It is never retried (see BRIDGE_DISPATCH_TIMEOUT_MS above).
+      signal: AbortSignal.timeout(BRIDGE_DISPATCH_TIMEOUT_MS),
     });
   } catch (dispatchErr) {
+    stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, postMs: Date.now() - tPost, sent: true, answered: false, orderId, bridgeJobId, requestId });
     // Clean up the pending promise so it doesn't leak.
     const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
     if (entry) {
@@ -2639,6 +2762,11 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     bridgeJobId,
     dispatchStatus: dispatchResp.status,
   });
+  stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, postMs: Date.now() - tPost, sent: true, answered: true, orderId, bridgeJobId, requestId });
+  stage("accepted", { ms: jobStartedAt ? Date.now() - jobStartedAt : Date.now() - tDispatch, sinceJobStart: Boolean(jobStartedAt), orderId, bridgeJobId, requestId });
+  if (maveloperJobId) {
+    await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date(tPost).toISOString(), acceptedAt: new Date().toISOString(), orderId: orderId || null } });
+  }
 
   // Wait for /bridge-callback to settle this promise.
   const result = await resultPromise;
@@ -2862,19 +2990,29 @@ function createFakeResponse() {
  * Reason: we never want a Supabase blip to crash the in-flight generation.
  */
 async function updateJobStatus(jobId, fields, requestId) {
-  if (!supabaseAdmin) return;
-  try {
-    await supabaseAdmin
-      .from("maveloper_jobs")
-      .update({ ...fields, updated_at: new Date().toISOString() })
-      .eq("id", jobId);
-  } catch (e) {
-    log("warn", "Failed to update job status (non-fatal)", {
-      requestId,
-      jobId,
-      error: e.message,
-    });
+  if (!supabaseAdmin) return false;
+  // RUN 17: supabase-js RETURNS its error rather than throwing it, so a refused
+  // write used to vanish here (step 1g: a completion write that fails leaves the
+  // durable callback's line, with no credential, as the record). It is now read,
+  // retried once, and logged. Still non-fatal to the generation.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const { error } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .update({ ...fields, updated_at: new Date().toISOString() })
+        .eq("id", jobId);
+      if (!error) return true;
+      log("warn", "Failed to update job status (non-fatal)", { requestId, jobId, attempt, error: error.message });
+    } catch (e) {
+      log("warn", "Failed to update job status (non-fatal)", {
+        requestId,
+        jobId,
+        attempt,
+        error: e.message,
+      });
+    }
   }
+  return false;
 }
 
 app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req, res) => {
@@ -2940,9 +3078,8 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
     if (!figmaToken) {
       return res.status(503).json({
         error: "Figma not configured",
-        details:
-          "No Figma credential is available for this order. Either set the FIGMA_API_TOKEN env var " +
-          "on the backend, or add this space's own Figma token in the space settings.",
+        // RUN 17 T2: this text reaches the client's order. No env var names.
+        details: NO_FIGMA_ACCOUNT,
         requestId: req.id,
       });
     }
@@ -2977,6 +3114,9 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
         code: figmaErr.code,
         userError: isUserError,
       });
+      // RUN 17 T2: Figma refused THIS account. Say so in plain words and name
+      // the account that was used (never the token, never an email address).
+      const refusedAccess = !isUserError && /\((401\/403|404)\)|\b40[134]\b/.test(msg);
       return res.status(isUserError ? 400 : 502).json({
         error:
           figmaErr.code === "MULTIPLE_EMAIL_FRAMES"
@@ -2984,7 +3124,7 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
             : isUserError
             ? "Invalid Figma URL"
             : "Figma fetch failed",
-        details: msg,
+        details: refusedAccess ? figmaCannotOpen(accountNameOf(figmaCred)) : msg,
         candidates: figmaErr.candidates ?? undefined, // structured list for picker UI
         requestId: req.id,
       });
@@ -3341,6 +3481,11 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
           // itself, so it needs the identical token or the two halves of one
           // order would read from two different Figma accounts.
           figmaToken,
+          // RUN 17 T3: the sentence naming WHICH credential read the design, kept
+          // on the job row so every completion path can record it.
+          figmaCredentialLine: figmaCredentialProvenanceLine(figmaCred),
+          orderId,
+          jobStartedAt: Number(req.body?._jobStartedAt) || null,
           log,
           assetSink: compilerAssetSink,
         });
@@ -3626,6 +3771,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
   }
 
   const jobId = job.id;
+  LOCAL_JOBS.add(jobId); // RUN 17 L5: this process started it
 
   log("info", "Async Figma generation started", {
     requestId,
@@ -3652,7 +3798,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
       // v9.3.0: pass _maveloperJobId so callClaudeCodeBridge can tag the
       // Supabase row with bridgeJobId, enabling restart-resilient callbacks.
       const fakeReq = {
-        body: { ...body, _maveloperJobId: jobId },
+        body: { ...body, _maveloperJobId: jobId, _jobStartedAt: bgStartTime },
         id: requestId,
         user: user,
         headers: headers || {},
@@ -3690,6 +3836,13 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
       // Handler completed. Inspect result.
       const durationSec = Math.round((Date.now() - bgStartTime) / 1000);
 
+      // RUN 17 K6: a person stopped this order. The stop already wrote the
+      // job row and the order; nothing here may overwrite either.
+      if (STOPPED_JOBS.has(jobId)) {
+        log("info", "Async job ended after a stop; its result is not written", { requestId, jobId, durationSec });
+        return;
+      }
+
       if (result.statusCode >= 200 && result.statusCode < 300 && result.body?.html) {
         // SUCCESS
         // v9.7.0 (Â§5): surface post-process assertion violations into the job's
@@ -3710,10 +3863,12 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
         const credLine = typeof result.body.figmaCredential === "string"
           ? " | " + result.body.figmaCredential
           : "";
+        // RUN 17: no em dash in this user-facing line (osVoice).
         const progressMsg = (ppAssertions.length > 0
-          ? `Generation complete in ${durationSec}s â€” POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
+          ? `Generation complete in ${durationSec}s. POST-PROCESS WARNING: ${ppAssertions.join("; ")}`
           : `Generation complete in ${durationSec}s`) + credLine;
-        await updateJobStatus(jobId, {
+        const tWrite = Date.now();
+        const wrote = await updateJobStatus(jobId, {
           status: "completed",
           result_html: result.body.html,
           engine_used: result.body.engineUsed ?? null,
@@ -3727,6 +3882,7 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
           progress_message: progressMsg,
           completed_at: new Date().toISOString(),
         }, requestId);
+        stage("write", { ms: Date.now() - tWrite, path: "in-process", ok: wrote, orderId: result.body.orderId ?? null, sinceJobStartMs: Date.now() - bgStartTime });
         log("info", "Async job completed", { requestId, jobId, durationSec, postProcessViolations: ppAssertions.length });
       } else {
         // FAILURE â€” handler set non-2xx status or no html
@@ -3920,6 +4076,109 @@ app.get("/job-status/:jobId", ...doors.job, async (req, res) => {
 //
 // Auth: shared secret in X-Bridge-Secret.
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── RUN 17 L4: THE FATE OF A LATE RESULT ──────────────────────────────────────
+// A result arrives for a job that is no longer waiting for one (its dispatch gave
+// up, the runner timed it out, a person stopped it, or it is a second callback).
+// It is DELIVERED only when its order was not re-run, stopped, cancelled, closed
+// or removed and this job is the order's newest; otherwise it is DISCARDED and
+// the discard is written down. It is never silently dropped, and nothing here
+// ever starts a build.
+async function lateResultFate(jobRow) {
+  const dm = jobRow.delivery_meta && typeof jobRow.delivery_meta === "object" ? jobRow.delivery_meta : {};
+  if (jobRow.status === "completed") return { deliver: false, reason: "the order already had its result" };
+  if (dm.stopped) return { deliver: false, reason: "a person had stopped it" };
+  if (!jobRow.order_id) return { deliver: false, reason: "it could not be matched to an order" };
+  const { data: latest } = await supabaseAdmin
+    .from("maveloper_jobs").select("id").eq("order_id", jobRow.order_id)
+    .order("created_at", { ascending: false }).limit(1);
+  const { data: orders } = await supabaseAdmin
+    .from("os_queue").select("id,order_id,status,error_text,closed_at,job_id,org_id").eq("order_id", jobRow.order_id);
+  const list = orders || [];
+  const order = list.length === 1 ? list[0] : null;
+  if (latest && latest[0] && latest[0].id !== jobRow.id) return { deliver: false, reason: "the order had been re-run", order };
+  if (list.length === 0) return { deliver: false, reason: "the order had been removed" };
+  if (list.length > 1) return { deliver: false, reason: "more than one order carries this order id" };
+  if (order.status === "delivered") return { deliver: false, reason: "the order had already been delivered", order };
+  if (order.status === "pending" || order.status === "processing") return { deliver: false, reason: "the order had been re-run", order };
+  if (order.closed_at) return { deliver: false, reason: "the order had been closed", order };
+  if (/^Stopped by /.test(order.error_text || "")) return { deliver: false, reason: "a person had stopped it", order };
+  if (/^Cancelled by /.test(order.error_text || "")) return { deliver: false, reason: "the order had been cancelled", order };
+  return { deliver: true, order };
+}
+
+async function recordLateDiscard(jobRow, fate, { bytes, bridgeJobId, requestId }) {
+  const t0 = Date.now();
+  const at = new Date();
+  const note = lateResultNote(at, fate.reason);
+  if (jobRow.status === "failed") {
+    await updateJobStatus(jobRow.id, { progress_message: note }, requestId);
+  }
+  await mergeDeliveryMeta(jobRow.id, { lateResult: { at: at.toISOString(), delivered: false, reason: fate.reason, bytes } });
+  const o = fate.order;
+  if (o && o.status === "failed" && !/A late result arrived/.test(o.error_text || "")) {
+    await supabaseAdmin.from("os_queue")
+      .update({ error_text: `${String(o.error_text || "").trim()} ${note}`.trim() })
+      .eq("id", o.id).eq("status", "failed");
+  }
+  log("warn", "/bridge-callback late result discarded and recorded", { requestId, bridgeJobId, dbJobId: jobRow.id, reason: fate.reason });
+  stage("write", { ms: Date.now() - t0, path: "late-discard", orderId: jobRow.order_id, bridgeJobId });
+}
+
+async function deliverLateResult(jobRow, order, html, { compilerAssets, elapsedSeconds, requestId, bridgeJobId }) {
+  const t0 = Date.now();
+  let deliverHtml = html;
+  let compilerImageUrlMap = null;
+  if (compilerAssets && typeof compilerAssets === "object" && Object.keys(compilerAssets).length > 0 && dropboxConfigured) {
+    try {
+      const byBase = new Map();
+      for (const [relSrc, b64] of Object.entries(compilerAssets)) {
+        if (typeof b64 !== "string") continue;
+        const filename = String(relSrc).split("/").pop();
+        if (!filename || byBase.has(filename)) continue;
+        byBase.set(filename, { filename, buffer: Buffer.from(b64, "base64") });
+      }
+      compilerImageUrlMap = await uploadImagesToDropbox(jobRow.order_id, [...byBase.values()], log);
+      deliverHtml = fixImageUrls(html, compilerImageUrlMap, null, { skipPositionalFallback: true }).html;
+    } catch (e) {
+      log("error", "/bridge-callback late result: slice upload failed (non-fatal)", { requestId, bridgeJobId, error: e.message });
+    }
+  }
+  stage("asset-upload", { ms: Date.now() - t0, path: "late", orderId: jobRow.order_id, bridgeJobId });
+  let finalHtml = deliverHtml;
+  try {
+    finalHtml = postProcessHtml(deliverHtml, { imageUrlMap: compilerImageUrlMap || undefined, mode: "figma", requestId }).html;
+  } catch { finalHtml = deliverHtml; }
+  const dm = jobRow.delivery_meta && typeof jobRow.delivery_meta === "object" ? jobRow.delivery_meta : {};
+  const at = new Date();
+  const cred = typeof dm.figmaCredential === "string" && dm.figmaCredential ? dm.figmaCredential : "Figma credential: not recorded for this order";
+  const tWrite = Date.now();
+  const { data: jobDone } = await supabaseAdmin.from("maveloper_jobs").update({
+    status: "completed",
+    result_html: finalHtml,
+    error_message: null,
+    progress_message: `${lateResultDelivered(at)} Generation complete (${finalHtml.length} bytes, ${elapsedSeconds}s) | ${cred}`,
+    completed_at: at.toISOString(),
+    updated_at: at.toISOString(),
+    delivery_meta: { ...dm, lateResult: { at: at.toISOString(), delivered: true } },
+    ...(compilerImageUrlMap && Object.keys(compilerImageUrlMap).length ? { image_url_map: compilerImageUrlMap } : {}),
+  }).eq("id", jobRow.id).eq("status", "failed").select("id");
+  const { data: orderDone } = await supabaseAdmin.from("os_queue").update({
+    status: "delivered",
+    html_content: finalHtml,
+    html_bytes: finalHtml.length,
+    finished_at: at.toISOString(),
+    // the build's own start, from its job row: settleFailed had cleared it
+    started_at: jobRow.created_at || null,
+    job_id: jobRow.id,
+    error_text: null,
+  }).eq("id", order.id).eq("status", "failed").is("closed_at", null).select("id");
+  const ok = Boolean(jobDone && jobDone.length && orderDone && orderDone.length);
+  stage("write", { ms: Date.now() - tWrite, path: "late-deliver", ok, orderId: jobRow.order_id, bridgeJobId });
+  stage("settle", { ms: Date.now() - tWrite, outcome: "delivered-late", ok, orderId: jobRow.order_id });
+  log(ok ? "info" : "warn", "/bridge-callback late result delivered", { requestId, bridgeJobId, dbJobId: jobRow.id, order: jobRow.order_id, ok });
+  return { ok };
+}
+
 app.post("/bridge-callback", async (req, res) => {
   const incomingSecret = req.headers["x-bridge-secret"];
   if (!incomingSecret || incomingSecret !== MAC_BRIDGE_SECRET) {
@@ -3986,6 +4245,65 @@ app.post("/bridge-callback", async (req, res) => {
       });
     }
   }
+  // RUN 17 L4: a FAILED job's error_message no longer carries the tag (the
+  // failure write replaced it), which is how a late result used to find no row
+  // and vanish. The dispatch also keeps the bridgeJobId in delivery_meta.bridge.
+  if (!dbJobId && supabaseAdmin) {
+    try {
+      const { data: rows } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("id")
+        .eq("delivery_meta->bridge->>bridgeJobId", bridgeJobId)
+        .limit(1);
+      if (rows && rows.length > 0) dbJobId = rows[0].id;
+    } catch (e) {
+      log("warn", "/bridge-callback delivery_meta lookup failed", { requestId: req.id, bridgeJobId, error: e.message });
+    }
+  }
+
+  // RUN 17: the row as it stands, for the late-result decision and the stage line.
+  let jobRow = null;
+  if (dbJobId && supabaseAdmin) {
+    const { data } = await supabaseAdmin
+      .from("maveloper_jobs")
+      .select("id,status,order_id,created_at,delivery_meta,progress_message")
+      .eq("id", dbJobId)
+      .maybeSingle();
+    jobRow = data || null;
+  }
+  const jobDm = jobRow && jobRow.delivery_meta && typeof jobRow.delivery_meta === "object" ? jobRow.delivery_meta : {};
+  const acceptedAt = jobDm.bridge && jobDm.bridge.acceptedAt ? Date.parse(jobDm.bridge.acceptedAt) : NaN;
+  stage("callback", {
+    ms: req._bodyRecvMs ?? 0,
+    bytes: req._bodyRecvBytes ?? null,
+    sinceAcceptedMs: Number.isFinite(acceptedAt) ? Date.now() - acceptedAt : null,
+    found: Boolean(jobRow),
+    jobStatus: jobRow ? jobRow.status : null,
+    orderId: jobRow ? jobRow.order_id : null,
+    bridgeJobId,
+  });
+
+  // ── RUN 17 L4: A RESULT FOR A JOB THAT IS NO LONGER WAITING FOR ONE ─────────
+  // Never silently dropped. It is delivered when its order was not re-run,
+  // stopped or cancelled (and has no newer job); otherwise it is recorded on the
+  // job row and, when the order is failed, on the order, as "a late result
+  // arrived at <time> and was discarded because <reason>".
+  if (jobRow && (jobRow.status === "failed" || jobRow.status === "completed") && !error && html) {
+    const fate = await lateResultFate(jobRow);
+    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+    if (entry) { STOPPED_JOBS.add(dbJobId); settleBridgeJob(bridgeJobId, { error: "late result handled by the callback" }); }
+    if (fate.deliver) {
+      const out = await deliverLateResult(jobRow, fate.order, html, { compilerAssets, elapsedSeconds, requestId: req.id, bridgeJobId });
+      return res.status(200).json({ ok: true, settled: "resolved", late: true, delivered: out.ok, durableWrite: true, inMemorySettled: Boolean(entry) });
+    }
+    await recordLateDiscard(jobRow, fate, { bytes: html.length, bridgeJobId, requestId: req.id });
+    return res.status(200).json({ ok: true, settled: "discarded", late: true, reason: fate.reason, durableWrite: true, inMemorySettled: Boolean(entry) });
+  }
+  if (jobRow && jobRow.status === "failed" && error) {
+    // a late FAILURE for a job already failed: nothing to change, but say so
+    log("info", "/bridge-callback late failure for a job already failed; recorded in the log only", { requestId: req.id, bridgeJobId, dbJobId });
+    return res.status(200).json({ ok: true, settled: "rejected", late: true, durableWrite: false, inMemorySettled: false });
+  }
 
   // â”€â”€ COMPILER slice-image upload (additive; INERT on the LLM path) â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // On the deterministic-compiler path the bridge forwards `compilerAssets`: a
@@ -4006,6 +4324,7 @@ app.post("/bridge-callback", async (req, res) => {
   // the durable-write branch below can persist the slice map to the `drafts` row that
   // /approve reads. Stays null on the LLM path and on compiler jobs with no order_id row.
   let compilerOrderId = null;
+  const tAssets = Date.now();
   if (html && compilerAssets && typeof compilerAssets === "object" && Object.keys(compilerAssets).length > 0) {
     const assetCount = Object.keys(compilerAssets).length;
     if (!dropboxConfigured) {
@@ -4065,6 +4384,14 @@ app.post("/bridge-callback", async (req, res) => {
       }
     }
   }
+  stage("asset-upload", {
+    ms: Date.now() - tAssets,
+    assets: compilerAssets && typeof compilerAssets === "object" ? Object.keys(compilerAssets).length : 0,
+    uploaded: compilerImageUrlMap ? Object.keys(compilerImageUrlMap).length : 0,
+    orderId: jobRow ? jobRow.order_id : null,
+    bridgeJobId,
+  });
+  const tWrite = Date.now();
 
   // â”€â”€ Write durable result to Supabase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (dbJobId && supabaseAdmin) {
@@ -4133,7 +4460,10 @@ app.post("/bridge-callback", async (req, res) => {
               ? { image_url_map: compilerImageUrlMap }
               : {}),
             error_message: null, // clear the __BRIDGE__ tag
-            progress_message: `Generation complete (${finalHtml.length} bytes, ${elapsedSeconds}s)`,
+            // RUN 17 T3: this path names the credential too (it was missing on
+            // TEST16-2115's second job, which ended on this line).
+            progress_message: `Generation complete (${finalHtml.length} bytes, ${elapsedSeconds}s)` +
+              (typeof jobDm.figmaCredential === "string" && jobDm.figmaCredential ? " | " + jobDm.figmaCredential : " | Figma credential: not recorded for this order"),
             completed_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
@@ -4171,7 +4501,9 @@ app.post("/bridge-callback", async (req, res) => {
         if ((compilerCertificate && typeof compilerCertificate === "object") ||
             (routeProvenance && typeof routeProvenance === "object")) {
           try {
-            const deliveryMeta = {};
+            // RUN 17: MERGED with what the dispatch stored (bridge record,
+            // credential line), which this write used to replace wholesale.
+            const deliveryMeta = { ...jobDm };
             if (compilerCertificate && typeof compilerCertificate === "object") {
               deliveryMeta.certificate = compilerCertificate;
               deliveryMeta.generatedBy = "compiler";
@@ -4210,6 +4542,7 @@ app.post("/bridge-callback", async (req, res) => {
         dbJobId,
         outcome: error ? "failed" : "completed",
       });
+      stage("write", { ms: Date.now() - tWrite, path: "callback", outcome: error ? "failed" : "completed", orderId: jobRow ? jobRow.order_id : null, bridgeJobId });
     } catch (e) {
       log("error", "/bridge-callback Supabase write failed", {
         requestId: req.id,
@@ -5264,6 +5597,24 @@ const queueRunner = createQueueRunner({
   startFigmaJobAsync,
   log,
   env: process.env,
+  // RUN 17: liveness (L1, behind ENGINE_JOB_PROBE), restart recovery (L5), timing (T4).
+  probeEngineJob,
+  isLocalJob: (jobId) => LOCAL_JOBS.has(jobId),
+  stage,
+});
+
+// RUN 17: EVERY ORDER CAN BE CONTROLLED. POST /os/orders/:id/:action behind run
+// 14's doors (sign-in, then a live seat), the role decided per order in
+// order-actions.js, writes with the service role only after that.
+createOrderActions({
+  app,
+  supabaseAdmin,
+  requireAuth,
+  requireLiveSeat: doors.requireLiveSeat,
+  platformOwners: platformOwners(process.env),
+  log,
+  hooks: { onStop: forgetStoppedJob },
+  runnerCfg: queueRunner.cfg,
 });
 
 // GET /runner/status â€” debug/observability, no auth. Reports the flag + last

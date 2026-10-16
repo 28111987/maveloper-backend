@@ -34,8 +34,22 @@ import { computeQueuePlan } from './queue-priority.js';
 // written to end, and an org-id rule that drifts between the producer and the
 // consumer reintroduces the "null" string bug on whichever side falls behind.
 import { normalisedOrgId as normaliseOrgId } from './figma-credential.js';
+// RUN 17: what a client reads on a failed order, in one place (order-words.js).
+import { plainReason, tookTooLong, ENGINE_LOST } from './order-words.js';
 
-export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env }) {
+/**
+ * RUN 17 HOOKS, all optional so an older caller keeps today's behaviour:
+ *   probeEngineJob(bridgeJobId) -> 'known' | 'unknown' | 'unreachable' | 'unsupported'
+ *       asks the engine whether it still holds the job (L1). Used only when
+ *       ENGINE_JOB_PROBE=true, because the engine at 217a3bb has no such route
+ *       (bridge-server.mjs:491-492); see the run 17 engine spec.
+ *   isLocalJob(jobId) -> boolean
+ *       whether THIS process started the job (L5): a running job with no bridge
+ *       record that this process did not start was being prepared by a process
+ *       that is gone, so nothing will ever dispatch it.
+ *   stage(name, fields) - one timing line per backend stage (T4).
+ */
+export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env, probeEngineJob = null, isLocalJob = null, stage = null }) {
   const cfg = {
     enabled: env.RUNNER_ENABLED === 'true',
     pollMs: Number(env.RUNNER_POLL_MS) || 10000,
@@ -52,7 +66,16 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
     // make one space wait for another by more than a single poll interval.
     maxDispatchPerTick: Number(env.MAX_DISPATCH_PER_TICK) || 10,
     bridgeUrl: env.MAC_BRIDGE_URL || null,
+    // RUN 17 L1: ask the engine whether it still holds an in-flight job. OFF by
+    // default until the engine answers GET /jobs/:bridgeJobId (run 17 engine
+    // spec). Against an engine without the route it is inert: only an explicit
+    // { known: false } counts, never a 404 page.
+    engineProbe: String(env.ENGINE_JOB_PROBE || '').toLowerCase() === 'true',
+    engineProbeMs: Number(env.ENGINE_JOB_PROBE_MS) || 45000,
+    engineLostAfter: Number(env.ENGINE_JOB_LOST_AFTER) || 2,
   };
+  const probeState = new Map(); // jobId -> { lastAt, unknown, unreachable }
+  const timeStage = (name, fields) => { try { if (stage) stage(name, fields); } catch { /* never fails a tick */ } };
 
   let isTicking = false;
   let started = false;
@@ -79,7 +102,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
   }
 
   // §4 DELIVERED — status, finished_at, html_content, html_bytes (do NOT rewrite started_at).
-  async function settleDelivered(id, resultHtml) {
+  async function settleDelivered(id, resultHtml, meta = {}) {
+    const t0 = Date.now();
     const html = String(resultHtml || '');
     const patch = {
       status: 'delivered',
@@ -89,21 +113,44 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
     };
     let ok = await updateRow(id, patch);
     if (!ok) ok = await updateRow(id, patch); // one retry
+    timeStage('settle', { ms: Date.now() - t0, outcome: 'delivered', ok, ...meta });
     return ok;
   }
 
   // §5 FAILED — every failure leaves a CLEAN, re-dispatchable row (null job_id/started/finished).
-  async function settleFailed(id, reason) {
+  // RUN 17 T2: error_text is what a client reads, so it goes through plainReason;
+  // the raw reason stays in maveloper_jobs.error_message and in the log.
+  async function settleFailed(id, reason, meta = {}) {
+    const t0 = Date.now();
     const patch = {
       status: 'failed',
-      error_text: reason,
+      error_text: plainReason(reason),
       job_id: null,
       started_at: null,
       finished_at: null,
     };
     let ok = await updateRow(id, patch);
     if (!ok) ok = await updateRow(id, patch); // one retry
+    timeStage('settle', { ms: Date.now() - t0, outcome: 'failed', ok, ...meta });
     return ok;
+  }
+
+  /** L1/L5: fail the job row too, so nothing waits on it. Its bridge record stays. */
+  async function failJobRow(jobId, why) {
+    const { error } = await supabaseAdmin
+      .from('maveloper_jobs')
+      .update({ status: 'failed', error_message: why, completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', jobId)
+      .in('status', ['pending', 'running']);
+    if (error) log('warn', 'Runner: job row fail write failed', { jobId, error: error.message });
+  }
+
+  /** The bridge record a dispatch leaves on the job row (run 17), or the older tag. */
+  function bridgeJobIdOf(job) {
+    const dm = job && job.delivery_meta && typeof job.delivery_meta === 'object' ? job.delivery_meta : null;
+    if (dm && dm.bridge && dm.bridge.bridgeJobId) return String(dm.bridge.bridgeJobId);
+    const tag = String((job && job.error_message) || '');
+    return tag.startsWith('__BRIDGE__:') ? tag.slice('__BRIDGE__:'.length) : null;
   }
 
   // ---- the tick ----
@@ -113,6 +160,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
   // implementation. Returns the same shape tick() has always returned.
   async function claimAndDispatch(pick, now) {
       // E. ATOMIC CLAIM — the .eq(status,pending).is(job_id,null) guards ARE the lock.
+      const tClaim = Date.now();
       const { data: claimed, error: claimErr } = await supabaseAdmin
         .from('os_queue')
         .update({ status: 'processing', started_at: new Date().toISOString() })
@@ -127,6 +175,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
       if (!claimed || claimed.length === 0) {
         return { dispatched: null, reason: 'claim lost (raced)' };
       }
+      timeStage('claim', { ms: Date.now() - tClaim, orderId: pick.order_id, waitedMs: Date.now() - Date.parse(pick.uploaded_at) });
 
       // F. DISPATCH — reuse the existing async path IN-PROCESS. Exactly the 5 client fields.
       const jobBody = {
@@ -172,7 +221,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         if (!jobId) throw new Error('async path returned no jobId');
       } catch (err) {
         const msg = `Runner dispatch failed: ${err.message}`;
-        await settleFailed(pick.id, msg);
+        await settleFailed(pick.id, msg, { orderId: pick.order_id });
         log('error', 'Runner: dispatch failed', { id: pick.id, order: pick.order_id, error: err.message });
         return { dispatched: null, reason: msg };
       }
@@ -207,13 +256,13 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
         if (r.job_id) {
           const { data: job } = await supabaseAdmin
             .from('maveloper_jobs')
-            .select('id,status,result_html,error_message')
+            .select('id,status,result_html,error_message,delivery_meta,created_at,completed_at')
             .eq('id', r.job_id)
             .maybeSingle();
 
           if (!job) {
             // MISSING JOB (§6) — processing with a job_id but no maveloper_jobs row.
-            await settleFailed(r.id, 'Auto-cleared: processing job row missing');
+            await settleFailed(r.id, 'Auto-cleared: processing job row missing', { orderId: r.order_id });
             log('warn', 'Runner: settled row with missing maveloper_jobs row', { id: r.id, order: r.order_id, jobId: r.job_id });
             continue;
           }
@@ -221,10 +270,11 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
           const js = String(job.status || '').toLowerCase();
           if (js === 'completed') {
             if (job.result_html) {
-              await settleDelivered(r.id, job.result_html);
+              const doneMs = job.completed_at ? Date.parse(job.completed_at) : NaN;
+              await settleDelivered(r.id, job.result_html, { orderId: r.order_id, sinceCompleteMs: Number.isFinite(doneMs) ? Date.now() - doneMs : null });
               log('info', 'Runner: settled delivered', { id: r.id, order: r.order_id, bytes: String(job.result_html).length });
             } else {
-              await settleFailed(r.id, 'Job completed but no HTML returned');
+              await settleFailed(r.id, 'Job completed but no HTML returned', { orderId: r.order_id });
               log('warn', 'Runner: completed with no HTML → failed', { id: r.id, order: r.order_id });
             }
             continue;
@@ -241,23 +291,57 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
             const meaningful = rawReason && !rawReason.startsWith('__BRIDGE__:') ? rawReason : '';
             const reason = meaningful
               ? meaningful.slice(0, 500)
-              : 'Bridge/generation failed — no detail returned';
-            await settleFailed(r.id, reason);
+              : 'Bridge/generation failed, no detail returned';
+            await settleFailed(r.id, reason, { orderId: r.order_id });
             log('warn', 'Runner: settled failed (maveloper_jobs failed)', { id: r.id, order: r.order_id, reason: reason.slice(0, 160) });
             continue;
           }
-          // still running/pending → in flight. Only intervene on the 35-min timeout (§3).
+          // still running/pending → in flight.
+          const bj = bridgeJobIdOf(job);
+          // RUN 17 L5: a job with no bridge record that THIS process did not
+          // start was being prepared by a process that is gone (a restart). Its
+          // dispatch will never happen, so it fails now, in plain words, instead
+          // of waiting out MAX_JOB_MS. (One backend process is assumed, as the
+          // in-memory PENDING_BRIDGE_JOBS map already assumes.)
+          if (!bj && isLocalJob && !isLocalJob(r.job_id)) {
+            await failJobRow(r.job_id, 'engine lost the job: the backend restarted before dispatch');
+            await settleFailed(r.id, ENGINE_LOST, { orderId: r.order_id, why: 'restart-before-dispatch' });
+            log('warn', 'Runner: in-flight job prepared by a process that is gone → failed', { id: r.id, order: r.order_id, jobId: r.job_id });
+            continue;
+          }
+          // RUN 17 L1: ask the engine whether it still holds the job.
+          if (bj && cfg.engineProbe && probeEngineJob) {
+            const ps = probeState.get(r.job_id) || { lastAt: 0, unknown: 0, unreachable: 0 };
+            if (now - ps.lastAt >= cfg.engineProbeMs) {
+              ps.lastAt = now;
+              const said = await probeEngineJob(bj).catch(() => 'unreachable');
+              if (said === 'unknown') ps.unknown += 1;
+              else if (said === 'unreachable') ps.unreachable += 1;
+              else { ps.unknown = 0; ps.unreachable = 0; }
+              probeState.set(r.job_id, ps);
+              log('info', 'Runner: engine job probe', { order: r.order_id, bridgeJobId: bj, said, unknown: ps.unknown, unreachable: ps.unreachable });
+              if (ps.unknown >= cfg.engineLostAfter || ps.unreachable >= cfg.engineLostAfter + 1) {
+                probeState.delete(r.job_id);
+                await failJobRow(r.job_id, `engine lost the job (probe: ${said})`);
+                await settleFailed(r.id, ENGINE_LOST, { orderId: r.order_id, why: 'engine-lost' });
+                log('warn', 'Runner: engine no longer holds the job → failed', { id: r.id, order: r.order_id, bridgeJobId: bj });
+                continue;
+              }
+            }
+          }
+          // The last resort (§3), its value unchanged: MAX_JOB_MS, default 35 min.
           if (age != null && age > cfg.maxJobMs) {
-            await settleFailed(r.id, 'Generation timed out (>35 min)');
+            await failJobRow(r.job_id, `timed out after ${Math.round(cfg.maxJobMs / 60000)} min`);
+            await settleFailed(r.id, tookTooLong(cfg.maxJobMs / 60000), { orderId: r.order_id });
             log('warn', 'Runner: in-flight job exceeded MAX_JOB_MS → failed', { id: r.id, order: r.order_id, ageMs: age });
           }
         } else {
           // processing with NO job_id → orphan tiers (§6).
           if (age != null && age > cfg.stuckMs) {
-            await settleFailed(r.id, 'Auto-failed: stuck in processing > 60 min (self-heal)');
+            await settleFailed(r.id, 'Auto-failed: stuck in processing > 60 min (self-heal)', { orderId: r.order_id });
             log('warn', 'Runner: self-heal freed stuck row (>60m)', { id: r.id, order: r.order_id });
           } else if (age != null && age > cfg.orphanMs) {
-            await settleFailed(r.id, 'Auto-cleared: processing with no job');
+            await settleFailed(r.id, 'Auto-cleared: processing with no job', { orderId: r.order_id });
             log('warn', 'Runner: auto-cleared orphan (>5m, no job_id)', { id: r.id, order: r.order_id });
           }
           // age == null (no started_at) → cannot age it; leave for a later tick / manual.
@@ -481,6 +565,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env 
     log('info', `Queue runner boot: ${cfg.enabled ? 'ENABLED' : 'DISABLED'}`, {
       enabled: cfg.enabled,
       pollMs: cfg.pollMs,
+      engineProbe: cfg.engineProbe,
+      engineProbeMs: cfg.engineProbeMs,
       maxJobMs: cfg.maxJobMs,
       orphanMs: cfg.orphanMs,
       stuckMs: cfg.stuckMs,
