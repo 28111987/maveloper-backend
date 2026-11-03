@@ -14,3 +14,5 @@ bash order-control.db.sh stop ; docker rm -f mav-run17-pg
 ```
 
 The old arm (the code before run 17): `OC_ARM=old OC_BACKEND_DIR=<a checkout of a3aeea0 with node_modules> node order-control.test.mjs ...`.
+
+**The engine choice (run 18)**: on the same database (with the console's `20261103_0001_engine_choice.sql`) and fake engine, which now records every request body it receives: `node order-control.test.mjs E123 E4 E5` checks that a row's 'TOPAZ' or 'DIAMOND' reaches the engine as `payload.engine`, a row with no choice sends no field and a body byte for byte the reference arm's (`OC_E3_REF=<that arm's E3 body>`, `OC_BODIES=<dir>` to keep the bodies, secrets masked), the async route sends only the exact names, and a retried order keeps its own engine. `R1` runs against a template built with `OC_EXCLUDE=20261103_0001_engine_choice.sql` (the queue keeps running without the column). `node engine-release.test.mjs` checks that the order confirmation names the release that ran (E8).

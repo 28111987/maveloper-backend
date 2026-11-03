@@ -27,7 +27,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { createHmac, randomUUID } from "node:crypto";
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -240,10 +240,10 @@ function parkSeedOrders() {
         where status in ('pending','processing');`);
 }
 
-async function insertOrder({ space, lead, status = "pending", uploadedAt, n = nextN(), errorText = null, jobId = null, startedAt = null, finishedAt = null, html = null, manualRank = null }) {
+async function insertOrder({ space, lead, status = "pending", uploadedAt, n = nextN(), errorText = null, jobId = null, startedAt = null, finishedAt = null, html = null, manualRank = null, engine, orderId }) {
   const p = PEOPLE[lead];
   const row = {
-    order_id: `OC${ARM.toUpperCase()}-${n}`,
+    order_id: orderId || `OC${ARM.toUpperCase()}-${n}`,
     figma_url: figmaUrlFor(n),
     tat_hours: 24,
     deadline: "2026-12-31T00:00:00Z",
@@ -259,6 +259,9 @@ async function insertOrder({ space, lead, status = "pending", uploadedAt, n = ne
     html_content: html,
     manual_rank: manualRank,
   };
+  // RUN 18: os_queue.engine only when the scenario names one, so every S1-S7
+  // row is exactly the row it was (and still inserts on a database without it).
+  if (engine !== undefined) row.engine = engine;
   const r = await rest("POST", "os_queue", { body: row, prefer: "return=representation" });
   if (r.status !== 201) throw new Error("insert os_queue failed: " + JSON.stringify(r.data));
   return r.data[0];
@@ -798,8 +801,194 @@ async function S7() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// RUN 18. THE ENGINE AN ORDER ASKED FOR, CARRIED TO THE ENGINE (V4, V5).
+// Expected values from the run 18 brief's rules, never from the code:
+//   V4  payload.engine is present ONLY as the exact string "TOPAZ" or
+//       "DIAMOND", taken from the row (runner) or the body (the async route);
+//       anything else sends no field and is logged once as ignored.
+//   E3  a row with no choice (null) sends NO engine key, and its body is,
+//       byte for byte, the body the previous arm sent for the same row.
+//   V5  a retried order keeps its own engine.
+// The database for E1, E2, E3 and E5 carries os_queue.engine (the run 18
+// migration); the old arm is today's backend on that database.
+// Bodies go to $OC_BODIES (secrets masked) when it is set.
+// ══════════════════════════════════════════════════════════════════════════
+const BODIES = process.env.OC_BODIES || null;
+// Fields that differ on every dispatch by construction, masked before a
+// byte comparison. figmaToken is masked ALWAYS: it is a credential, even a dummy.
+const MASK_RANDOM = ["bridgeJobId", "maveloperJobId", "callbackUrl", "requestId"];
+const MASK_SECRET = ["figmaToken"];
+function maskBody(raw) {
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const [k, x] of Object.entries(v)) {
+        out[k] = MASK_SECRET.includes(k) ? "<masked:secret>" : MASK_RANDOM.includes(k) ? "<masked:per-run>" : walk(x);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(walk(JSON.parse(raw)));
+}
+function saveBody(name, raw) {
+  if (!BODIES || raw == null) return;
+  const masked = maskBody(raw);
+  writeFileSync(path.join(BODIES, `${name}-${ARM}.json`), masked);
+  writeFileSync(path.join(BODIES, `${name}-${ARM}.pretty.json`), JSON.stringify(JSON.parse(masked), null, 2));
+}
+const hasKey = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+const showEngine = (p) => (hasKey(p, "engine") ? JSON.stringify(p.engine) : "(no engine key)");
+const buildFor = (E, fileKey) => E.engine.builds.filter((b) => b.raw && b.raw.includes(fileKey));
+
+// E1 'TOPAZ', E2 'DIAMOND', E3 null: the SERVER RUNNER dispatches each row.
+async function E123() {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const E = await env0();
+  const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000" } });
+  try {
+    const cases = [
+      { s: "E1", engine: "TOPAZ", n: 900001, want: '"TOPAZ"' },
+      { s: "E2", engine: "DIAMOND", n: 900002, want: '"DIAMOND"' },
+      { s: "E3", engine: null, n: 900003, want: "(no engine key)" },
+    ];
+    for (const c of cases) {
+      const o = await insertOrder({ space: "B", lead: "dev-b", n: c.n, orderId: `${c.s}-ROW`, engine: c.engine });
+      const done = await waitFor(async () => {
+        const r = await getOrder(o.id);
+        return r && (r.status === "delivered" || r.status === "failed") ? r : null;
+      }, 90000, 1000);
+      const fileKey = `OCfile${String(c.n).padStart(10, "0")}`;
+      const b = buildFor(E, fileKey);
+      record(c.s, `runner, row engine ${c.engine === null ? "null" : `'${c.engine}'`}`, "setup: the row delivered on one build", "delivered, 1", `${done?.status}, ${b.length}`);
+      record(c.s, `runner, row engine ${c.engine === null ? "null" : `'${c.engine}'`}`, "V4 payload.engine as received by the engine", c.want, b[0] ? showEngine(b[0].payload) : "(no request)");
+      if (b[0]) saveBody(`${c.s}-runner`, b[0].raw);
+      if (c.s === "E3" && b[0]) {
+        // byte for byte against the reference arm's body for the same row
+        const ref = process.env.OC_E3_REF ? readFileSync(process.env.OC_E3_REF, "utf8") : null;
+        if (ref) {
+          const mine = maskBody(b[0].raw);
+          record("E3", "runner, row engine null", `E3 the body equals the reference arm's byte for byte (masked: ${[...MASK_SECRET, ...MASK_RANDOM].join(", ")})`, "identical", mine === ref ? "identical" : `differs (${mine.length} vs ${ref.length} bytes)`);
+        }
+      }
+    }
+    record("E1-E3", "runner", "no request left this machine", 0, srv.refused.length);
+  } finally {
+    await srv.stop();
+    await E.close();
+  }
+}
+
+// E4 POST /generate-from-figma-async with body.engine in seven shapes.
+async function E4() {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const E = await env0();
+  const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "false" } });
+  const ABSENT = Symbol("absent");
+  const cases = [
+    { name: '"TOPAZ"', v: "TOPAZ", want: '"TOPAZ"', ignored: 0 },
+    { name: '"DIAMOND"', v: "DIAMOND", want: '"DIAMOND"', ignored: 0 },
+    { name: "absent", v: ABSENT, want: "(no engine key)", ignored: 1 },
+    { name: '"topaz"', v: "topaz", want: "(no engine key)", ignored: 1 },
+    { name: '" TOPAZ"', v: " TOPAZ", want: "(no engine key)", ignored: 1 },
+    { name: "7", v: 7, want: "(no engine key)", ignored: 1 },
+    { name: "null", v: null, want: "(no engine key)", ignored: 1 },
+  ];
+  try {
+    let i = 0;
+    for (const c of cases) {
+      i++;
+      const n = 910000 + i;
+      const orderId = `E4-${i}`;
+      const body = { figmaUrl: figmaUrlFor(n), orderId, darkMode: false, tatHours: 24 };
+      if (c.v !== ABSENT) body.engine = c.v;
+      const r = await fetch(`${srv.base}/generate-from-figma-async`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${tokenOf("dev-b")}` },
+        body: JSON.stringify(body),
+      });
+      const fileKey = `OCfile${String(n).padStart(10, "0")}`;
+      await waitFor(async () => buildFor(E, fileKey).length >= 1, 60000, 300);
+      const b = buildFor(E, fileKey);
+      record("E4", `async route, body.engine ${c.name}`, "setup: the route accepted (202) and the engine got one request", "202, 1", `${r.status}, ${b.length}`);
+      record("E4", `async route, body.engine ${c.name}`, "V4 payload.engine as received by the engine", c.want, b[0] ? showEngine(b[0].payload) : "(no request)");
+      const ign = srv.logs().filter((l) => l.msg === "Engine choice ignored" && l.orderId === orderId);
+      record("E4", `async route, body.engine ${c.name}`, "V4 an ignored value is logged once as ignored", c.ignored, ign.length);
+      if (b[0]) saveBody(`E4-${i}-${c.name.replace(/[^A-Za-z0-9]+/g, "_")}`, b[0].raw);
+    }
+    record("E4", "async route", "no request left this machine", 0, srv.refused.length);
+  } finally {
+    await srv.stop();
+    await E.close();
+  }
+}
+
+// E5 RUN 17's RETRY of a failed 'TOPAZ' row: the second dispatch carries TOPAZ too.
+async function E5() {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const E = await env0();
+  E.engine.set({ dieAfterAccept: true });
+  const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000" } });
+  try {
+    const n = 920001;
+    const fileKey = `OCfile${String(n).padStart(10, "0")}`;
+    const o = await insertOrder({ space: "B", lead: "dev-b", n, orderId: "E5-ROW", engine: "TOPAZ" });
+    await waitFor(async () => buildFor(E, fileKey).length >= 1, 60000, 300);
+    // the build is lost; the space's Admin stops it, so the order is failed
+    E.engine.set({ dieAfterAccept: false, buildMs: 300 });
+    const st = await fetch(`${srv.base}/os/orders/${o.id}/stop`, { method: "POST", headers: { authorization: `Bearer ${tokenOf("admin-b")}` } });
+    const failed = await waitFor(async () => ((await getOrder(o.id))?.status === "failed" ? true : null), 20000, 500);
+    record("E5", "retry of a failed 'TOPAZ' row", "setup: stopped, the order is failed", "200, failed", `${st.status}, ${failed ? "failed" : (await getOrder(o.id))?.status}`);
+    const rt = await fetch(`${srv.base}/os/orders/${o.id}/retry`, { method: "POST", headers: { authorization: `Bearer ${tokenOf("admin-b")}` } });
+    const done = await waitFor(async () => ((await getOrder(o.id))?.status === "delivered" ? true : null), 90000, 1000);
+    const b = buildFor(E, fileKey);
+    record("E5", "retry of a failed 'TOPAZ' row", "setup: retried (200), delivered, two dispatches", "200, delivered, 2", `${rt.status}, ${done ? "delivered" : (await getOrder(o.id))?.status}, ${b.length}`);
+    record("E5", "retry of a failed 'TOPAZ' row", "V4 the first dispatch's payload.engine", '"TOPAZ"', b[0] ? showEngine(b[0].payload) : "(no request)");
+    record("E5", "retry of a failed 'TOPAZ' row", "V5 the retried dispatch's payload.engine", '"TOPAZ"', b[1] ? showEngine(b[1].payload) : "(no request)");
+    record("E5", "retry of a failed 'TOPAZ' row", "V5 the row still reads 'TOPAZ'", "TOPAZ", (await getOrder(o.id))?.engine);
+    if (b[0]) saveBody("E5-first", b[0].raw);
+    if (b[1]) saveBody("E5-retry", b[1].raw);
+    record("E5", "retry", "no request left this machine", 0, srv.refused.length);
+  } finally {
+    await srv.stop();
+    await E.close();
+  }
+}
+
+// R1 THE REVERT MATRIX: this backend on a database WITHOUT os_queue.engine
+// (template built with OC_EXCLUDE=20261103_0001_engine_choice.sql). Rule: the
+// queue keeps running; an order dispatches as an order with no choice (no
+// engine field) and delivers; the runner says once that the column is absent.
+async function R1() {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  const hasColumn = psql("select count(*) from information_schema.columns where table_name = 'os_queue' and column_name = 'engine'");
+  record("R1", "database without the column", "setup: os_queue has no engine column", "0", hasColumn);
+  parkSeedOrders();
+  const E = await env0();
+  const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000" } });
+  try {
+    const n = 930001;
+    const o = await insertOrder({ space: "B", lead: "dev-b", n, orderId: "R1-ROW" });
+    const done = await waitFor(async () => ((await getOrder(o.id))?.status === "delivered" ? true : null), 90000, 1000);
+    const b = buildFor(E, `OCfile${String(n).padStart(10, "0")}`);
+    record("R1", "database without the column", "the order delivers on one build", "delivered, 1", `${done ? "delivered" : (await getOrder(o.id))?.status}, ${b.length}`);
+    record("R1", "database without the column", "payload.engine", "(no engine key)", b[0] ? showEngine(b[0].payload) : "(no request)");
+    const warned = srv.logs().filter((l) => /no engine column/.test(l.msg || ""));
+    record("R1", "database without the column", "the runner says once that the column is absent", 1, warned.length);
+    if (b[0]) saveBody("R1-nocolumn", b[0].raw);
+  } finally {
+    await srv.stop();
+    await E.close();
+  }
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
-const ALL = { S1, S2, S3, S4, S5, S6, S7 };
+const ALL = { S1, S2, S3, S4, S5, S6, S7, E123, E4, E5, R1 };
 const want = process.argv.slice(2).filter((a) => ALL[a]);
 const run = want.length ? want : Object.keys(ALL);
 console.log(`order-control: arm ${ARM}, backend ${BACKEND_DIR}, scenarios ${run.join(" ")}`);

@@ -21,6 +21,11 @@
 //
 // Every POST /generate is recorded with its bridgeJobId, so a test can count
 // BUILDS per order: a build is a /generate whose body was read and accepted.
+//
+// RUN 18: every POST /generate body is ALSO recorded as received, raw text and
+// parsed, in `requests` (accepted or not, in arrival order), and each build
+// carries its own `raw` and `payload`, so a test can read exactly what the
+// backend sent (payload.engine among it) and compare two arms byte for byte.
 import { createServer } from "node:http";
 
 export function createFakeEngine({ secret, log = () => {} } = {}) {
@@ -39,6 +44,7 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
   const builds = [];            // { bridgeJobId, at, maveloperJobId, hasToken }
   const health = [];            // timestamps of /health answered
   const callbacks = [];         // { bridgeJobId, status, at }
+  const requests = [];          // { at, raw, payload } every POST /generate body as received
   const timers = new Set();
 
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { timers.delete(t); r(); }, ms); timers.add(t); });
@@ -99,7 +105,8 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     if (req.method === "POST" && url.pathname === "/generate") {
       if (req.headers["x-bridge-secret"] !== secret) return send(res, 401, { error: "Unauthorized" });
       let payload;
-      try { payload = JSON.parse(raw); } catch { return send(res, 400, { error: "Invalid JSON body" }); }
+      try { payload = JSON.parse(raw); } catch { requests.push({ at: Date.now(), raw, payload: null }); return send(res, 400, { error: "Invalid JSON body" }); }
+      requests.push({ at: Date.now(), raw, payload });
       const { bridgeJobId, callbackUrl } = payload;
       if (!bridgeJobId || !callbackUrl) return send(res, 400, { error: "Missing bridgeJobId or callbackUrl" });
       if (opts.acceptDelayMs) await wait(opts.acceptDelayMs);
@@ -113,6 +120,8 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
         maveloperJobId: payload.maveloperJobId || null,
         hasToken: typeof payload.figmaToken === "string" && payload.figmaToken.length > 0,
         callerGone: aborted,
+        raw,
+        payload,
       });
       log(`[fake-engine] accepted ${bridgeJobId}${aborted ? " (caller already gone)" : ""}`);
       send(res, 202, { jobId: "fake_" + builds.length, bridgeJobId, status: "accepted" });
@@ -146,6 +155,7 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     builds,
     health,
     callbacks,
+    requests,
     jobs,
     set(o) { Object.assign(opts, o); },
     cold() { readyAt = null; },
