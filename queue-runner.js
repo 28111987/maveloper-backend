@@ -37,6 +37,18 @@ import { normalisedOrgId as normaliseOrgId } from './figma-credential.js';
 // RUN 17: what a client reads on a failed order, in one place (order-words.js).
 import { plainReason, tookTooLong, ENGINE_LOST } from './order-words.js';
 
+// The active rows' columns, as they have always been. RUN 18 asks for `engine`
+// on top of them (section C), and falls back to exactly this list on a
+// database without that column.
+const ACTIVE_COLUMNS = 'id,order_id,org_id,tat_hours,uploaded_at,status,lead_user_id,manual_rank,effective_deadline,locked,locked_at,figma_url,esp,dark_mode,job_id';
+// Undefined column (42703), named as os_queue.engine. Anything else is a real
+// failure and keeps today's handling.
+export function isMissingEngineColumn(err) {
+  if (!err) return false;
+  const msg = String(err.message || '');
+  return (err.code === '42703' || /does not exist|could not find/i.test(msg)) && /\bengine\b/.test(msg);
+}
+
 /**
  * RUN 17 HOOKS, all optional so an older caller keeps today's behaviour:
  *   probeEngineJob(bridgeJobId) -> 'known' | 'unknown' | 'unreachable' | 'unsupported'
@@ -82,6 +94,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
   let pollTimer = null;
   let heartbeatTimer = null;
   let runnerReqCounter = 0;
+  let engineColumnWarned = false; // RUN 18: said once per process, see section C
 
   const state = {
     runnerLastSeen: null,
@@ -185,6 +198,11 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
         tatHours: Number(pick.tat_hours),
       };
       if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
+      // RUN 18 V4: the row's engine choice travels as it is stored. A row with
+      // no choice (null, every row from before run 18) adds nothing, so its
+      // body is exactly today's; callClaudeCodeBridge decides what reaches the
+      // engine (only the exact "TOPAZ" or "DIAMOND").
+      if (pick.engine !== null && pick.engine !== undefined) jobBody.engine = pick.engine;
 
       // ── ★★ THE JOIN. THE ONE LINE THAT MAKES AN ORDER USE ITS OWN SPACE'S
       //    FIGMA CREDENTIAL. ────────────────────────────────────────────────
@@ -395,10 +413,26 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
       // selected because the columns keep their history and this row shape is
       // what the rest of the tick passes around; narrowing the select would be a
       // second, unrelated change riding along with the ordering one.
-      const { data: activeRows, error: activeErr } = await supabaseAdmin
+      //
+      // RUN 18: `engine` (the DIAMOND / TOPAZ choice, os_queue.engine) is read
+      // here and nowhere else in the runner. PostgREST answers a select naming a
+      // column the database does not have with 42703 and NO rows, so on a
+      // database without the run 18 migration every tick would end below and no
+      // order would ever dispatch. That case reads the list without `engine`
+      // (every row then dispatches as a row with no choice, i.e. DIAMOND), says
+      // so once, and asks with `engine` again on the next tick.
+      const readActive = (cols) => supabaseAdmin
         .from('os_queue')
-        .select('id,order_id,org_id,tat_hours,uploaded_at,status,lead_user_id,manual_rank,effective_deadline,locked,locked_at,figma_url,esp,dark_mode,job_id')
+        .select(cols)
         .in('status', ['pending', 'processing']);
+      let { data: activeRows, error: activeErr } = await readActive(`${ACTIVE_COLUMNS},engine`);
+      if (activeErr && isMissingEngineColumn(activeErr)) {
+        if (!engineColumnWarned) {
+          engineColumnWarned = true;
+          log('warn', 'Runner: os_queue has no engine column (run 18 migration not applied); dispatching every order with no engine choice', { error: activeErr.message });
+        }
+        ({ data: activeRows, error: activeErr } = await readActive(ACTIVE_COLUMNS));
+      }
       if (activeErr) {
         log('warn', 'Runner: active-rows load failed', { error: activeErr.message });
         return { dispatched: null, reason: `active load failed: ${activeErr.message}` };

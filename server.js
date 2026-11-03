@@ -2566,7 +2566,7 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink, engine }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
   }
@@ -2675,6 +2675,25 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   // Putting the token inside it would have printed it on the very next line.
   if (typeof figmaToken === "string" && figmaToken) {
     payload.figmaToken = figmaToken;
+  }
+
+  // ── RUN 18: THE ENGINE THE ORDER ASKED FOR (DIAMOND OR TOPAZ). ─────────
+  // The contract agreed with the engine on 3 NOV: ONE optional field,
+  // payload.engine, sent ONLY as the exact string "TOPAZ" or "DIAMOND". The
+  // engine runs DIAMOND for anything else (engine-select.mjs, asked === "TOPAZ"
+  // exactly) and records what actually ran on the provenance record. Every
+  // other value (absent, null, "topaz", " TOPAZ", a number) sends NO field, so
+  // an order with no choice sends a body byte for byte as before, and is said
+  // once in the log. The value is a family name, never a credential.
+  if (engine === "TOPAZ" || engine === "DIAMOND") {
+    payload.engine = engine;
+    log("info", "Engine choice sent", { requestId, orderId, maveloperJobId, engine });
+  } else {
+    log("info", "Engine choice ignored", {
+      requestId, orderId, maveloperJobId,
+      asked: engine === undefined ? "(absent)" : JSON.stringify(engine).slice(0, 40),
+      sent: "no engine field (the engine runs DIAMOND)",
+    });
   }
 
   log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
@@ -3484,6 +3503,9 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
           // RUN 17 T3: the sentence naming WHICH credential read the design, kept
           // on the job row so every completion path can record it.
           figmaCredentialLine: figmaCredentialProvenanceLine(figmaCred),
+          // RUN 18: the order's engine choice as it came in (the runner's row, or
+          // the async route's body); callClaudeCodeBridge sends only the exact names.
+          engine: req.body?.engine,
           orderId,
           jobStartedAt: Number(req.body?._jobStartedAt) || null,
           log,

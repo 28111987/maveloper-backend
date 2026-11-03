@@ -504,6 +504,11 @@ export function readProvenanceFacts({ provenance, certificate, deliveredHtml, im
     banner: p && typeof p.banner === "string" ? p.banner : null,
     humanBlock: p && typeof p.humanBlock === "string" ? p.humanBlock : null,
     diamondTag: p && p.diamondTag !== undefined && p.diamondTag !== null ? p.diamondTag : null,
+    // RUN 18: the release that ACTUALLY ran (the engine's stampEngine, agreed
+    // 3 NOV). diamondTag keeps its old meaning, the checked-out tree's tag, and
+    // is not the release when engineRelease exists (a TOPAZ-1 order still
+    // carries diamondTag DIAMOND-158).
+    engineRelease: p && typeof p.engineRelease === "string" && p.engineRelease.trim() ? p.engineRelease : null,
     fallback,
     // compiler.notAttemptedBecause distinguishes "the compiler refused" from
     // "the compiler was never asked" — two very different things to tell a lead.
@@ -624,15 +629,18 @@ export function buildLeadSummary(facts, { placeholderCount = 0 } = {}) {
 
   if (isCompiler && !fellBack && !refused && !saysNotShipped) {
     const unproven = facts.proven === false || (facts.exitCode && facts.exitCode.value === 1);
+    // RUN 18 (V10): the release that ran first; today's field only for a
+    // record from before the engine stamped one.
+    const release = facts.engineRelease || facts.diamondTag;
     return {
       state: "shipped",
       tone: "lime",
       isCompiler: true,
       fellBack: false,
-      engineLabel: facts.diamondTag
-        ? `Deterministic compiler (${facts.diamondTag})`
+      engineLabel: release
+        ? `Deterministic compiler (${release})`
         : "Deterministic compiler",
-      chip: facts.diamondTag ? `COMPILER &middot; ${esc(facts.diamondTag)}` : "DETERMINISTIC COMPILER",
+      chip: release ? `COMPILER &middot; ${esc(release)}` : "DETERMINISTIC COMPILER",
       headline: "Built by the compiler, straight from your Figma.",
       // ★ certify exit 1 means it shipped WITH known divergences (OUTPUT POLICY
       //   §8). The detail table that used to itemise them is gone, so the one
