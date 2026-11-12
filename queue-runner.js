@@ -37,6 +37,46 @@ import { normalisedOrgId as normaliseOrgId } from './figma-credential.js';
 // RUN 17: what a client reads on a failed order, in one place (order-words.js).
 import { plainReason, tookTooLong, ENGINE_LOST } from './order-words.js';
 
+// ── RUN 19: AN ORDER THAT MEETS AN ENGINE UPDATE IS SENT AGAIN ───────────────
+// The TOPAZ-3 engine drains when Cloud Run stops an instance, and says so in two
+// ways (bridge-server.mjs, topaz3-sp cd03753f):
+//   S-DRAIN  a POST /generate after SIGTERM is answered 503, Retry-After: 5,
+//            {"status":"draining",...,"engineDraining":true}; nothing is built.
+//   S-STOP   a build that cannot finish in the drain window gets ONE callback
+//            { error, exitCode:null, signal:"SIGTERM", engineStopped:true, ... }.
+// The bounds live HERE, read once from the environment (server.js imports them).
+export function engineUpdateLimits(env = {}) {
+  const int = (v, d) => {
+    if (v === undefined || v === null || String(v).trim() === '') return d;
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 0 ? n : d;
+  };
+  return {
+    drainResendMax: int(env.DRAIN_RESEND_MAX, 3),       // D2: re-sends per dispatch after S-DRAIN
+    stopRedispatchMax: int(env.STOP_REDISPATCH_MAX, 2), // D4: re-sends per order after S-STOP
+  };
+}
+
+/** D1: S-DRAIN is a 503 whose JSON body says engineDraining true (or status "draining"). Nothing else is. */
+export function isDrainAnswer(status, text) {
+  if (status !== 503) return false;
+  try {
+    const b = JSON.parse(String(text || ''));
+    return Boolean(b && typeof b === 'object' && (b.engineDraining === true || b.status === 'draining'));
+  } catch {
+    return false;
+  }
+}
+
+/** D2: an integer Retry-After in seconds; absent, unreadable or below 1 means 5; above 30 means 30. */
+export function retryAfterSeconds(header) {
+  const s = String(header ?? '').trim();
+  if (!/^\d+$/.test(s)) return 5;
+  const n = Number(s);
+  if (n < 1) return 5;
+  return Math.min(n, 30);
+}
+
 // The active rows' columns, as they have always been. RUN 18 asks for `engine`
 // on top of them (section C), and falls back to exactly this list on a
 // database without that column.
@@ -85,6 +125,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
     engineProbe: String(env.ENGINE_JOB_PROBE || '').toLowerCase() === 'true',
     engineProbeMs: Number(env.ENGINE_JOB_PROBE_MS) || 45000,
     engineLostAfter: Number(env.ENGINE_JOB_LOST_AFTER) || 2,
+    // RUN 19 D2/D4/D6: the engine-update bounds (shown on the boot line).
+    ...engineUpdateLimits(env),
   };
   const probeState = new Map(); // jobId -> { lastAt, unknown, unreachable }
   const timeStage = (name, fields) => { try { if (stage) stage(name, fields); } catch { /* never fails a tick */ } };
@@ -166,7 +208,107 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
     return tag.startsWith('__BRIDGE__:') ? tag.slice('__BRIDGE__:'.length) : null;
   }
 
+  /**
+   * RUN 19 D6: the engine stopped this order's build (S-STOP) while no process
+   * held the order's wait (this backend had restarted). /bridge-callback failed
+   * that job row, recorded the stop in delivery_meta.engineStops and marked it
+   * engineStopResend 'runner'. The order is still `processing`, so it keeps its
+   * row and its place; here it is sent again through the same path a claim
+   * uses (a new job row, so a new bridgeJobId), at most stopRedispatchMax times
+   * per order (the new job carries the stop list). Returns true when it handled
+   * the row; false leaves today's failed-job handling untouched.
+   */
+  async function resendAfterEngineStop(r, job) {
+    const dm = job && job.delivery_meta && typeof job.delivery_meta === 'object' ? job.delivery_meta : null;
+    if (!dm || dm.engineStopResend !== 'runner' || !Array.isArray(dm.engineStops)) return false;
+    const stops = dm.engineStops;
+    const last = stops[stops.length - 1] || {};
+    if (stops.length > cfg.stopRedispatchMax) {
+      await settleFailed(r.id, `engine stopped: the engine was stopped for an update ${stops.length} times while building this order (engineStopped); not sent again`, { orderId: r.order_id, why: 'engine-stopped' });
+      log('warn', 'Runner: engine stopped the order more often than it is sent again → failed', { id: r.id, order: r.order_id, stops: stops.length, max: cfg.stopRedispatchMax });
+      return true;
+    }
+    // One re-send per stop, even across two ticks or two processes: the mark is
+    // taken with a guarded update, like the claim.
+    const { data: took, error: takeErr } = await supabaseAdmin
+      .from('maveloper_jobs')
+      .update({ delivery_meta: { ...dm, engineStopResend: 'sent' } })
+      .eq('id', job.id)
+      .eq('delivery_meta->>engineStopResend', 'runner')
+      .select('id');
+    if (takeErr) {
+      log('warn', 'Runner: engine-stop re-send mark failed', { id: r.id, order: r.order_id, error: takeErr.message });
+      return true; // try again next tick
+    }
+    if (!took || took.length === 0) return true;
+    let { data: row, error: rowErr } = await supabaseAdmin.from('os_queue').select(`${ACTIVE_COLUMNS},engine`).eq('id', r.id).maybeSingle();
+    if (rowErr && isMissingEngineColumn(rowErr)) ({ data: row, error: rowErr } = await supabaseAdmin.from('os_queue').select(ACTIVE_COLUMNS).eq('id', r.id).maybeSingle());
+    if (rowErr || !row || row.status !== 'processing') {
+      log('warn', 'Runner: engine-stop re-send found no processing row; nothing sent', { id: r.id, order: r.order_id, error: rowErr ? rowErr.message : null });
+      return true;
+    }
+    const requestId = `runner_${Date.now()}_${runnerReqCounter++}`;
+    log('warn', 'Engine stopped: the order is sent again', { requestId, orderId: r.order_id, stoppedBridgeJobId: last.bridgeJobId || null, stop: stops.length, elapsedSeconds: last.elapsedSeconds ?? null, via: 'runner' });
+    timeStage('engine-stop', { stop: stops.length, bridgeJobId: last.bridgeJobId || null, elapsedSeconds: last.elapsedSeconds ?? null, orderId: r.order_id, requestId, via: 'runner' });
+    let jobId;
+    try {
+      const result = await startFigmaJobAsync({ body: dispatchBodyOf(row), requestId, user: null, headers: {}, engineStops: stops });
+      if (result && result.error) throw new Error(`${result.error}${result.details ? `: ${result.details}` : ''}`);
+      jobId = result && result.jobId;
+      if (!jobId) throw new Error('async path returned no jobId');
+    } catch (err) {
+      await settleFailed(r.id, `Runner dispatch failed: ${err.message}`, { orderId: r.order_id });
+      log('error', 'Runner: engine-stop re-send failed', { id: r.id, order: r.order_id, error: err.message });
+      return true;
+    }
+    await updateRow(r.id, { job_id: jobId });
+    log('info', 'Runner: dispatched order again after an engine stop', { id: r.id, order: r.order_id, jobId, requestId });
+    return true;
+  }
+
   // ---- the tick ----
+
+  // F. THE DISPATCH BODY of one queue row (RUN 19: one function, so the claim and
+  // the re-send after an engine stop (D6) send exactly the same body).
+  function dispatchBodyOf(pick) {
+    const jobBody = {
+      figmaUrl: pick.figma_url,
+      darkMode: pick.dark_mode,
+      orderId: pick.order_id,
+      tatHours: Number(pick.tat_hours),
+    };
+    if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
+    // RUN 18 V4: the row's engine choice travels as it is stored. A row with
+    // no choice (null, every row from before run 18) adds nothing, so its
+    // body is exactly today's; callClaudeCodeBridge decides what reaches the
+    // engine (only the exact "TOPAZ" or "DIAMOND").
+    if (pick.engine !== null && pick.engine !== undefined) jobBody.engine = pick.engine;
+
+    // ── ★★ THE JOIN. THE ONE LINE THAT MAKES AN ORDER USE ITS OWN SPACE'S
+    //    FIGMA CREDENTIAL. ────────────────────────────────────────────────
+    // `org_id` has been in the select list at the active-rows query all along
+    // (see section C). It simply never entered the dispatch body, so every
+    // order reached generation with no idea which space it belonged to and
+    // generation had no choice but the one global Mavlers token.
+    //
+    // ★ WHY normaliseOrgId AND NOT `String(pick.org_id ?? 'null')`.
+    // THAT EXACT SHAPE IS THE PER-SPACE LOCK BUG. Stringifying a null id
+    // turned every orgKey into the literal text "null", the lock silently
+    // never matched, and FOUR THEORIES WERE CHECKED AND ALL FOUR WERE WRONG
+    // before anyone read the select list. A literal "null" is truthy, so it
+    // sails past every `if (!orgId)` guard downstream and then matches no row
+    // - which resolves to the global token and is INDISTINGUISHABLE from a
+    // space that simply has no credential stored.
+    //
+    // So: set the key ONLY when there is a real id. Historical rows have a
+    // null org_id (they have a null user_id already), and for those the key is
+    // ABSENT rather than present-and-garbage. resolveFigmaToken then takes its
+    // `no-org-id` branch and returns the GLOBAL TOKEN WITHOUT THROWING, which
+    // is exactly today's behaviour for every order that predates this feature.
+    const orgId = normaliseOrgId(pick.org_id);
+    if (orgId !== null) jobBody.orgId = orgId;
+    return jobBody;
+  }
 
   // CLAIM + DISPATCH for ONE queue row. Sections E and F were moved here
   // unchanged so the global path and the per-space path share one
@@ -191,42 +333,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
       timeStage('claim', { ms: Date.now() - tClaim, orderId: pick.order_id, waitedMs: Date.now() - Date.parse(pick.uploaded_at) });
 
       // F. DISPATCH — reuse the existing async path IN-PROCESS. Exactly the 5 client fields.
-      const jobBody = {
-        figmaUrl: pick.figma_url,
-        darkMode: pick.dark_mode,
-        orderId: pick.order_id,
-        tatHours: Number(pick.tat_hours),
-      };
-      if (pick.esp && pick.esp !== 'none') jobBody.espPlatform = pick.esp;
-      // RUN 18 V4: the row's engine choice travels as it is stored. A row with
-      // no choice (null, every row from before run 18) adds nothing, so its
-      // body is exactly today's; callClaudeCodeBridge decides what reaches the
-      // engine (only the exact "TOPAZ" or "DIAMOND").
-      if (pick.engine !== null && pick.engine !== undefined) jobBody.engine = pick.engine;
-
-      // ── ★★ THE JOIN. THE ONE LINE THAT MAKES AN ORDER USE ITS OWN SPACE'S
-      //    FIGMA CREDENTIAL. ────────────────────────────────────────────────
-      // `org_id` has been in the select list at the active-rows query all along
-      // (see section C). It simply never entered the dispatch body, so every
-      // order reached generation with no idea which space it belonged to and
-      // generation had no choice but the one global Mavlers token.
-      //
-      // ★ WHY normaliseOrgId AND NOT `String(pick.org_id ?? 'null')`.
-      // THAT EXACT SHAPE IS THE PER-SPACE LOCK BUG. Stringifying a null id
-      // turned every orgKey into the literal text "null", the lock silently
-      // never matched, and FOUR THEORIES WERE CHECKED AND ALL FOUR WERE WRONG
-      // before anyone read the select list. A literal "null" is truthy, so it
-      // sails past every `if (!orgId)` guard downstream and then matches no row
-      // - which resolves to the global token and is INDISTINGUISHABLE from a
-      // space that simply has no credential stored.
-      //
-      // So: set the key ONLY when there is a real id. Historical rows have a
-      // null org_id (they have a null user_id already), and for those the key is
-      // ABSENT rather than present-and-garbage. resolveFigmaToken then takes its
-      // `no-org-id` branch and returns the GLOBAL TOKEN WITHOUT THROWING, which
-      // is exactly today's behaviour for every order that predates this feature.
-      const orgId = normaliseOrgId(pick.org_id);
-      if (orgId !== null) jobBody.orgId = orgId;
+      const jobBody = dispatchBodyOf(pick);
 
       const requestId = `runner_${now}_${runnerReqCounter++}`;
       let jobId;
@@ -297,6 +404,7 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
             }
             continue;
           }
+          if (js === 'failed' && await resendAfterEngineStop(r, job)) continue;
           if (js === 'failed') {
             // v9.8.0: surface the REAL cause. maveloper_jobs.error_message holds the
             // honest reason — the bridge/engine error, or the cc-runner quality-gate
@@ -607,6 +715,8 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
       heartbeatMs: cfg.heartbeatMs,
       perSpaceQueue: cfg.perSpaceQueue,
       maxDispatchPerTick: cfg.maxDispatchPerTick,
+      drainResendMax: cfg.drainResendMax,
+      stopRedispatchMax: cfg.stopRedispatchMax,
       supabase: !!supabaseAdmin,
     });
     if (!cfg.enabled) return;

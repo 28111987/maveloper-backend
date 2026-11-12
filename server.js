@@ -11,11 +11,11 @@ import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrl
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
-import { createQueueRunner } from "./queue-runner.js";
+import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds } from "./queue-runner.js";
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
 import { createRouteDoors } from "./route-doors.js";
 import { createOrderActions } from "./order-actions.js";
-import { plainReason, figmaCannotOpen, accountNameOf, NO_FIGMA_ACCOUNT, lateResultNote, lateResultDelivered } from "./order-words.js";
+import { plainReason, figmaCannotOpen, accountNameOf, NO_FIGMA_ACCOUNT, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
@@ -2455,6 +2455,23 @@ const LOCAL_JOBS = new Set();
 // K6 STOP. Jobs a person stopped: never dispatched after this, and their result
 // is recorded as discarded if it arrives.
 const STOPPED_JOBS = new Set();
+// RUN 19: an engine that is being updated. S-DRAIN (503 draining, nothing built)
+// sends the SAME payload again with the SAME bridgeJobId, after Retry-After and
+// the health wait, at most DRAIN_RESEND_MAX times per dispatch. S-STOP (the
+// engine stopped a build) sends the order again with a NEW bridgeJobId, at most
+// STOP_REDISPATCH_MAX times per order. Both bounds are read in queue-runner.js.
+// Neither signal is sent by an engine before TOPAZ-3, so every other answer
+// takes exactly today's path.
+const { drainResendMax: DRAIN_RESEND_MAX, stopRedispatchMax: STOP_REDISPATCH_MAX } = engineUpdateLimits(process.env);
+
+/** RUN 19 D4/D6: the stop list carried into a re-sent order, cleaned (internal field). */
+function cleanEngineStops(v) {
+  if (!Array.isArray(v)) return [];
+  return v
+    .filter((s) => s && typeof s === "object" && typeof s.bridgeJobId === "string")
+    .slice(0, 20)
+    .map((s) => ({ bridgeJobId: s.bridgeJobId.slice(0, 80), at: typeof s.at === "string" ? s.at.slice(0, 40) : null, elapsedSeconds: Number.isFinite(s.elapsedSeconds) ? s.elapsedSeconds : null }));
+}
 
 /** T4: one structured line per backend stage of an order. Never a secret, a token or an email. */
 function stage(name, fields = {}) {
@@ -2566,7 +2583,7 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink, engine }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink, engine, priorEngineStops }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
   }
@@ -2592,7 +2609,8 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   }
 
   // Generate a unique id we'll use to correlate the callback with this call.
-  const bridgeJobId = `bj_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+  // RUN 19: a new one each time the order is sent again after S-STOP (D4).
+  let bridgeJobId = `bj_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
 
   // Compute the public callback URL. We need an absolute URL the bridge
   // can reach from outside Railway. PUBLIC_BACKEND_URL is the env var
@@ -2603,6 +2621,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     process.env.PUBLIC_BACKEND_URL ||
     "https://maveloper-backend-production.up.railway.app";
   const callbackUrl = `${publicBackendUrl}/bridge-callback`;
+  const carriedStops = cleanEngineStops(priorEngineStops);
 
   // v9.3.0 Bug B fix: tag the Supabase maveloper_jobs row with bridgeJobId BEFORE
   // dispatching, so /bridge-callback can find the row even if this Railway worker
@@ -2610,7 +2629,8 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   // restart and late callbacks get 404.
   if (maveloperJobId && supabaseAdmin) {
     await updateJobStatus(maveloperJobId, {
-      progress_message: `Dispatched to bridge (bridgeJobId=${bridgeJobId})`,
+      // RUN 19 D4/D6: an order sent again after the engine stopped says so.
+      progress_message: carriedStops.length ? ENGINE_RESENT : `Dispatched to bridge (bridgeJobId=${bridgeJobId})`,
       // Stash bridgeJobId in error_message column as a side-channel since the
       // table doesn't have a dedicated column. We clear it when the job succeeds.
       // The /bridge-callback endpoint searches by this stashed value.
@@ -2623,6 +2643,8 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     await mergeDeliveryMeta(maveloperJobId, {
       bridge: { bridgeJobId, dispatchedAt: new Date().toISOString(), orderId: orderId || null },
       ...(typeof figmaCredentialLine === "string" && figmaCredentialLine ? { figmaCredential: figmaCredentialLine } : {}),
+      // RUN 19 D6: the stop list of the job this order was re-sent from.
+      ...(carriedStops.length ? { engineStops: carriedStops } : {}),
     });
   }
 
@@ -2696,6 +2718,12 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     });
   }
 
+  // RUN 19 D4: the stops this order has met, counted here; an order the runner
+  // sent again after a stop (D6) starts from the stops its earlier job met.
+  let stopsSoFar = carriedStops.length;
+  let tAttempt = tDispatch;
+  let attemptHealth = health;
+  for (;;) {
   log("info", "Claude Code: dispatching to Mac bridge (callback mode)", {
     requestId,
     maveloperJobId,
@@ -2728,10 +2756,21 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   // A stop that lands while this promise is unsettled rejects it; nobody awaits
   // it until the dispatch answers, so the rejection must not go unhandled.
   resultPromise.catch(() => {});
+  const forgetPending = () => {
+    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+    if (entry) {
+      clearTimeout(entry.timer);
+      PENDING_BRIDGE_JOBS.delete(bridgeJobId);
+    }
+  };
 
   // Fire the dispatch. Bridge should respond 202 in <1 second.
   let dispatchResp;
-  const tPost = Date.now();
+  let tPost = Date.now();
+  // RUN 19 D1/D2: a 503 is read here once; its text is kept for today's message.
+  let answerText = null;
+  let drainResends = 0;
+  for (;;) {
   try {
     dispatchResp = await fetch(`${MAC_BRIDGE_URL}/generate`, {
       method: "POST",
@@ -2747,13 +2786,9 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       signal: AbortSignal.timeout(BRIDGE_DISPATCH_TIMEOUT_MS),
     });
   } catch (dispatchErr) {
-    stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, postMs: Date.now() - tPost, sent: true, answered: false, orderId, bridgeJobId, requestId });
+    stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, postMs: Date.now() - tPost, sent: true, answered: false, orderId, bridgeJobId, requestId, ...(drainResends ? { drainResends } : {}) });
     // Clean up the pending promise so it doesn't leak.
-    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
-    if (entry) {
-      clearTimeout(entry.timer);
-      PENDING_BRIDGE_JOBS.delete(bridgeJobId);
-    }
+    forgetPending();
     log("error", "Bridge dispatch failed", {
       requestId,
       bridgeJobId,
@@ -2762,14 +2797,46 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     });
     throw new Error(`Bridge dispatch failed: ${dispatchErr.message}`);
   }
+  if (dispatchResp.status !== 503) break;
+  answerText = await dispatchResp.text().catch(() => "(no body)");
+  // D1: ONLY a 503 whose JSON body says the engine is draining. Any other 503
+  // (no body, another body, an HTML page) leaves this loop for today's path.
+  if (!isDrainAnswer(dispatchResp.status, answerText)) break;
+  // D2: the engine refused BEFORE registering the id, so the SAME payload with
+  // the SAME bridgeJobId is safe to send again, and keeps one record.
+  if (drainResends >= DRAIN_RESEND_MAX) {
+    forgetPending();
+    stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, postMs: Date.now() - tPost, sent: true, answered: true, draining: true, drainResends, orderId, bridgeJobId, requestId });
+    throw new Error(`engine draining: the engine refused the order ${drainResends + 1} times while it was being updated (HTTP 503, draining); nothing was built`);
+  }
+  const retryAfterS = retryAfterSeconds(dispatchResp.headers.get("retry-after"));
+  const tWait = Date.now();
+  await new Promise((r) => setTimeout(r, retryAfterS * 1000));
+  if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+    forgetPending();
+    throw new Error("stopped by a person before dispatch");
+  }
+  const drainHealth = await waitForEngineHealth(requestId);
+  if (!drainHealth.ok) {
+    forgetPending();
+    stage("dispatch", { ms: Date.now() - tAttempt, healthMs: drainHealth.ms, healthAttempts: drainHealth.attempts, sent: false, drainResends, orderId, requestId });
+    throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+  }
+  if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+    forgetPending();
+    throw new Error("stopped by a person before dispatch");
+  }
+  drainResends += 1;
+  const waitedMs = Date.now() - tWait;
+  log("warn", "Engine draining: the order is sent again", { requestId, orderId, maveloperJobId, bridgeJobId, attempt: drainResends, waitedMs, retryAfterS });
+  stage("engine-drain", { attempt: drainResends, waitedMs, retryAfterS, healthMs: drainHealth.ms, orderId, bridgeJobId, requestId });
+  answerText = null;
+  tPost = Date.now();
+  }
 
   if (!dispatchResp.ok && dispatchResp.status !== 202) {
-    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
-    if (entry) {
-      clearTimeout(entry.timer);
-      PENDING_BRIDGE_JOBS.delete(bridgeJobId);
-    }
-    const errText = await dispatchResp.text().catch(() => "(no body)");
+    forgetPending();
+    const errText = answerText !== null ? answerText : await dispatchResp.text().catch(() => "(no body)");
     const errBody = errText.trimStart().startsWith("<")
       ? "BRIDGE UNREACHABLE - the tunnel returned an HTML error page, not the bridge. The laptop or ngrok was down."
       : errText.substring(0, 500);
@@ -2781,14 +2848,47 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     bridgeJobId,
     dispatchStatus: dispatchResp.status,
   });
-  stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, postMs: Date.now() - tPost, sent: true, answered: true, orderId, bridgeJobId, requestId });
-  stage("accepted", { ms: jobStartedAt ? Date.now() - jobStartedAt : Date.now() - tDispatch, sinceJobStart: Boolean(jobStartedAt), orderId, bridgeJobId, requestId });
+  stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, postMs: Date.now() - tPost, sent: true, answered: true, orderId, bridgeJobId, requestId, ...(drainResends ? { drainResends } : {}) });
+  stage("accepted", { ms: jobStartedAt ? Date.now() - jobStartedAt : Date.now() - tAttempt, sinceJobStart: Boolean(jobStartedAt), orderId, bridgeJobId, requestId });
   if (maveloperJobId) {
     await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date(tPost).toISOString(), acceptedAt: new Date().toISOString(), orderId: orderId || null } });
   }
 
   // Wait for /bridge-callback to settle this promise.
   const result = await resultPromise;
+
+  // RUN 19 D4: the engine stopped this build (S-STOP). /bridge-callback has
+  // recorded the stop on the job and settled this wait with engineStopped; the
+  // order is sent again with a NEW bridgeJobId (the engine builds one job per
+  // id), through the same health wait and the same S-DRAIN handling, at most
+  // STOP_REDISPATCH_MAX times per order.
+  if (result && result.engineStopped === true && !result.html) {
+    stopsSoFar += 1;
+    if (stopsSoFar > STOP_REDISPATCH_MAX) {
+      throw new Error(`engine stopped: the engine was stopped for an update ${stopsSoFar} times while building this order (engineStopped); not sent again`);
+    }
+    log("warn", "Engine stopped: the order is sent again", { requestId, orderId, maveloperJobId, stoppedBridgeJobId: bridgeJobId, stop: stopsSoFar, elapsedSeconds: result.elapsedSeconds ?? null });
+    stage("engine-stop", { stop: stopsSoFar, bridgeJobId, elapsedSeconds: result.elapsedSeconds ?? null, orderId, requestId });
+    if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+      throw new Error("stopped by a person before dispatch");
+    }
+    tAttempt = Date.now();
+    attemptHealth = await waitForEngineHealth(requestId);
+    if (!attemptHealth.ok) {
+      stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, healthAttempts: attemptHealth.attempts, sent: false, orderId, requestId });
+      throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+    }
+    if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
+      throw new Error("stopped by a person before dispatch");
+    }
+    bridgeJobId = `bj_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    payload.bridgeJobId = bridgeJobId;
+    if (maveloperJobId && supabaseAdmin) {
+      await updateJobStatus(maveloperJobId, { progress_message: ENGINE_RESENT, error_message: `__BRIDGE__:${bridgeJobId}` }, requestId);
+      await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date().toISOString(), orderId: orderId || null } });
+    }
+    continue;
+  }
 
   if (!result.html) {
     throw new Error(`Bridge callback delivered no HTML: ${JSON.stringify(result).substring(0, 500)}`);
@@ -2811,6 +2911,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   }
 
   return result.html;
+  }
 }
 
 // =====================================================================
@@ -3506,6 +3607,8 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
           // RUN 18: the order's engine choice as it came in (the runner's row, or
           // the async route's body); callClaudeCodeBridge sends only the exact names.
           engine: req.body?.engine,
+          // RUN 19 D6: the stops an order re-sent by the runner already met (internal).
+          priorEngineStops: req.body?._engineStops,
           orderId,
           jobStartedAt: Number(req.body?._jobStartedAt) || null,
           log,
@@ -3696,7 +3799,7 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
 // req.* references became the passed-in params (req.bodyâ†’body, req.idâ†’requestId,
 // req.userâ†’user, req.headersâ†’headers). No generation logic changed.
 //
-async function startFigmaJobAsync({ body, requestId, user, headers }) {
+async function startFigmaJobAsync({ body, requestId, user, headers, engineStops }) {
   body = body || {};
   headers = headers || {};
   const figmaUrl = body.figmaUrl;
@@ -3819,8 +3922,12 @@ async function startFigmaJobAsync({ body, requestId, user, headers }) {
       // /generate-from-figma handler will read req.body and req.id from it.
       // v9.3.0: pass _maveloperJobId so callClaudeCodeBridge can tag the
       // Supabase row with bridgeJobId, enabling restart-resilient callbacks.
+      const fakeBody = { ...body, _maveloperJobId: jobId, _jobStartedAt: bgStartTime };
+      // RUN 19 D6: the stop list rides only from the runner, never from a caller's body.
+      delete fakeBody._engineStops;
+      if (Array.isArray(engineStops) && engineStops.length) fakeBody._engineStops = engineStops;
       const fakeReq = {
-        body: { ...body, _maveloperJobId: jobId, _jobStartedAt: bgStartTime },
+        body: fakeBody,
         id: requestId,
         user: user,
         headers: headers || {},
@@ -4211,7 +4318,7 @@ app.post("/bridge-callback", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets, compilerCertificate, routeProvenance } = req.body || {};
+  const { bridgeJobId, html, bytesGenerated, elapsedSeconds, error, exitCode, stderr, maveloperJobId, compilerAssets, compilerCertificate, routeProvenance, engineStopped } = req.body || {};
 
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
@@ -4282,6 +4389,20 @@ app.post("/bridge-callback", async (req, res) => {
       log("warn", "/bridge-callback delivery_meta lookup failed", { requestId: req.id, bridgeJobId, error: e.message });
     }
   }
+  // RUN 19 D8: a bridgeJobId the engine stopped, after which the order was sent
+  // again with a new one: it is in that job's stop list (delivery_meta.engineStops).
+  if (!dbJobId && supabaseAdmin) {
+    try {
+      const { data: rows } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("id")
+        .contains("delivery_meta", { engineStops: [{ bridgeJobId }] })
+        .limit(1);
+      if (rows && rows.length > 0) dbJobId = rows[0].id;
+    } catch (e) {
+      log("warn", "/bridge-callback engine-stop lookup failed", { requestId: req.id, bridgeJobId, error: e.message });
+    }
+  }
 
   // RUN 17: the row as it stands, for the late-result decision and the stage line.
   let jobRow = null;
@@ -4304,6 +4425,65 @@ app.post("/bridge-callback", async (req, res) => {
     orderId: jobRow ? jobRow.order_id : null,
     bridgeJobId,
   });
+
+  // ── RUN 19 D4/D6/D7: THE ENGINE STOPPED THIS BUILD FOR AN UPDATE (S-STOP) ───
+  // The engine's one callback { engineStopped: true, error, signal: "SIGTERM" }
+  // for a build that could not finish in its drain window. For an order still
+  // building it is NOT a failure: the stop is appended to the job's stop list and
+  // the order is sent again with a new bridgeJobId, by the wait in this process
+  // (D4) or, when no process holds the wait (a restart), by the queue runner
+  // (D6). For an order a person stopped, or one already finished, it is recorded
+  // in the log only (D7). The engine's sentence never reaches a client.
+  if (engineStopped === true && !html) {
+    const entry = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+    const knownStops = Array.isArray(jobDm.engineStops) ? jobDm.engineStops : [];
+    const currentId = jobDm.bridge && jobDm.bridge.bridgeJobId ? String(jobDm.bridge.bridgeJobId) : null;
+    const building = Boolean(jobRow) && (jobRow.status === "running" || jobRow.status === "pending");
+    const why = !jobRow && !entry ? "no job and no wait for this bridgeJobId"
+      : jobRow && (jobDm.stopped || STOPPED_JOBS.has(jobRow.id)) ? "a person had stopped the order"
+      : jobRow && !building ? `the job is already ${jobRow.status}`
+      : knownStops.some((x) => x && x.bridgeJobId === bridgeJobId) ? "this stop was already recorded"
+      : jobRow && currentId && currentId !== bridgeJobId ? "the order was already sent again"
+      : null;
+    if (why) {
+      log("info", "/bridge-callback engine stop for an order that is no longer building; recorded in the log only", { requestId: req.id, bridgeJobId, dbJobId: dbJobId || null, why });
+      return res.status(200).json({ ok: true, settled: "engine-stopped", resend: false, durableWrite: false, inMemorySettled: false });
+    }
+    const stop = { bridgeJobId, at: new Date().toISOString(), elapsedSeconds: Number.isFinite(Number(elapsedSeconds)) ? Number(elapsedSeconds) : null };
+    const stops = [...knownStops, stop];
+    if (entry) {
+      if (jobRow && supabaseAdmin) {
+        const { error: dmErr } = await supabaseAdmin.from("maveloper_jobs")
+          .update({ delivery_meta: { ...jobDm, engineStops: stops }, updated_at: new Date().toISOString() })
+          .eq("id", jobRow.id).in("status", ["pending", "running"]);
+        if (dmErr) log("warn", "/bridge-callback engine stop: stop list write failed", { requestId: req.id, bridgeJobId, error: dmErr.message });
+      }
+      log("warn", "/bridge-callback engine stopped the build; the order is sent again", { requestId: req.id, bridgeJobId, dbJobId: dbJobId || null, stops: stops.length, resend: "in-process" });
+      settleBridgeJob(bridgeJobId, { engineStopped: true, elapsedSeconds: stop.elapsedSeconds });
+      return res.status(200).json({ ok: true, settled: "engine-stopped", resend: "in-process", durableWrite: Boolean(jobRow), inMemorySettled: true });
+    }
+    // D6: no process holds this order's wait. The job is failed with the stop
+    // recorded and marked for the runner, which sends the order again (or, past
+    // the bound, fails it with D5's words). The raw reason stays on the job.
+    const { error: d6Err } = await supabaseAdmin.from("maveloper_jobs").update({
+      status: "failed",
+      error_message: `engine stopped: the engine was stopped for an update while building this order (engineStopped, bridgeJobId ${bridgeJobId}); the queue runner sends it again`,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      delivery_meta: { ...jobDm, engineStops: stops, engineStopResend: "runner" },
+    }).eq("id", jobRow.id).in("status", ["pending", "running"]);
+    log("warn", "/bridge-callback engine stopped the build; no wait in this process, the queue runner sends it again", { requestId: req.id, bridgeJobId, dbJobId, stops: stops.length, resend: "runner", ...(d6Err ? { error: d6Err.message } : {}) });
+    return res.status(200).json({ ok: true, settled: "engine-stopped", resend: "runner", durableWrite: !d6Err, inMemorySettled: false });
+  }
+
+  // RUN 19 D8: the stopped build finished after all and its result arrived. The
+  // order was sent again, and the re-sent build is the one that delivers; this
+  // result is a late result, discarded and recorded in run 17's L4 words.
+  if (jobRow && html && !error && Array.isArray(jobDm.engineStops) && jobDm.engineStops.some((x) => x && x.bridgeJobId === bridgeJobId)) {
+    const reason = "the order had been re-run";
+    await recordLateDiscard(jobRow, { deliver: false, reason, order: null }, { bytes: html.length, bridgeJobId, requestId: req.id });
+    return res.status(200).json({ ok: true, settled: "discarded", late: true, reason, durableWrite: true, inMemorySettled: false });
+  }
 
   // ── RUN 17 L4: A RESULT FOR A JOB THAT IS NO LONGER WAITING FOR ONE ─────────
   // Never silently dropped. It is delivered when its order was not re-run,

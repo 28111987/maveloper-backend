@@ -40,6 +40,13 @@ export const FIGMA_PLAN_LIMIT =
 export const BAD_LINK =
   "This Figma link does not point at one email frame. In Figma, right-click the email frame, choose Copy link to selection, and submit that link.";
 
+/** RUN 19 D3: the engine kept refusing the order while it was being updated (S-DRAIN past the bound). */
+export const ENGINE_UPDATING = "The engine was being updated and could not take the order. Please resubmit in a few minutes.";
+/** RUN 19 D5: the engine was stopped under the order more often than Mavloper re-sends it (S-STOP past the bound). */
+export const ENGINE_STOPPED_TWICE = "The engine stopped twice while it was being updated. Please resubmit in a few minutes.";
+/** RUN 19 D4: the progress words of an order Mavloper sent again after the engine stopped. Not a failure. */
+export const ENGINE_RESENT = "The engine restarted for an update. Mavloper sent the order again.";
+
 /** L1's timeout fallback, in minutes the runner actually uses. */
 export function tookTooLong(minutes) {
   const m = Math.max(1, Math.round(Number(minutes) || 35));
@@ -105,6 +112,7 @@ export const NO_FIGMA_ACCOUNT =
 // sentence of ours is found and returned on its own.
 const OURS = [
   ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
+  ENGINE_UPDATING, ENGINE_STOPPED_TWICE,
 ];
 const OURS_RE = [
   /The build ran longer than \d+ minutes and was stopped on our side\. Please resubmit\./,
@@ -128,6 +136,11 @@ export function plainReason(raw) {
   if (!s) return INTERNAL;
   const ours = oursIn(s);
   if (ours) return ours;
+  // RUN 19: an engine update. Ahead of the dispatch rule, because the raw S-DRAIN
+  // reason also names HTTP 503. The engine's own S-STOP sentence ("Please place
+  // the order again.") is never shown to a client: it reads as D5.
+  if (/engine draining:|\(HTTP 503, draining\)/i.test(s)) return ENGINE_UPDATING;
+  if (/engine stopped:|\bengineStopped\b|engine was stopped before this order finished building/i.test(s)) return ENGINE_STOPPED_TWICE;
   if (/No Figma credential|Figma not configured|FIGMA_API_TOKEN is not set/i.test(s)) return NO_FIGMA_ACCOUNT;
   // the handler's user errors: a wrong link, a page instead of a frame, several frames
   if (/Multiple email frames|Invalid Figma URL|Figma URL|node-id|Copy link|email-shaped|email design frame|no content\. Check the URL/i.test(s)) {
@@ -149,6 +162,7 @@ export function plainReason(raw) {
 
 export default {
   SUPPORT, ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
+  ENGINE_UPDATING, ENGINE_STOPPED_TWICE, ENGINE_RESENT,
   tookTooLong, accountNameOf, figmaCannotOpen, stoppedBy, cancelledBy, lateResultNote,
   lateResultDelivered, istClock, plainReason,
 };
