@@ -367,6 +367,7 @@ async function S1() {
       const leaky = st.filter((l) => /@|figd_|Bearer|eyJ/.test(JSON.stringify(l)));
       record("S1", kase, "T4 no email, token or secret in a stage line", 0, leaky.length);
       record("S1", kase, "no request left this machine", 0, srv.refused.length);
+      await capture(`S1-${startupMs / 1000}s`, srv, [o.order_id]);
     } finally {
       await srv.stop();
       await E.close();
@@ -470,6 +471,7 @@ async function S3() {
         record("S3", variant, "L4 the first build's late result is recorded as discarded", true, Boolean(noted));
       }
       record("S3", variant, "no request left this machine", 0, srv.refused.length);
+      await capture(`S3-${variant[0]}`, srv, [o.order_id]);
       void settled;
     } finally {
       await srv.stop();
@@ -876,6 +878,7 @@ async function E123() {
       }
     }
     record("E1-E3", "runner", "no request left this machine", 0, srv.refused.length);
+    await capture("E123", srv, cases.map((c) => `${c.s}-ROW`));
   } finally {
     await srv.stop();
     await E.close();
@@ -987,8 +990,332 @@ async function R1() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// RUN 19. AN ORDER THAT MEETS AN ENGINE UPDATE IS SENT AGAIN, NEVER FAILED.
+// The fake engine speaks the TOPAZ-3 engine's two signals exactly as the run 19
+// brief quotes bridge-server.mjs (topaz3-sp cd03753f): S-DRAIN (503, Retry-After,
+// {"status":"draining",...,"engineDraining":true}, nothing built) and S-STOP (one
+// callback {error, exitCode:null, signal:"SIGTERM", engineStopped:true, ...}).
+// It also builds ONE job per bridgeJobId (dedupe), as that engine does.
+// Expected values from the brief's D1-D9, fixed in _RUN19/rules-before-tests.md
+// before any code changed; never from the code. Real clock (no scaling).
+// ══════════════════════════════════════════════════════════════════════════
+const D3_WORDS = "The engine was being updated and could not take the order. Please resubmit in a few minutes.";
+const D5_WORDS = "The engine stopped twice while it was being updated. Please resubmit in a few minutes.";
+const D4_WORDS = "The engine restarted for an update. Mavloper sent the order again.";
+const START_FAILED_WORDS = "The build could not start on our side. Please resubmit in a few minutes.";
+const LEAK = /@|figd_|Bearer|eyJ|oc-dummy-bridge-secret/;
+
+async function xStart({ engine = {}, env = {} } = {}) {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const E = await env0();
+  E.engine.set({ dedupe: true, buildMs: 1500, ...engine });
+  const srvEnv = { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000", ...env };
+  const box = { E, srvEnv, srv: await startServer({ ...E, env: srvEnv }) };
+  box.close = async () => { await box.srv.stop(); await E.close(); };
+  return box;
+}
+
+// Watch one order until it is delivered or failed, recording every status and
+// every job progress line seen on the way, then wait settleMs for late callbacks.
+async function watchOrder(o, { timeoutMs = 90000, settleMs = 4000, until = null } = {}) {
+  const seen = { statuses: new Set(), progress: new Set() };
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const r = await getOrder(o.id);
+    if (r) seen.statuses.add(r.status);
+    for (const j of await jobsForOrder(o.order_id)) seen.progress.add(j.progress_message || "");
+    if (r && (r.status === "delivered" || r.status === "failed") && (!until || until())) break;
+    await sleep(300);
+  }
+  await sleep(settleMs);
+  const final = await getOrder(o.id);
+  if (final) seen.statuses.add(final.status);
+  return { final, seen };
+}
+const idsOf = (E) => E.engine.requests.map((r) => r.payload && r.payload.bridgeJobId);
+const drainLines = (srv, orderId) => stageLines(srv).filter((l) => l.stage === "engine-drain" && (!orderId || l.orderId === orderId));
+const stopsOf = (job) => (job && job.delivery_meta && Array.isArray(job.delivery_meta.engineStops) ? job.delivery_meta.engineStops : null);
+
+// X1 one S-DRAIN then 202 (D1, D2).
+async function X1() {
+  const X = await xStart({ engine: { drainFirst: 1, retryAfter: "5" } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940001, orderId: "X1-ROW" });
+    const { final } = await watchOrder(o);
+    const ids = idsOf(X.E);
+    const k = "one S-DRAIN (Retry-After 5) then 202";
+    record("X1", k, "D2 the order is delivered", "delivered", final?.status);
+    record("X1", k, "D2 one build", 1, X.E.engine.builds.length);
+    record("X1", k, "D2 two POSTs", 2, ids.length);
+    record("X1", k, "D2 the same bridgeJobId both times", true, ids.length === 2 && ids[0] === ids[1]);
+    const gap = X.E.engine.requests.length >= 2 ? X.E.engine.requests[1].at - X.E.engine.requests[0].at : -1;
+    record("X1", k, "D2 the gap between the POSTs is at least Retry-After (5000 ms)", true, gap >= 5000);
+    const dl = drainLines(X.srv, "X1-ROW");
+    record("X1", k, "D2 one engine-drain stage line, attempt 1, with waitedMs", "1, 1, true", `${dl.length}, ${dl[0]?.attempt}, ${Number.isFinite(dl[0]?.waitedMs)}`);
+    const lg = X.srv.logs().filter((l) => l.msg === "Engine draining: the order is sent again");
+    record("X1", k, "D2 one structured log line for the resend", 1, lg.length);
+    record("X1", k, "D2 no secret, token or email in those lines", 0, [...dl, ...lg].filter((l) => LEAK.test(JSON.stringify(l))).length);
+    record("X1", k, "no request left this machine", 0, X.srv.refused.length);
+    console.log(`   X1 gap ${gap} ms; error_text ${final?.error_text}`);
+  } finally { await X.close(); }
+}
+
+// X2 S-DRAIN on every dispatch (D2 bound, D3).
+async function X2() {
+  const X = await xStart({ engine: { drainAlways: true, retryAfter: "5" } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940002, orderId: "X2-ROW" });
+    const { final } = await watchOrder(o, { timeoutMs: 120000 });
+    const ids = idsOf(X.E);
+    const k = "S-DRAIN on every dispatch";
+    record("X2", k, "D3 the order fails", "failed", final?.status);
+    record("X2", k, "D3 the client's words, exactly", D3_WORDS, final?.error_text);
+    record("X2", k, "D2 1 + DRAIN_RESEND_MAX (3) POSTs, one bridgeJobId", "4, 1", `${ids.length}, ${new Set(ids).size}`);
+    record("X2", k, "D2 nothing built", 0, X.E.engine.builds.length);
+    const jobs = await jobsForOrder(o.order_id);
+    const raw = jobs[jobs.length - 1]?.error_message || "";
+    record("X2", k, "D3 the raw reason stays on the job (503, draining), not the client's words", true, /503/.test(raw) && /draining/i.test(raw) && raw !== D3_WORDS);
+    record("X2", k, "D2 three engine-drain lines", 3, drainLines(X.srv, "X2-ROW").length);
+    record("X2", k, "no request left this machine", 0, X.srv.refused.length);
+    console.log(`   X2 raw: ${raw.slice(0, 200)}`);
+  } finally { await X.close(); }
+}
+
+// X3 the controls (D1): a 503 without the draining body, a 500, an HTML page.
+async function X3() {
+  const html = "<!DOCTYPE html><html><head><title>503 Service Unavailable</title></head><body>Service Unavailable</body></html>";
+  const cases = [
+    { name: "503 without the draining body", reject: { status: 503, body: '{"error":"Service Unavailable"}' }, detail: '{"error":"Service Unavailable"}' },
+    { name: "500", reject: { status: 500, body: '{"error":"boom"}' }, detail: '{"error":"boom"}' },
+    { name: "503 HTML page", reject: { status: 503, contentType: "text/html", body: html }, detail: "BRIDGE UNREACHABLE - the tunnel returned an HTML error page, not the bridge. The laptop or ngrok was down." },
+  ];
+  let i = 0;
+  for (const c of cases) {
+    i++;
+    const X = await xStart({ engine: { reject: c.reject } });
+    try {
+      const o = await insertOrder({ space: "B", lead: "dev-b", n: 940030 + i, orderId: `X3-${i}` });
+      const { final } = await watchOrder(o);
+      const jobs = await jobsForOrder(o.order_id);
+      const raw = jobs[jobs.length - 1]?.error_message || "";
+      record("X3", c.name, "D1 today's outcome: failed", "failed", final?.status);
+      record("X3", c.name, "D1 today's client words", START_FAILED_WORDS, final?.error_text);
+      record("X3", c.name, "D1 today's raw reason, exactly", `Claude Code bridge failed and automatic fallback is disabled.: Bridge rejected dispatch with status ${c.reject.status}: ${c.detail}`, raw);
+      record("X3", c.name, "D1 one POST, never resent", 1, X.E.engine.requests.length);
+      record("X3", c.name, "D1 no engine-drain line", 0, drainLines(X.srv).length);
+    } finally { await X.close(); }
+  }
+}
+
+// X4 Retry-After absent, "abc", "0", "999" -> waits of 5, 5, 5, 30 s (D2). Real clock.
+async function X4() {
+  const X = await xStart({ engine: {} });
+  const cases = [{ name: "absent", ra: null, want: 5 }, { name: '"abc"', ra: "abc", want: 5 }, { name: '"0"', ra: "0", want: 5 }, { name: '"999"', ra: "999", want: 30 }];
+  try {
+    let i = 0;
+    for (const c of cases) {
+      i++;
+      X.E.engine.set({ drainFirst: X.E.engine.drains.length + 1, retryAfter: c.ra });
+      const n = 940040 + i;
+      const o = await insertOrder({ space: "B", lead: "dev-b", n, orderId: `X4-${i}` });
+      const { final } = await watchOrder(o, { timeoutMs: 120000, settleMs: 500 });
+      const fileKey = `OCfile${String(n).padStart(10, "0")}`;
+      const reqs = X.E.engine.requests.filter((r) => r.raw && r.raw.includes(fileKey));
+      const gap = reqs.length >= 2 ? reqs[1].at - reqs[0].at : -1;
+      const dl = drainLines(X.srv, `X4-${i}`);
+      record("X4", `Retry-After ${c.name}`, "D2 the wait used, and the gap between the POSTs at least that", `${c.want}, true`, `${dl[0]?.retryAfterS}, ${gap >= c.want * 1000}`);
+      record("X4", `Retry-After ${c.name}`, "D2 delivered", "delivered", final?.status);
+      console.log(`   X4 ${c.name}: gap ${gap} ms`);
+    }
+  } finally { await X.close(); }
+}
+
+// X5 S-STOP while the order waits (D4).
+async function X5() {
+  const X = await xStart({ engine: { stopAfterMs: 1500, stopTimes: 1, buildMs: 3000 } });
+  try {
+    const tIns = Date.now();
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940005, orderId: "X5-ROW" });
+    const { final, seen } = await watchOrder(o);
+    const ids = idsOf(X.E);
+    const k = "S-STOP 1.5 s after accept, then normal";
+    record("X5", k, "D4 the order is never failed", false, seen.statuses.has("failed"));
+    record("X5", k, "D4 delivered", "delivered", final?.status);
+    record("X5", k, "D4 two POSTs with different bridgeJobIds", "2, true", `${ids.length}, ${ids.length === 2 && ids[0] !== ids[1]}`);
+    record("X5", k, "D8 the delivered email is the re-sent build's", true, Boolean(ids[1] && (final?.html_content || "").includes(`FAKE BUILD ${ids[1]}`)));
+    const rows = (await rest("GET", `os_queue?order_id=eq.X5-ROW&select=id,uploaded_at`)).data || [];
+    record("X5", k, "D4 one os_queue row, same id and submission time", true, rows.length === 1 && rows[0].id === o.id && Date.parse(rows[0].uploaded_at) === Date.parse(o.uploaded_at));
+    const jobs = await jobsForOrder(o.order_id);
+    const done = jobs.filter((j) => j.status === "completed");
+    record("X5", k, "D8 exactly one completed job for the order", 1, done.length);
+    const st = stopsOf(done[0] || jobs[jobs.length - 1]);
+    record("X5", k, "D4 the stop list has one entry (the stopped id, at, elapsedSeconds)", true, Boolean(st && st.length === 1 && st[0].bridgeJobId === ids[0] && st[0].at && Number.isFinite(st[0].elapsedSeconds)));
+    record("X5", k, "D4 the progress words were written", true, seen.progress.has(D4_WORDS));
+    const firstStop = X.E.engine.stops[0]?.at || Infinity;
+    record("X5", k, "D4/T1 Total time counts from submission", true, Boolean(final?.finished_at) && Date.parse(final.finished_at) - Date.parse(final.uploaded_at) >= firstStop - tIns);
+    const sl = stageLines(X.srv).filter((l) => l.stage === "engine-stop");
+    record("X5", k, "D4 one engine-stop stage line", 1, sl.length);
+    record("X5", k, "no request left this machine", 0, X.srv.refused.length);
+    console.log(`   X5 error_text ${final?.error_text}`);
+  } finally { await X.close(); }
+}
+
+// X6 S-STOP on every attempt (D4 bound, D5).
+async function X6() {
+  const X = await xStart({ engine: { stopAfterMs: 800, stopTimes: Infinity } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940006, orderId: "X6-ROW" });
+    const { final } = await watchOrder(o, { timeoutMs: 120000 });
+    const ids = idsOf(X.E);
+    const k = "S-STOP on every build";
+    record("X6", k, "D5 failed", "failed", final?.status);
+    record("X6", k, "D5 the client's words, exactly", D5_WORDS, final?.error_text);
+    record("X6", k, "D4 1 + STOP_REDISPATCH_MAX (2) dispatches, all different ids", "3, 3", `${ids.length}, ${new Set(ids).size}`);
+    const jobs = await jobsForOrder(o.order_id);
+    const last = jobs[jobs.length - 1];
+    record("X6", k, "D4 the stop list has 3 entries", 3, stopsOf(last)?.length ?? "(none)");
+    const raw = last?.error_message || "";
+    record("X6", k, "D5 the raw reason stays on the job, not the client's words", true, raw.length > 0 && raw !== D5_WORDS);
+    console.log(`   X6 raw: ${raw.slice(0, 200)}`);
+  } finally { await X.close(); }
+}
+
+// X7 S-STOP after a backend restart (D6).
+async function X7() {
+  // The S-STOP is sent 20 s after the accept, so that it lands on the RESTARTED
+  // backend (the engine makes one attempt only, as bridge-server.mjs does).
+  // OC_X7_STOP_MS moves it (a small value lands it while the backend is down).
+  const X = await xStart({ engine: { stopAfterMs: Number(process.env.OC_X7_STOP_MS) || 20000, stopTimes: 1, buildMs: 1500 } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940007, orderId: "X7-ROW" });
+    await waitFor(async () => X.E.engine.builds.length >= 1, 60000, 300);
+    const port = X.srv.port;
+    await X.srv.stop();
+    X.srv = await startServer({ ...X.E, port, env: X.srvEnv });
+    const { final, seen } = await watchOrder(o, { timeoutMs: 120000 });
+    const ids = idsOf(X.E);
+    const k = "S-STOP arrives after a backend restart";
+    const stopCb = X.E.engine.callbacks.find((c) => c.bridgeJobId === ids[0]);
+    record("X7", k, "setup: the S-STOP reached the restarted backend", 200, stopCb ? stopCb.status : "(not sent)");
+    record("X7", k, "D6 the order is never failed", false, seen.statuses.has("failed"));
+    record("X7", k, "D6 re-sent with a new bridgeJobId", "2, true", `${ids.length}, ${ids.length === 2 && ids[0] !== ids[1]}`);
+    record("X7", k, "D6 delivered, the re-sent build's email", "delivered, true", `${final?.status}, ${Boolean(ids[1] && (final?.html_content || "").includes(`FAKE BUILD ${ids[1]}`))}`);
+    const rows = (await rest("GET", `os_queue?order_id=eq.X7-ROW&select=id`)).data || [];
+    record("X7", k, "D6 one os_queue row", 1, rows.length);
+    const jobs = await jobsForOrder(o.order_id);
+    const done = jobs.filter((j) => j.status === "completed");
+    record("X7", k, "D6 one completed job; its stop list has 1 entry", "1, 1", `${done.length}, ${stopsOf(done[0])?.length ?? "(none)"}`);
+    // D6 as written before the code: the RUNNER sends it again, with a new job row;
+    // the stopped job is failed with the stop recorded (rules-before-tests.md).
+    const first = jobs[0];
+    record("X7", k, "D6 through the runner: two job rows, the first failed with the stopped id in its stop list", "2, failed, true", `${jobs.length}, ${first?.status}, ${Boolean(stopsOf(first)?.some((s) => s.bridgeJobId === ids[0]))}`);
+    record("X7", k, "no request left this machine", 0, X.srv.refused.length);
+    console.log(`   X7 error_text ${final?.error_text}`);
+  } finally { await X.close(); }
+}
+
+// X7B D6 past its bound, with the bound overridden from the environment
+// (STOP_REDISPATCH_MAX=0): D5's words after 1 + 0 dispatches, never re-sent.
+async function X7B() {
+  const X = await xStart({ engine: { stopAfterMs: 20000, stopTimes: 1, buildMs: 1500 }, env: { STOP_REDISPATCH_MAX: "0" } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940071, orderId: "X7B-ROW" });
+    await waitFor(async () => X.E.engine.builds.length >= 1, 60000, 300);
+    const port = X.srv.port;
+    await X.srv.stop();
+    X.srv = await startServer({ ...X.E, port, env: X.srvEnv });
+    const { final } = await watchOrder(o, { timeoutMs: 120000 });
+    const ids = idsOf(X.E);
+    const k = "S-STOP after a restart, STOP_REDISPATCH_MAX=0";
+    const stopCb = X.E.engine.callbacks.find((c) => c.bridgeJobId === ids[0]);
+    record("X7B", k, "setup: the S-STOP reached the restarted backend", 200, stopCb ? stopCb.status : "(not sent)");
+    record("X7B", k, "D5 failed with D5's words", `failed | ${D5_WORDS}`, `${final?.status} | ${final?.error_text}`);
+    record("X7B", k, "D4/D6 1 + 0 dispatches", 1, ids.length);
+  } finally { await X.close(); }
+}
+
+// X8 a PERSON stops the order, then S-STOP arrives (D7).
+async function X8() {
+  const X = await xStart({ engine: { stopAfterMs: 6000, stopTimes: 1 } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940008, orderId: "X8-ROW" });
+    await waitFor(async () => X.E.engine.builds.length >= 1, 60000, 300);
+    await sleep(1000);
+    const r = await fetch(`${X.srv.base}/os/orders/${o.id}/stop`, { method: "POST", headers: { authorization: `Bearer ${tokenOf("admin-b")}` } });
+    await waitFor(async () => X.E.engine.stops.length >= 1, 30000, 300);
+    await sleep(15000);
+    const ids = idsOf(X.E);
+    const final = await getOrder(o.id);
+    const k = "a person stops, then S-STOP";
+    record("X8", k, "setup: the stop route answered 200", 200, r.status);
+    record("X8", k, "D7 not re-sent (15 s after the S-STOP)", 1, ids.length);
+    record("X8", k, "D7 the order keeps the person's words", true, /^Stopped by .+ \(Admin\)\.$/.test(final?.error_text || ""));
+    const lines = X.srv.logs().filter((l) => l.bridgeJobId === ids[0] && /recorded in the log only|log only/i.test(l.msg || ""));
+    record("X8", k, "D7 the S-STOP is recorded in the log only", true, lines.length >= 1);
+  } finally { await X.close(); }
+}
+
+// X9 S-STOP, re-send, then the OLD instance's normal callback arrives late (D8).
+async function X9() {
+  for (const v of [
+    { name: "a: while the re-send builds", engine: { stopAfterMs: 1000, stopTimes: 1, lateNormalAfterMs: 1000, buildMs: 6000 }, reason: "the order had been re-run" },
+    { name: "b: after the re-send delivered", engine: { stopAfterMs: 1000, stopTimes: 1, lateNormalAfterMs: 9000, buildMs: 1500 }, reason: null },
+  ]) {
+    const X = await xStart({ engine: v.engine });
+    try {
+      const o = await insertOrder({ space: "B", lead: "dev-b", n: 940009 + (v.reason ? 0 : 100), orderId: v.reason ? "X9A-ROW" : "X9B-ROW" });
+      const { final } = await watchOrder(o, { timeoutMs: 90000, settleMs: 3000, until: () => X.E.engine.callbacks.length >= 3 });
+      const ids = idsOf(X.E);
+      record("X9", v.name, "setup: three callbacks (S-STOP, the late old result, the re-send's result)", 3, X.E.engine.callbacks.length);
+      record("X9", v.name, "D8 delivered once, with the re-sent build's email", "delivered, true", `${final?.status}, ${Boolean(ids[1] && (final?.html_content || "").includes(`FAKE BUILD ${ids[1]}`))}`);
+      const jobs = await jobsForOrder(o.order_id);
+      record("X9", v.name, "D8 exactly one completed job", 1, jobs.filter((j) => j.status === "completed").length);
+      const late = jobs.map((j) => j.delivery_meta && j.delivery_meta.lateResult).find(Boolean);
+      record("X9", v.name, "D8 the old result is recorded as discarded (L4)", v.reason ? `false, ${v.reason}` : "false", late ? (v.reason ? `${late.delivered}, ${late.reason}` : String(late.delivered)) : "(not recorded)");
+      const line = X.srv.logs().filter((l) => l.msg === "/bridge-callback late result discarded and recorded" && l.bridgeJobId === ids[0]);
+      record("X9", v.name, "D8 the discard is in the log", 1, line.length);
+    } finally { await X.close(); }
+  }
+}
+
+// X10 S-DRAIN, then the re-sent order meets S-STOP: both rules compose.
+async function X10() {
+  const X = await xStart({ engine: { drainFirst: 1, retryAfter: "5", stopAfterMs: 1000, stopTimes: 1, buildMs: 1500 } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 940010, orderId: "X10-ROW" });
+    const { final, seen } = await watchOrder(o, { timeoutMs: 120000 });
+    const ids = idsOf(X.E);
+    const k = "S-DRAIN, then S-STOP on the re-sent order";
+    record("X10", k, "D2+D4 delivered, never failed", "delivered, false", `${final?.status}, ${seen.statuses.has("failed")}`);
+    record("X10", k, "D2+D4 three POSTs: the first two one id, the third a new one", "3, true", `${ids.length}, ${ids.length === 3 && ids[0] === ids[1] && ids[2] !== ids[0]}`);
+    const jobs = await jobsForOrder(o.order_id);
+    const done = jobs.filter((j) => j.status === "completed");
+    record("X10", k, "D4 the stop list has 1 entry; one engine-drain line", "1, 1", `${stopsOf(done[0])?.length ?? "(none)"}, ${drainLines(X.srv, "X10-ROW").length}`);
+    record("X10", k, "D8 the delivered email is the last build's", true, Boolean(ids[2] && (final?.html_content || "").includes(`FAKE BUILD ${ids[2]}`)));
+  } finally { await X.close(); }
+}
+
+// ── RUN 19 INERT-TODAY CAPTURE: with OC_CAPTURE=<dir>, S1, S3 and E123 write the
+// server's log lines and the order's os_queue and maveloper_jobs rows, so two
+// arms can be compared (run 19 step 4c). Nothing is written when it is unset.
+const CAPTURE = process.env.OC_CAPTURE || null;
+async function capture(name, srv, orderIds) {
+  if (!CAPTURE) return;
+  const rows = [];
+  for (const id of orderIds) {
+    const q = (await rest("GET", `os_queue?order_id=eq.${encodeURIComponent(id)}&select=*`)).data || [];
+    const j = ((await rest("GET", `maveloper_jobs?order_id=eq.${encodeURIComponent(id)}&select=*&order=created_at.asc`)).data || [])
+      .map(({ engine_used, ...rest }) => rest); // never written anywhere (run 19 constraint 10)
+    rows.push({ orderId: id, os_queue: q, maveloper_jobs: j });
+  }
+  writeFileSync(path.join(CAPTURE, `${name}-${ARM}.lines.txt`), srv.lines.join("\n") + "\n");
+  writeFileSync(path.join(CAPTURE, `${name}-${ARM}.rows.json`), JSON.stringify(rows, null, 2));
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
-const ALL = { S1, S2, S3, S4, S5, S6, S7, E123, E4, E5, R1 };
+const ALL = { S1, S2, S3, S4, S5, S6, S7, E123, E4, E5, R1, X1, X2, X3, X4, X5, X6, X7, X7B, X8, X9, X10 };
 const want = process.argv.slice(2).filter((a) => ALL[a]);
 const run = want.length ? want : Object.keys(ALL);
 console.log(`order-control: arm ${ARM}, backend ${BACKEND_DIR}, scenarios ${run.join(" ")}`);
