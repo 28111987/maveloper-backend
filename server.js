@@ -11,7 +11,7 @@ import { renderFigmaNodes, makeFilename, patchSpecImageSrcs, fetchRawImageRefUrl
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
-import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds } from "./queue-runner.js";
+import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds, bridgeSecretConfig, bridgeSecretAccepts } from "./queue-runner.js";
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
 import { createRouteDoors } from "./route-doors.js";
 import { createOrderActions } from "./order-actions.js";
@@ -2410,7 +2410,12 @@ function assertFigmaPostProcess(before, after, designSpec, { requestId, source =
 // Auth: MAC_BRIDGE_SECRET shared between Railway and Mac bridge
 
 const MAC_BRIDGE_URL = process.env.MAC_BRIDGE_URL || null;
-const MAC_BRIDGE_SECRET = process.env.MAC_BRIDGE_SECRET || "change-me-in-env";
+// RUN 20: the shared secret and its rotation window, read in ONE place
+// (queue-runner.js bridgeSecretConfig). MAC_BRIDGE_SECRET is the value SENT to the
+// engine: the current one, or MAC_BRIDGE_SECRET_NEXT once MAC_BRIDGE_SECRET_SEND
+// is "next". /bridge-callback accepts the current value or NEXT (bridgeSecretAccepts).
+const BRIDGE_SECRETS = bridgeSecretConfig(process.env);
+const MAC_BRIDGE_SECRET = BRIDGE_SECRETS.sendValue;
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // v9.2.0 â€” Bridge callback architecture
 //
@@ -2455,6 +2460,8 @@ const LOCAL_JOBS = new Set();
 // K6 STOP. Jobs a person stopped: never dispatched after this, and their result
 // is recorded as discarded if it arrives.
 const STOPPED_JOBS = new Set();
+// RUN 20 B1: the bridgeJobIds whose stop callback this process is handling now.
+const STOPS_IN_HAND = new Set();
 // RUN 19: an engine that is being updated. S-DRAIN (503 draining, nothing built)
 // sends the SAME payload again with the SAME bridgeJobId, after Retry-After and
 // the health wait, at most DRAIN_RESEND_MAX times per dispatch. S-STOP (the
@@ -4310,10 +4317,11 @@ async function deliverLateResult(jobRow, order, html, { compilerAssets, elapsedS
 
 app.post("/bridge-callback", async (req, res) => {
   const incomingSecret = req.headers["x-bridge-secret"];
-  if (!incomingSecret || incomingSecret !== MAC_BRIDGE_SECRET) {
+  if (!bridgeSecretAccepts(incomingSecret, BRIDGE_SECRETS)) {
     log("warn", "/bridge-callback unauthorized", {
       requestId: req.id,
       hasHeader: !!incomingSecret,
+      secretNextSet: BRIDGE_SECRETS.secretNextSet,
     });
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -4323,6 +4331,20 @@ app.post("/bridge-callback", async (req, res) => {
   if (!bridgeJobId) {
     return res.status(400).json({ error: "Missing bridgeJobId" });
   }
+
+  // RUN 20 B1: the engine sends its stop callback again, with the SAME body, when
+  // we are slow to answer. A copy that arrives while this process still handles
+  // the first is answered and logged only: it never appends a stop and never
+  // sends the order again. Entered before the first await, left in the finally
+  // at the end of this handler. A copy after the first finished meets the
+  // persisted check in the stop branch ("this stop was already recorded").
+  const stopCopyKey = engineStopped === true && !html ? String(bridgeJobId) : null;
+  if (stopCopyKey && STOPS_IN_HAND.has(stopCopyKey)) {
+    log("info", "/bridge-callback a second copy of this stop arrived while the first was handled", { requestId: req.id, bridgeJobId });
+    return res.status(200).json({ ok: true, settled: "engine-stopped", resend: false, durableWrite: false, inMemorySettled: false });
+  }
+  if (stopCopyKey) STOPS_IN_HAND.add(stopCopyKey);
+  try {
 
   // ── ★ THE CALLBACK TRANSFER, STATED IN THE LOG ──────────────────────────────
   // recvMs is tunnel-transfer AND JSON parse together (see the middleware pair
@@ -4799,6 +4821,9 @@ app.post("/bridge-callback", async (req, res) => {
     durableWrite: !!dbJobId,
     inMemorySettled: !!entry,
   });
+  } finally {
+    if (stopCopyKey) STOPS_IN_HAND.delete(stopCopyKey);
+  }
 });
 
 // -----------------------------------------------------------------

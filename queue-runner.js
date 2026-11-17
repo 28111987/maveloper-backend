@@ -28,6 +28,7 @@
  *   pending   → (still pending/processing; leave in flight)
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { computeQueuePlan } from './queue-priority.js';
 // ★ The org-id normaliser lives WITH the resolver that consumes it, not as a
 // second copy here. One regex in four places is the defect asset-refs.js was
@@ -89,6 +90,50 @@ export function isMissingEngineColumn(err) {
   return (err.code === '42703' || /does not exist|could not find/i.test(msg)) && /\bengine\b/.test(msg);
 }
 
+// ── RUN 20: THE SHARED SECRET WITH THE ENGINE, AND ITS ROTATION WINDOW ───────
+// The engine reads BRIDGE_SECRET and, during a rotation, BRIDGE_SECRET_NEXT: it
+// accepts either on what we send it, and its callbacks carry BRIDGE_SECRET only.
+// So for a window the backend accepts two values on /bridge-callback and chooses
+// which one it sends, and every backend step of a rotation is a variable:
+//   MAC_BRIDGE_SECRET       the current value, sent and accepted (as always)
+//   MAC_BRIDGE_SECRET_NEXT  optional; when set and not empty, ALSO accepted
+//   MAC_BRIDGE_SECRET_SEND  exactly "next" sends NEXT (when NEXT is set); anything
+//                           else, or "next" without NEXT, sends the current value
+// Read HERE only (server.js imports it). No value, length or part of one is ever
+// logged: the boot line carries the two words of bridgeSecretBootFields.
+export function bridgeSecretConfig(env = {}) {
+  const current = env.MAC_BRIDGE_SECRET || 'change-me-in-env';
+  const next = typeof env.MAC_BRIDGE_SECRET_NEXT === 'string' && env.MAC_BRIDGE_SECRET_NEXT !== '' ? env.MAC_BRIDGE_SECRET_NEXT : null;
+  const wantNext = env.MAC_BRIDGE_SECRET_SEND === 'next';
+  const sendNext = wantNext && next !== null;
+  return {
+    current,
+    next,
+    sendValue: sendNext ? next : current,
+    secretNextSet: next !== null,
+    secretSend: sendNext ? 'next' : 'current',
+    sendNextWithoutNext: wantNext && next === null,
+  };
+}
+
+/** A3: the only view of the secrets that is ever printed (the boot line). */
+export function bridgeSecretBootFields(cfg) {
+  return { secretNextSet: cfg.secretNextSet, secretSend: cfg.secretSend };
+}
+
+/** A2: a callback's X-Bridge-Secret is the current value or, when set, NEXT. Constant time; a length mismatch is a refusal. */
+export function bridgeSecretAccepts(header, cfg) {
+  if (typeof header !== 'string' || header === '') return false;
+  const same = (want) => {
+    const a = Buffer.from(header, 'utf8');
+    const b = Buffer.from(want, 'utf8');
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  const okCurrent = same(cfg.current);
+  const okNext = cfg.next !== null && same(cfg.next);
+  return okCurrent || okNext;
+}
+
 /**
  * RUN 17 HOOKS, all optional so an older caller keeps today's behaviour:
  *   probeEngineJob(bridgeJobId) -> 'known' | 'unknown' | 'unreachable' | 'unsupported'
@@ -128,6 +173,9 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
     // RUN 19 D2/D4/D6: the engine-update bounds (shown on the boot line).
     ...engineUpdateLimits(env),
   };
+  // RUN 20: the secret's two boot words; the values themselves never enter cfg.
+  const secretCfg = bridgeSecretConfig(env);
+  Object.assign(cfg, bridgeSecretBootFields(secretCfg));
   const probeState = new Map(); // jobId -> { lastAt, unknown, unreachable }
   const timeStage = (name, fields) => { try { if (stage) stage(name, fields); } catch { /* never fails a tick */ } };
 
@@ -717,8 +765,11 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
       maxDispatchPerTick: cfg.maxDispatchPerTick,
       drainResendMax: cfg.drainResendMax,
       stopRedispatchMax: cfg.stopRedispatchMax,
+      secretNextSet: cfg.secretNextSet,
+      secretSend: cfg.secretSend,
       supabase: !!supabaseAdmin,
     });
+    if (secretCfg.sendNextWithoutNext) log('warn', 'MAC_BRIDGE_SECRET_SEND=next but MAC_BRIDGE_SECRET_NEXT is not set');
     if (!cfg.enabled) return;
     if (!supabaseAdmin) {
       log('warn', 'Queue runner: RUNNER_ENABLED=true but Supabase not configured — not starting');
