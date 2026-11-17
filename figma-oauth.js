@@ -49,7 +49,7 @@
  * not by threading a reason through a function that returns null.
  */
 
-import { readKey, sealToken, openToken, KEY_ENV } from "./figma-credential-crypto.js";
+import { readKey, readPreviousKey, sealToken, openTokenWithFallback, KEY_ENV, PREVIOUS_KEY_ENV } from "./figma-credential-crypto.js";
 import { normalisedOrgId, resolveFigmaToken, credentialProvenanceLine } from "./figma-credential.js";
 
 // ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ async function recordRefreshOutcome(db, orgId, ok, note, nowIso) {
  * failure is recorded on the row (see recordRefreshOutcome) and this function
  * returns null rather than handing back the stale access token.
  */
-export async function resolveFigmaOAuth(orgId, { db = null, key = null, now = null, env = null, fetchImpl = null } = {}) {
+export async function resolveFigmaOAuth(orgId, { db = null, key = null, previousKey = null, now = null, env = null, fetchImpl = null } = {}) {
   const nowMs = now ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
@@ -384,14 +384,21 @@ export async function resolveFigmaOAuth(orgId, { db = null, key = null, now = nu
   if (row.is_active === false) return null;
 
   let sealingKey = key;
+  let previous = previousKey;
   if (!sealingKey) {
     const keyRead = readKey(env ? env[KEY_ENV] : process.env[KEY_ENV]);
     if (!keyRead.ok) return null;
     sealingKey = keyRead.key;
+    // KEY ROTATION: read FIGMA_CRED_KEY_PREVIOUS only when the caller passed no
+    // keys (production passes none). Absent = exactly today's behaviour.
+    if (previous == null) {
+      const prevRead = readPreviousKey(env ? env[PREVIOUS_KEY_ENV] : process.env[PREVIOUS_KEY_ENV]);
+      previous = prevRead.ok ? prevRead.key : null;
+    }
   }
 
-  const openedAccess = openToken(row.access_token, sealingKey);
-  const openedRefresh = openToken(row.refresh_token, sealingKey);
+  const openedAccess = openTokenWithFallback(row.access_token, sealingKey, previous);
+  const openedRefresh = openTokenWithFallback(row.refresh_token, sealingKey, previous);
   if (!openedAccess.ok || !openedRefresh.ok) return null;
 
   let accessToken = openedAccess.token;
@@ -497,10 +504,10 @@ export function shapeOAuthResolution(oauth, orgId) {
  * so that composition has a name and a direct, isolated test — see
  * figma-oauth.test.mjs's fallthrough control.
  */
-export async function resolveFigmaCredential(orgId, { db, globalToken, now, key, env, fetchImpl } = {}) {
-  const oauth = await resolveFigmaOAuth(orgId, { db, key, now, env, fetchImpl });
+export async function resolveFigmaCredential(orgId, { db, globalToken, now, key, previousKey, env, fetchImpl } = {}) {
+  const oauth = await resolveFigmaOAuth(orgId, { db, key, previousKey, now, env, fetchImpl });
   if (oauth) return shapeOAuthResolution(oauth, orgId);
-  return resolveFigmaToken(orgId, { db, globalToken, now, key, env });
+  return resolveFigmaToken(orgId, { db, globalToken, now, key, previousKey, env });
 }
 
 /**

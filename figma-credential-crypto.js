@@ -248,4 +248,52 @@ export function lastFour(token) {
   return s.slice(-4);
 }
 
-export default { SEAL_PREFIX, KEY_ENV, readKey, isSealed, sealToken, openToken, lastFour };
+/**
+ * KEY ROTATION (17 NOV 2026). THE HEADER ABOVE SAYS A ROTATED KEY KILLS EVERY
+ * STORED CREDENTIAL. THAT STAYS TRUE OF A KEY SWAP; THIS MAKES A ROTATION SAFE.
+ *
+ * FIGMA_CRED_KEY_PREVIOUS is OPTIONAL and normally ABSENT. While it is set, a
+ * value that will not open with FIGMA_CRED_KEY is tried with it, and the boot
+ * re-seal (figma-credential-reseal.js) rewrites every such row under the
+ * current key. Sealing ALWAYS uses FIGMA_CRED_KEY. With the variable absent,
+ * every function here behaves exactly as before: the fallback is never tried.
+ *
+ * The rotation: set PREVIOUS = the old key and FIGMA_CRED_KEY = a new one in the
+ * same change; the boot re-seal moves every row; then remove PREVIOUS.
+ */
+export const PREVIOUS_KEY_ENV = "FIGMA_CRED_KEY_PREVIOUS";
+
+/**
+ * Read the optional previous key. ABSENT IS NOT AN ERROR: { ok: true, key: null }.
+ * A present-but-malformed value is { ok: false, key: null, error } and is never
+ * used; like readKey it names the length and never the value.
+ */
+export function readPreviousKey(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return { ok: true, key: null, error: null };
+  const r = readKey(s);
+  if (r.ok) return { ok: true, key: r.key, error: null };
+  return { ok: false, key: null, error: r.error.split(KEY_ENV).join(PREVIOUS_KEY_ENV) };
+}
+
+/**
+ * openToken with the rotation fallback. Tries `key`; only when that fails on a
+ * SEALED value and `previousKey` is a key, tries `previousKey`. Reports
+ * `usedPrevious` so the re-seal can tell an old-key row from a current one.
+ * On a double failure it returns the FIRST attempt's result: the error a caller
+ * already handles today.
+ */
+export function openTokenWithFallback(sealed, key, previousKey = null) {
+  const first = openToken(sealed, key);
+  if (first.ok || !first.wasSealed || !Buffer.isBuffer(previousKey)) {
+    return { ...first, usedPrevious: false };
+  }
+  const second = openToken(sealed, previousKey);
+  if (second.ok) return { ...second, usedPrevious: true };
+  return { ...first, usedPrevious: false };
+}
+
+export default {
+  SEAL_PREFIX, KEY_ENV, PREVIOUS_KEY_ENV, readKey, readPreviousKey, isSealed,
+  sealToken, openToken, openTokenWithFallback, lastFour,
+};

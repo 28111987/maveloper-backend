@@ -480,8 +480,11 @@ section("   FALLBACK REGRESSES");
   const original = rfs(SRC, "utf8");
 
   // Replace the unseal with run 1's behaviour: hand the RAW ROW straight on.
+  // (17 NOV 2026: the unseal became openTokenWithFallback(row.token, sealingKey,
+  // previous) for the FIGMA_CRED_KEY rotation; this pattern follows it, and the
+  // "mutation actually applied" check below still refuses a silent no-match.)
   const mutated = original.replace(
-    /const opened = openToken\(row\.token, sealingKey\);/,
+    /const opened = openTokenWithFallback\(row\.token, sealingKey, previous\);/,
     "const opened = { ok: true, token: row.token, wasSealed: false }; // MUTANT: unseal removed"
   );
   ok("8d the mutation actually applied (NOT a silent no-match)", mutated !== original);

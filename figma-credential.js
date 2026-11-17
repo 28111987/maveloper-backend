@@ -61,7 +61,7 @@
  * deliberately deferred — it needs a redirect/refresh flow this table cannot hold.
  */
 
-import { readKey, openToken, isSealed, KEY_ENV } from "./figma-credential-crypto.js";
+import { readKey, readPreviousKey, openTokenWithFallback, isSealed, KEY_ENV, PREVIOUS_KEY_ENV } from "./figma-credential-crypto.js";
 
 // ---------------------------------------------------------------------------
 // SHAPE
@@ -259,7 +259,7 @@ export function normalisedOrgId(v) {
  */
 export async function resolveFigmaToken(
   orgId,
-  { db = null, globalToken = null, now = null, key = null, env = null } = {}
+  { db = null, globalToken = null, now = null, key = null, previousKey = null, env = null } = {}
 ) {
   const fallback = scrubToken(
     globalToken ?? process.env.FIGMA_API_TOKEN ?? process.env.FIGMA_TOKEN ?? ""
@@ -333,8 +333,16 @@ export async function resolveFigmaToken(
     }
     sealingKey = keyRead.key;
   }
+  // KEY ROTATION: while FIGMA_CRED_KEY_PREVIOUS is set, a row the current key
+  // cannot open is tried with the previous one. Read from env only when the
+  // caller did not pass keys itself (production passes none); absent = today.
+  let previous = previousKey;
+  if (wasSealedRow && previous == null && !key) {
+    const prevRead = readPreviousKey(env ? env[PREVIOUS_KEY_ENV] : process.env[PREVIOUS_KEY_ENV]);
+    previous = prevRead.ok ? prevRead.key : null;
+  }
 
-  const opened = openToken(row.token, sealingKey);
+  const opened = openTokenWithFallback(row.token, sealingKey, previous);
   if (!opened.ok) {
     // Wrong key, truncated ciphertext or a tampered tag. All three mean the same
     // thing operationally: this row cannot be used and the client re-pastes.

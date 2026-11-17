@@ -30,6 +30,9 @@ import { createFigmaCredentialRoutes } from "./figma-credential-routes.js";
 // there is none. Fails OPEN exactly like the resolver it wraps: a space with
 // no OAuth connection and no pasted token behaves exactly as it does today.
 import { resolveFigmaOAuth, shapeOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
+// FIGMA_CRED_KEY rotation (17 NOV 2026): runs at boot ONLY while
+// FIGMA_CRED_KEY_PREVIOUS is set. See figma-credential-reseal.js.
+import { resealAll } from "./figma-credential-reseal.js";
 import { createFigmaOAuthRoutes } from "./figma-oauth-routes.js";
 import {
   sanitizeOrderId,
@@ -5964,6 +5967,15 @@ const server = app.listen(PORT, () => {
   // RUNNER_ENABLED === "true" â€” so the dark build's only visible effect is one
   // extra log line at startup.
   queueRunner.start();
+  // FIGMA_CRED_KEY ROTATION: only while FIGMA_CRED_KEY_PREVIOUS is set. It runs
+  // AFTER listen and is not awaited, so /health (Railway's deploy gate) never
+  // waits on it. With the variable absent nothing is called and nothing is
+  // logged: every ordinary boot is unchanged.
+  if (String(process.env.FIGMA_CRED_KEY_PREVIOUS || "").trim()) {
+    resealAll({ db: supabaseAdmin, log })
+      .then((s) => { if (!s.ran) log("warn", "figma credential re-seal did not run", { reason: s.reason }); })
+      .catch(() => log("warn", "figma credential re-seal did not run", { reason: "unexpected error" }));
+  }
 });
 
 server.timeout = SERVER_TIMEOUT_MS;

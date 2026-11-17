@@ -58,7 +58,7 @@ import {
   findTokenLeaks,
   CREDENTIAL_TABLE,
 } from "./figma-credential.js";
-import { readKey, sealToken, openToken, lastFour, KEY_ENV } from "./figma-credential-crypto.js";
+import { readKey, readPreviousKey, sealToken, openTokenWithFallback, lastFour, KEY_ENV, PREVIOUS_KEY_ENV } from "./figma-credential-crypto.js";
 import { figmaAuthHeaders } from "./figma-auth-header.js";
 
 /**
@@ -699,7 +699,9 @@ export function createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, l
             }, log);
           }
         }
-        const opened = openToken(data.token, keyRead.key);
+        // KEY ROTATION: the previous key, when set, opens a row not yet re-sealed.
+        const prevRead = readPreviousKey(env[PREVIOUS_KEY_ENV]);
+        const opened = openTokenWithFallback(data.token, keyRead.key, prevRead.ok ? prevRead.key : null);
         if (!opened.ok) {
           return sendSafe(res, 500, { error: "Could not read the stored credential", details: opened.error }, log);
         }
