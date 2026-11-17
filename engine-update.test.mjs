@@ -1,10 +1,15 @@
-// engine-update.test.mjs - RUN 19: the pure parts of "an order that meets an
+// engine-update.test.mjs - RUN 19 (run 20: C1, the bounded-stop sentence): the pure parts of "an order that meets an
 // engine update is sent again" (queue-runner.js, order-words.js).
 //   node engine-update.test.mjs        (exit 0 = every case passed)
 // Expected values from the run 19 brief's rules D1, D2, D3, D5 and D9, never from
 // the code. The end-to-end scenarios are X1-X10 in order-control.test.mjs.
 import { engineUpdateLimits, isDrainAnswer, retryAfterSeconds } from "./queue-runner.js";
-import { plainReason, ENGINE_UPDATING, ENGINE_STOPPED_TWICE, ENGINE_RESENT, START_FAILED, INTERNAL } from "./order-words.js";
+import * as W from "./order-words.js";
+const { plainReason, ENGINE_UPDATING, ENGINE_RESENT, START_FAILED, INTERNAL } = W;
+// RUN 20 C1: the bounded-stop sentence, from the rule (it said "twice"; the default
+// bound fails the order at the third stop). The old sentence maps to it.
+const D5 = "The engine stopped more than once while it was being updated. Please resubmit in a few minutes.";
+const D5_OLD = "The engine stopped twice while it was being updated. Please resubmit in a few minutes.";
 
 let pass = 0, fail = 0;
 function eq(name, expected, actual) {
@@ -40,24 +45,28 @@ for (const [h, want] of [[null, 5], [undefined, 5], ["", 5], ["abc", 5], ["0", 5
 
 // D3, D5, D9: the words a client reads.
 eq("D3 words", "The engine was being updated and could not take the order. Please resubmit in a few minutes.", ENGINE_UPDATING);
-eq("D5 words", "The engine stopped twice while it was being updated. Please resubmit in a few minutes.", ENGINE_STOPPED_TWICE);
+eq("D5 words (C1)", D5, W.ENGINE_STOPPED_MORE_THAN_ONCE);
 eq("D4 progress words", "The engine restarted for an update. Mavloper sent the order again.", ENGINE_RESENT);
 eq("D3 the raw S-DRAIN reason, as the async route writes it", ENGINE_UPDATING,
   plainReason("Claude Code bridge failed and automatic fallback is disabled.: engine draining: the engine refused the order 4 times while it was being updated (HTTP 503, draining); nothing was built"));
-eq("D5 the raw S-STOP reason (in process)", ENGINE_STOPPED_TWICE,
+eq("D5 the raw S-STOP reason (in process)", D5,
   plainReason("Claude Code bridge failed and automatic fallback is disabled.: engine stopped: the engine was stopped for an update 3 times while building this order (engineStopped); not sent again"));
-eq("D5 the raw S-STOP reason (runner)", ENGINE_STOPPED_TWICE,
+eq("D5 the raw S-STOP reason (runner)", D5,
   plainReason("engine stopped: the engine was stopped for an update 3 times while building this order (engineStopped); not sent again"));
-eq("D9 the engine's own S-STOP sentence reads as D5", ENGINE_STOPPED_TWICE,
+eq("D9 the engine's own S-STOP sentence reads as D5", D5,
   plainReason("The engine was stopped before this order finished building, because the server running it was shut down. Nothing was delivered. Please place the order again."));
-eq("D9 the engine's sentence behind the 502 prefix", ENGINE_STOPPED_TWICE,
+eq("D9 the engine's sentence behind the 502 prefix", D5,
   plainReason("Claude Code bridge failed and automatic fallback is disabled.: The engine was stopped before this order finished building, because the server running it was shut down. Nothing was delivered. Please place the order again."));
 eq("D3 maps to itself", ENGINE_UPDATING, plainReason(ENGINE_UPDATING));
-eq("D5 maps to itself", ENGINE_STOPPED_TWICE, plainReason(ENGINE_STOPPED_TWICE));
+eq("D5 maps to itself", D5, plainReason(D5));
+eq("C1 the old D5 sentence maps to the new one", D5, plainReason(D5_OLD));
+eq("C1 the old D5 sentence behind a prefix maps to the new one", D5, plainReason("Runner: " + D5_OLD));
+eq("C1 the default export carries the new sentence", D5, W.default && W.default.ENGINE_STOPPED_MORE_THAN_ONCE);
+eq("C1 no export still carries the old sentence", false, Object.values(W).concat(Object.values(W.default || {})).includes(D5_OLD));
 eq("D1 a 503 without the draining body keeps today's words", START_FAILED,
   plainReason('Claude Code bridge failed and automatic fallback is disabled.: Bridge rejected dispatch with status 503: {"error":"Service Unavailable"}'));
 eq("D1 an unrecognised reason keeps today's words", INTERNAL, plainReason("something nobody expected"));
-for (const [n, s] of [["D3", ENGINE_UPDATING], ["D5", ENGINE_STOPPED_TWICE], ["D4", ENGINE_RESENT]]) {
+for (const [n, s] of [["D3", ENGINE_UPDATING], ["D5", D5], ["D4", ENGINE_RESENT]]) {
   eq(`${n} has no em dash`, false, /—/.test(s));
   eq(`${n} never tells the client to place the order again`, false, /place the order again/i.test(s));
 }

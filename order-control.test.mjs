@@ -26,7 +26,7 @@
 // ---------------------------------------------------------------------------
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHmac, randomUUID, randomBytes } from "node:crypto";
 import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -114,7 +114,12 @@ function record(scenario, kase, rule, expected, actual) {
 }
 
 // ── the local front: /auth/v1/user from our JWT, /rest/v1 to PostgREST ───────
+// RUN 20: `delays` holds a database request on purpose (B1): each entry
+// { match(method, pathAndQuery, body), ms, phase: "before"|"after", skip, left }
+// holds the first `left` matching requests after `skip`, before forwarding them
+// or after the database answered. Empty (every scenario before run 20): no change.
 async function startFront() {
+  const delays = [];
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const chunks = [];
@@ -131,9 +136,18 @@ async function startFront() {
       const to = REST_URL + url.pathname.slice("/rest/v1".length) + url.search;
       const headers = { ...req.headers };
       delete headers.host; delete headers["content-length"]; delete headers.connection;
+      let hold = null;
+      for (const d of delays) {
+        if (d.left > 0 && d.match(req.method, decodeURIComponent(url.pathname + url.search), body.toString())) {
+          if (d.skip > 0) { d.skip--; continue; }
+          d.left--; d.hits = (d.hits || 0) + 1; hold = d; break;
+        }
+      }
+      if (hold && hold.phase === "before") await sleep(hold.ms);
       try {
         const r = await fetch(to, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body });
         const out = Buffer.from(await r.arrayBuffer());
+        if (hold && hold.phase === "after") await sleep(hold.ms);
         const h = {};
         r.headers.forEach((v, k) => { if (!["content-encoding", "transfer-encoding", "connection", "content-length"].includes(k)) h[k] = v; });
         res.writeHead(r.status, h);
@@ -147,7 +161,7 @@ async function startFront() {
     res.end(JSON.stringify({ message: "front: no such path " + url.pathname }));
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }) };
+  return { url: `http://127.0.0.1:${server.address().port}`, delays, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }) };
 }
 
 // ── the fake Figma ──────────────────────────────────────────────────────────
@@ -1001,7 +1015,9 @@ async function R1() {
 // before any code changed; never from the code. Real clock (no scaling).
 // ══════════════════════════════════════════════════════════════════════════
 const D3_WORDS = "The engine was being updated and could not take the order. Please resubmit in a few minutes.";
-const D5_WORDS = "The engine stopped twice while it was being updated. Please resubmit in a few minutes.";
+// RUN 20 C1: the bounded-stop sentence says "more than once" (it was "twice", and the
+// default bound fails the order at the third stop).
+const D5_WORDS = "The engine stopped more than once while it was being updated. Please resubmit in a few minutes.";
 const D4_WORDS = "The engine restarted for an update. Mavloper sent the order again.";
 const START_FAILED_WORDS = "The build could not start on our side. Please resubmit in a few minutes.";
 const LEAK = /@|figd_|Bearer|eyJ|oc-dummy-bridge-secret/;
@@ -1297,6 +1313,311 @@ async function X10() {
   } finally { await X.close(); }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// RUN 20. ROTATE THE SHARED SECRET WITHOUT REFUSING AN ORDER; ONE STOP HANDLED ONCE.
+// Expected values from the run 20 brief's A1-A5 and B1, fixed in
+// _RUN20/rules-before-tests.md before any code changed; never from the code.
+// The fake engine handles the secret as the engine does during a rotation: it
+// accepts BRIDGE_SECRET or BRIDGE_SECRET_NEXT on POST /generate and GET /jobs, and
+// its callbacks carry BRIDGE_SECRET only. The two secrets are made here per run,
+// held in memory and never printed: every report names them "old" and "new".
+// ══════════════════════════════════════════════════════════════════════════
+const ROT_OLD = randomBytes(24).toString("base64url");   // 32 characters
+const ROT_NEW = randomBytes(36).toString("base64url");   // 48: another length on purpose
+const rotLabel = (v) => (v === ROT_OLD ? "old" : v === ROT_NEW ? "new" : v === "" ? "(empty)" : "(other)");
+// A3: no secret, no prefix and no suffix of one, in any line the backend wrote.
+function secretLeaks(lines) {
+  const needles = [ROT_OLD, ROT_NEW, BRIDGE_SECRET, ROT_OLD.slice(0, 8), ROT_OLD.slice(-8), ROT_NEW.slice(0, 8), ROT_NEW.slice(-8)];
+  return lines.filter((l) => needles.some((n) => l.includes(n))).length;
+}
+const bootLine = (srv) => srv.logs().find((l) => /^Queue runner boot: /.test(l.msg || ""));
+const SEND_WARNING = "MAC_BRIDGE_SECRET_SEND=next but MAC_BRIDGE_SECRET_NEXT is not set";
+
+// Two engine revisions serving at once, as during a staged release: POST
+// /generate goes to each in turn (the first to the newer revision), GET /jobs to
+// the revision that holds the job, GET /health to the first.
+async function startSplitter(engines) {
+  let n = 0;
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = Buffer.concat(chunks);
+    const url = new URL(req.url, "http://127.0.0.1");
+    let target = engines[0];
+    if (req.method === "POST" && url.pathname === "/generate") target = engines[n++ % engines.length];
+    else if (url.pathname.startsWith("/jobs/")) target = engines.find((e) => e.jobs.has(decodeURIComponent(url.pathname.slice(6)))) || engines[0];
+    const headers = { ...req.headers };
+    delete headers.host; delete headers["content-length"]; delete headers.connection;
+    try {
+      const r = await fetch(target.url + req.url, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body });
+      const out = Buffer.from(await r.arrayBuffer());
+      const h = {};
+      r.headers.forEach((v, k) => { if (!["content-encoding", "transfer-encoding", "connection", "content-length"].includes(k)) h[k] = v; });
+      res.writeHead(r.status, h);
+      res.end(out);
+    } catch {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end('{"error":"splitter"}');
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }) };
+}
+
+// One rotation step: the backend's variables, the serving revisions, and one
+// order per revision (each delivered), with what each must carry.
+//   orders[i] = { engine, sent, outcome, callback }   outcome: delivered | failed-start | processing
+async function rotStep(name, { backend, engines, boot, orders, refusedDispatches = 0, refusedCallbacks = 0 }) {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const front = await startFront();
+  const figma = await startFigma();
+  const revs = [];
+  for (const e of engines) {
+    const en = createFakeEngine({ secret: e.secret, secretNext: e.next || null, label: rotLabel, log: process.env.OC_VERBOSE ? console.log : () => {} });
+    en.url = await en.listen();
+    en.set({ buildMs: 1500, dedupe: true });
+    en.rev = e.rev;
+    revs.push(en);
+  }
+  const split = revs.length > 1 ? await startSplitter(revs) : null;
+  const srv = await startServer({ front, figma, engine: { url: split ? split.url : revs[0].url }, env: { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000", ...backend } });
+  try {
+    const b = bootLine(srv);
+    record(name, "boot", "A3 the boot line's secretNextSet, secretSend", boot.join(", "), `${b?.secretNextSet}, ${b?.secretSend}`);
+    for (let i = 0; i < orders.length; i++) {
+      const want = orders[i];
+      const en = revs[want.engine];
+      const k = `order ${i + 1} (to the ${en.rev} revision)`;
+      const seen0 = en.seen.length, cb0 = en.callbacks.length, b0 = en.builds.length;
+      const o = await insertOrder({ space: "B", lead: "dev-b", orderId: `${name}-${i + 1}` });
+      const { final } = await watchOrder(o, { timeoutMs: want.outcome === "processing" ? 30000 : 60000, settleMs: 1500 });
+      const outcome = final?.status === "failed" ? `failed | ${final.error_text}` : final?.status;
+      const wantOutcome = want.outcome === "failed-start" ? `failed | ${START_FAILED_WORDS}` : want.outcome;
+      record(name, k, "A5 the order's outcome", wantOutcome, outcome);
+      const posts = en.seen.slice(seen0).filter((s) => s.method === "POST" && s.path === "/generate");
+      record(name, k, "A1 every dispatch to it carried", want.sent, [...new Set(posts.map((s) => s.header))].join("+") || "(no dispatch)");
+      record(name, k, "A5 builds there for this order", want.outcome === "failed-start" ? 0 : 1, en.builds.length - b0);
+      const cbs = en.callbacks.slice(cb0);
+      record(name, k, "A2 its callback carried, and the backend answered", want.callback, cbs.map((c) => `${c.carried}, ${c.status}`).join(" / ") || "(no callback)");
+    }
+    const allRefused = revs.flatMap((e) => e.refused).filter((r) => r.path === "/generate").length;
+    const cbRefused = revs.flatMap((e) => e.callbacks).filter((c) => c.status === 401).length;
+    record(name, "step", "A5 refused dispatches, every revision", refusedDispatches, allRefused);
+    record(name, "step", "A5 refused callbacks", refusedCallbacks, cbRefused);
+    record(name, "step", "A3 no secret, prefix or suffix in any log line", 0, secretLeaks(srv.lines));
+    record(name, "step", "no request left this machine", 0, srv.refused.length);
+  } finally {
+    // OC_DUMP=<dir>: the server's own lines for this step (no secret is ever in them: A3).
+    if (process.env.OC_DUMP) writeFileSync(path.join(process.env.OC_DUMP, `${name}-${ARM}.lines.txt`), srv.lines.join("\n") + "\n");
+    await srv.stop();
+    if (split) await split.close();
+    for (const en of revs) await en.close();
+    await figma.close();
+    await front.close();
+  }
+}
+
+const S0_ENGINE = { rev: "current", secret: ROT_OLD };
+const S2_ENGINE = { rev: "new", secret: ROT_OLD, next: ROT_NEW };
+const S2_OLDREV = { rev: "old", secret: ROT_OLD };
+const S4_ENGINE = { rev: "new", secret: ROT_NEW, next: ROT_OLD };
+const S4_PREV = { rev: "previous", secret: ROT_OLD, next: ROT_NEW };
+const S6_ENGINE = { rev: "current", secret: ROT_NEW };
+const B_S0 = { MAC_BRIDGE_SECRET: ROT_OLD };
+const B_S1 = { MAC_BRIDGE_SECRET: ROT_OLD, MAC_BRIDGE_SECRET_NEXT: ROT_NEW };
+const B_S3 = { MAC_BRIDGE_SECRET: ROT_OLD, MAC_BRIDGE_SECRET_NEXT: ROT_NEW, MAC_BRIDGE_SECRET_SEND: "next" };
+const B_S5 = { MAC_BRIDGE_SECRET: ROT_NEW };
+const one = (engine, sent, callback) => ({ engine, sent, outcome: "delivered", callback });
+
+async function ROT0() { await rotStep("ROT0", { backend: B_S0, engines: [S0_ENGINE], boot: [false, "current"], orders: [one(0, "old", "old, 200")] }); }
+async function ROT1() { await rotStep("ROT1", { backend: B_S1, engines: [S0_ENGINE], boot: [true, "current"], orders: [one(0, "old", "old, 200")] }); }
+async function ROT2() { await rotStep("ROT2", { backend: B_S1, engines: [S2_ENGINE, S2_OLDREV], boot: [true, "current"], orders: [one(0, "old", "old, 200"), one(1, "old", "old, 200")] }); }
+async function ROT3() { await rotStep("ROT3", { backend: B_S3, engines: [S2_ENGINE], boot: [true, "next"], orders: [one(0, "new", "old, 200")] }); }
+// S3 while a revision WITHOUT BRIDGE_SECRET_NEXT still serves: the deliberate red.
+async function ROT3X() {
+  await rotStep("ROT3X", {
+    backend: B_S3, engines: [S2_ENGINE, S2_OLDREV], boot: [true, "next"], refusedDispatches: 1,
+    orders: [one(0, "new", "old, 200"), { engine: 1, sent: "new", outcome: "failed-start", callback: "(no callback)" }],
+  });
+}
+async function ROT4() { await rotStep("ROT4", { backend: B_S3, engines: [S4_ENGINE, S4_PREV], boot: [true, "next"], orders: [one(0, "new", "new, 200"), one(1, "new", "old, 200")] }); }
+async function ROT5() { await rotStep("ROT5", { backend: B_S5, engines: [S4_ENGINE], boot: [false, "current"], orders: [one(0, "new", "new, 200")] }); }
+async function ROT6() { await rotStep("ROT6", { backend: B_S5, engines: [S6_ENGINE], boot: [false, "current"], orders: [one(0, "new", "new, 200")] }); }
+// The control: S1 skipped, the engine moved straight to S4. The known red.
+async function ROTSKIP() {
+  await rotStep("ROTSKIP", {
+    backend: B_S0, engines: [S4_ENGINE], boot: [false, "current"], refusedCallbacks: 1,
+    orders: [{ engine: 0, sent: "old", outcome: "processing", callback: "new, 401" }],
+  });
+}
+
+// A2 / A3: the callback's secret check and the boot line, case by case.
+async function postCallback(srv, header, body) {
+  const h = { "content-type": "application/json" };
+  if (header !== undefined) h["x-bridge-secret"] = header;
+  const r = await fetch(`${srv.base}/bridge-callback`, { method: "POST", headers: h, body: JSON.stringify(body) });
+  return { status: r.status, text: await r.text(), contentType: r.headers.get("content-type"), headers: [...r.headers.entries()] };
+}
+async function A23() {
+  const E = await env0();
+  const allLines = [];
+  const UNAUTH = '{"error":"Unauthorized"}';
+  const sameLen = (s) => (s[0] === "A" ? "B" : "A") + s.slice(1);
+  const boots = [
+    { k: "no variable", env: B_S0, boot: "false, current", warn: 0 },
+    { k: "NEXT set", env: B_S1, boot: "true, current", warn: 0 },
+    { k: "NEXT set, SEND=next", env: B_S3, boot: "true, next", warn: 0 },
+    { k: "SEND=next, NEXT unset", env: { MAC_BRIDGE_SECRET: ROT_OLD, MAC_BRIDGE_SECRET_SEND: "next" }, boot: "false, current", warn: 1 },
+    { k: "SEND=next, NEXT empty", env: { MAC_BRIDGE_SECRET: ROT_OLD, MAC_BRIDGE_SECRET_NEXT: "", MAC_BRIDGE_SECRET_SEND: "next" }, boot: "false, current", warn: 1 },
+    { k: "SEND=NEXT (capitals), NEXT set", env: { ...B_S1, MAC_BRIDGE_SECRET_SEND: "NEXT" }, boot: "true, current", warn: 0 },
+    { k: "SEND=yes, NEXT set", env: { ...B_S1, MAC_BRIDGE_SECRET_SEND: "yes" }, boot: "true, current", warn: 0 },
+    { k: "SEND empty, NEXT set", env: { ...B_S1, MAC_BRIDGE_SECRET_SEND: "" }, boot: "true, current", warn: 0 },
+  ];
+  try {
+    for (const c of boots) {
+      const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "false", ...c.env } });
+      try {
+        const b = bootLine(srv);
+        record("A23", `boot: ${c.k}`, "A1/A3 secretNextSet, secretSend", c.boot, `${b?.secretNextSet}, ${b?.secretSend}`);
+        record("A23", `boot: ${c.k}`, "A1 the SEND warning, once", c.warn, srv.logs().filter((l) => l.msg === SEND_WARNING).length);
+        const secretFields = b ? Object.keys(b).filter((x) => /secret/i.test(x)).sort().join(",") : "(no boot line)";
+        record("A23", `boot: ${c.k}`, "A3 the only boot fields naming a secret", "secretNextSet,secretSend", secretFields);
+        if (c.k === "no variable" || c.k === "NEXT set") {
+          const nextSet = c.k === "NEXT set";
+          const cases = [
+            { k: "header = current (old)", h: ROT_OLD, ok: true },
+            { k: "header = new", h: ROT_NEW, ok: nextSet },
+            { k: "header = a wrong value of old's length", h: sameLen(ROT_OLD), ok: false },
+            { k: "header = a wrong value of new's length", h: sameLen(ROT_NEW), ok: false },
+            { k: "header = a wrong value of another length", h: "x" + ROT_OLD.slice(0, 5), ok: false },
+            { k: "header = new without its last character", h: ROT_NEW.slice(0, -1), ok: false },
+            { k: "header = new plus one character", h: ROT_NEW + "x", ok: false },
+            { k: "header empty", h: "", ok: false },
+            { k: "header missing", h: undefined, ok: false },
+          ];
+          for (const cc of cases) {
+            const r = await postCallback(srv, cc.h, { bridgeJobId: "bj_a23_unknown", error: "a23 probe" });
+            const got = r.status === 401 ? (r.text === UNAUTH ? "refused (401, today's body)" : `401 with another body ${r.text}`) : r.status >= 500 ? `error ${r.status}` : "accepted";
+            record("A23", `${c.k}: ${cc.k}`, "A2 accepted, or refused as today", cc.ok ? "accepted" : "refused (401, today's body)", got);
+          }
+          const un = srv.logs().filter((l) => l.msg === "/bridge-callback unauthorized");
+          const shapes = [...new Set(un.map((l) => Object.keys(l).filter((x) => !["level", "msg", "ts", "requestId"].includes(x)).sort().join(",")))];
+          record("A23", `${c.k}: refusal log lines`, "A2/A3 hasHeader and secretNextSet, booleans only", "hasHeader,secretNextSet", shapes.join(" | "));
+          record("A23", `${c.k}: refusal log lines`, "A3 secretNextSet says whether NEXT is configured", String(nextSet), [...new Set(un.map((l) => String(l.secretNextSet)))].join(","));
+          record("A23", `${c.k}: still answering`, "A2 a length mismatch is a refusal, not an exception", 200, (await fetch(`${srv.base}/health`)).status);
+        }
+      } finally {
+        allLines.push(...srv.lines);
+        await srv.stop();
+      }
+    }
+    record("A23", "every boot", "A3 no secret, prefix or suffix in any log line", 0, secretLeaks(allLines));
+  } finally {
+    await E.close();
+  }
+}
+
+// A4: with no new variable, what the backend sends the engine and how it answers
+// callbacks, written to $OC_A4_DIR/<arm>.json (secrets as labels, per-run values
+// masked) for an old-against-new comparison.
+const A4_DIR = process.env.OC_A4_DIR || null;
+function maskText(s) {
+  return String(s)
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
+    .replace(/bj_\d+_[a-z0-9]+/g, "<bridgeJobId>")
+    .replace(/\breq_[a-z0-9]+_[a-z0-9]+\b/g, "<request id>")
+    .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<port>")
+    .replace(/"requestId":"[^"]*"/g, '"requestId":"<id>"');
+}
+const maskHeaders = (hs) => hs.map(([k, v]) => [k, ["host", "content-length", "date", "etag"].includes(k.toLowerCase()) ? "<masked>" : maskText(v)]);
+async function A4() {
+  execFileSync("bash", [path.join(HERE, "order-control.db.sh"), "reset"], { cwd: HERE, stdio: "ignore" });
+  parkSeedOrders();
+  const E = await env0();
+  E.engine.set({ buildMs: 8000 });
+  const srv = await startServer({ ...E, env: { RUNNER_ENABLED: "true", RUNNER_POLL_MS: "2000", ENGINE_JOB_PROBE: "true", ENGINE_JOB_PROBE_MS: "1000" } });
+  try {
+    const o = await insertOrder({ space: "B", lead: "dev-b", n: 950001, orderId: "A4-ROW" });
+    const { final } = await watchOrder(o, { timeoutMs: 60000, settleMs: 1500 });
+    record("A4", "one order, probe on", "setup: delivered", "delivered", final?.status);
+    const first = (m, p) => E.engine.seen.find((s) => s.method === m && (p instanceof RegExp ? p.test(s.path) : s.path === p));
+    const gen = first("POST", "/generate"), jobs = first("GET", /^\/jobs\//), health = first("GET", "/health");
+    record("A4", "one order, probe on", "setup: a dispatch, a probe and a health wait were seen", "true, true, true", `${Boolean(gen)}, ${Boolean(jobs)}, ${Boolean(health)}`);
+    const out = {
+      generateHeaders: gen ? maskHeaders(gen.headers) : null,
+      generateBody: E.engine.builds[0] ? maskBody(E.engine.builds[0].raw) : null,
+      jobsHeaders: jobs ? maskHeaders(jobs.headers) : null,
+      healthHeaders: health ? maskHeaders(health.headers) : null,
+      resultAnswer: E.engine.callbacks[0] ? { status: E.engine.callbacks[0].status, contentType: E.engine.callbacks[0].contentType, body: maskText(E.engine.callbacks[0].answer) } : null,
+      callbackAnswers: {},
+    };
+    const cases = {
+      "unknown bridgeJobId": [BRIDGE_SECRET, { bridgeJobId: "bj_a4_unknown", error: "a4 probe" }],
+      "wrong secret": ["a-wrong-value", { bridgeJobId: "bj_a4_unknown", error: "a4 probe" }],
+      "header missing": [undefined, { bridgeJobId: "bj_a4_unknown", error: "a4 probe" }],
+      "header empty": ["", { bridgeJobId: "bj_a4_unknown", error: "a4 probe" }],
+      "no bridgeJobId": [BRIDGE_SECRET, { error: "a4 probe" }],
+    };
+    for (const [k, [h, body]] of Object.entries(cases)) {
+      const r = await postCallback(srv, h, body);
+      out.callbackAnswers[k] = { status: r.status, body: maskText(r.text), headers: maskHeaders(r.headers) };
+    }
+    if (A4_DIR) writeFileSync(path.join(A4_DIR, `${ARM}.json`), JSON.stringify(out, null, 2));
+    const ref = process.env.OC_A4_REF ? JSON.parse(readFileSync(process.env.OC_A4_REF, "utf8")) : null;
+    if (ref) {
+      for (const key of Object.keys(out)) {
+        record("A4", key, "A4 byte for byte as the reference arm (secrets as labels, per-run values masked)", "identical", JSON.stringify(out[key]) === JSON.stringify(ref[key]) ? "identical" : "differs");
+      }
+    }
+    record("A4", "one order, probe on", "no request left this machine", 0, srv.refused.length);
+  } finally {
+    await srv.stop();
+    await E.close();
+  }
+}
+
+// B1: copies of one stop callback (the engine retries it with the same body).
+const STOP_WRITE = (m, p, b) => m === "PATCH" && p.startsWith("/rest/v1/maveloper_jobs") && b.includes('"engineStops"');
+const STOP_READ = (m, p) => m === "GET" && p.startsWith("/rest/v1/maveloper_jobs") && p.includes("delivery_meta,progress_message");
+async function B1() {
+  const variants = [
+    { k: "a: two copies together", engine: { stopCopyAt: [0, 0] }, delays: [], copies: 2 },
+    { k: "b: two copies 50 ms apart, the first's stop-list write held 3 s", engine: { stopCopyAt: [0, 50] }, delays: [{ match: STOP_WRITE, ms: 3000, phase: "before", skip: 0, left: 1 }], copies: 2 },
+    { k: "c: two copies together, a third 2 s after both were answered", engine: { stopCopyAt: [0, 0], stopCopyAfterMs: 2000 }, delays: [], copies: 3 },
+    { k: "d: 50 ms apart, the first's write held 300 ms, the second's job read answered 3 s late", engine: { stopCopyAt: [0, 50] }, delays: [{ match: STOP_WRITE, ms: 300, phase: "before", skip: 0, left: 1 }, { match: STOP_READ, ms: 3000, phase: "after", skip: 1, left: 1 }], copies: 2 },
+  ];
+  let i = 0;
+  for (const v of variants) {
+    i++;
+    const X = await xStart({ engine: { stopAfterMs: 1000, stopTimes: 1, buildMs: 6000, ...v.engine } });
+    try {
+      X.E.front.delays.push(...v.delays);
+      const o = await insertOrder({ space: "B", lead: "dev-b", n: 960000 + i, orderId: `B1${v.k[0].toUpperCase()}-ROW` });
+      const { final, seen } = await watchOrder(o, { timeoutMs: 60000, settleMs: 10000, until: () => X.E.engine.callbacks.some((c) => !c.stop) });
+      const ids = idsOf(X.E);
+      const stopCbs = X.E.engine.callbacks.filter((c) => c.stop);
+      record("B1", v.k, "setup: every copy was sent and answered 200", `${v.copies}, true`, `${stopCbs.length}, ${stopCbs.every((c) => c.status === 200)}`);
+      if (v.delays.length) record("B1", v.k, "setup: every held database request was held", true, v.delays.every((d) => d.hits === 1));
+      const jobs = await jobsForOrder(o.order_id);
+      const done = jobs.filter((j) => j.status === "completed");
+      const st = stopsOf(done[0] || jobs[jobs.length - 1]);
+      record("B1", v.k, "B1 ONE stop recorded (the stopped id)", "1, true", `${st ? st.length : "(none)"}, ${Boolean(st && st[0] && st[0].bridgeJobId === ids[0])}`);
+      record("B1", v.k, "B1 ONE re-send: 2 POSTs, 2 ids", "2, 2", `${ids.length}, ${new Set(ids).size}`);
+      record("B1", v.k, "B1 delivered once (one completed job), never failed", "delivered, 1, false", `${final?.status}, ${done.length}, ${seen.statuses.has("failed")}`);
+      const lines = X.srv.logs();
+      record("B1", v.k, "B1 the stop is appended and sent again ONCE (one 'sent again' line)", 1, lines.filter((l) => l.msg === "/bridge-callback engine stopped the build; the order is sent again" && l.bridgeJobId === ids[0]).length);
+      record("B1", v.k, "B1 the second copy is logged only, once", 1, lines.filter((l) => l.msg === "/bridge-callback a second copy of this stop arrived while the first was handled" && l.bridgeJobId === ids[0]).length);
+      record("B1", v.k, "B1 no copy took the no-wait branch", 0, lines.filter((l) => /no wait in this process/.test(l.msg || "") && l.bridgeJobId === ids[0]).length);
+      if (v.copies === 3) {
+        const persisted = lines.filter((l) => /recorded in the log only/.test(l.msg || "") && l.bridgeJobId === ids[0] && ["this stop was already recorded", "the order was already sent again"].includes(l.why));
+        record("B1", v.k, "B1 the third copy is logged only by the persisted check", 1, persisted.length);
+      }
+      record("B1", v.k, "no request left this machine", 0, X.srv.refused.length);
+    } finally { await X.close(); }
+  }
+}
+
 // ── RUN 19 INERT-TODAY CAPTURE: with OC_CAPTURE=<dir>, S1, S3 and E123 write the
 // server's log lines and the order's os_queue and maveloper_jobs rows, so two
 // arms can be compared (run 19 step 4c). Nothing is written when it is unset.
@@ -1315,7 +1636,8 @@ async function capture(name, srv, orderIds) {
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
-const ALL = { S1, S2, S3, S4, S5, S6, S7, E123, E4, E5, R1, X1, X2, X3, X4, X5, X6, X7, X7B, X8, X9, X10 };
+const ALL = { S1, S2, S3, S4, S5, S6, S7, E123, E4, E5, R1, X1, X2, X3, X4, X5, X6, X7, X7B, X8, X9, X10,
+  ROT0, ROT1, ROT2, ROT3, ROT3X, ROT4, ROT5, ROT6, ROTSKIP, A23, A4, B1 };
 const want = process.argv.slice(2).filter((a) => ALL[a]);
 const run = want.length ? want : Object.keys(ALL);
 console.log(`order-control: arm ${ARM}, backend ${BACKEND_DIR}, scenarios ${run.join(" ")}`);

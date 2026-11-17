@@ -48,11 +48,24 @@
 //                  answers 202 { status: "duplicate" } and builds nothing
 //                  (bridge-server.mjs:286-297 at cd03753f)
 // Every refusal is in `drains`, every S-STOP in `stops`.
+//
+// RUN 20: THE SHARED SECRET AS THE ENGINE HANDLES IT DURING A ROTATION (topaz3-rp2
+// 73950499, bridge-server.mjs, as the run 20 brief reads it): POST /generate and
+// GET /jobs are accepted with BRIDGE_SECRET (`secret`) or, when set and not empty,
+// BRIDGE_SECRET_NEXT (`secretNext`); anything else is 401 {"error":"Unauthorized"},
+// counted in `refused`. Callbacks ALWAYS carry BRIDGE_SECRET only. `label(value)`
+// names a header value ("old", "new", ...) so a test can read which value came
+// without ever printing it; every request's header list is kept in `seen` with the
+// secret replaced by its label. Stop copies (the engine retries its stop callback
+// with the same body):
+//   stopCopyAt     offsets in ms, one stop copy sent at each (default [0], one copy);
+//                  copies with the same offset are sent together (Promise.all)
+//   stopCopyAfterMs  one more copy this long after every earlier copy was answered
 export const DRAIN_BODY = '{"status":"draining","error":"This engine is shutting down for an update and takes no new orders. Send the order again: another engine takes it.","engineDraining":true}';
 export const STOP_ERROR = "The engine was stopped before this order finished building, because the server running it was shut down. Nothing was delivered. Please place the order again.";
 import { createServer } from "node:http";
 
-export function createFakeEngine({ secret, log = () => {} } = {}) {
+export function createFakeEngine({ secret, secretNext = null, label = null, log = () => {} } = {}) {
   const opts = {
     startupMs: 0,
     acceptDelayMs: 0,
@@ -72,7 +85,11 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     lateNormalAfterMs: null,
     lateCarriesJobId: false,
     dedupe: false,
+    stopCopyAt: [0],
+    stopCopyAfterMs: null,
   };
+  const nameOf = (v) => (v === undefined ? "(none)" : label ? label(v) : v === secret ? "current" : "(other)");
+  const accepts = (v) => typeof v === "string" && (v === secret || (typeof secretNext === "string" && secretNext !== "" && v === secretNext));
   let readyAt = null;           // null = cold; a number = when start-up ends
   const jobs = new Map();       // bridgeJobId -> { state, accepted, payload }
   const builds = [];            // { bridgeJobId, at, maveloperJobId, hasToken }
@@ -81,6 +98,8 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
   const requests = [];          // { at, raw, payload } every POST /generate body as received
   const drains = [];            // { at, bridgeJobId, retryAfter } every S-DRAIN refusal
   const stops = [];             // { at, bridgeJobId, status } every S-STOP callback
+  const refused = [];           // RUN 20 { at, method, path, header } every 401 for the secret
+  const seen = [];              // RUN 20 { at, method, path, header, headers } every request
   let stoppedSoFar = 0;
   const timers = new Set();
 
@@ -105,7 +124,8 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
         headers: { "content-type": "application/json", "x-bridge-secret": secret },
         body: JSON.stringify(body),
       });
-      callbacks.push({ bridgeJobId: body.bridgeJobId, status: r.status, at: Date.now() });
+      const answer = await r.text().catch(() => "");
+      callbacks.push({ bridgeJobId: body.bridgeJobId, status: r.status, at: Date.now(), carried: nameOf(secret), answer, contentType: r.headers.get("content-type"), stop: body.engineStopped === true });
       log(`[fake-engine] callback ${body.bridgeJobId} -> ${r.status}`);
     } catch (e) {
       callbacks.push({ bridgeJobId: body.bridgeJobId, status: "threw " + e.message, at: Date.now() });
@@ -122,6 +142,14 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     } catch { return; }
     await untilReady();
     const url = new URL(req.url, "http://127.0.0.1");
+    const hdr = req.headers["x-bridge-secret"];
+    const headers = [];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const k = req.rawHeaders[i];
+      headers.push([k, k.toLowerCase() === "x-bridge-secret" ? `<${nameOf(req.rawHeaders[i + 1])}>` : req.rawHeaders[i + 1]]);
+    }
+    seen.push({ at: Date.now(), method: req.method, path: url.pathname, header: nameOf(hdr), headers });
+    const refuse = () => { refused.push({ at: Date.now(), method: req.method, path: url.pathname, header: nameOf(hdr) }); return send(res, 401, { error: "Unauthorized" }); };
 
     if (req.method === "GET" && url.pathname === "/health") {
       if (opts.slowHealthMs) await wait(opts.slowHealthMs);
@@ -133,14 +161,14 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     const jm = /^\/jobs\/([^/]+)$/.exec(url.pathname);
     if (req.method === "GET" && jm) {
       if (!opts.jobsRoute) return send(res, 404, { error: "Not found" });
-      if (req.headers["x-bridge-secret"] !== secret) return send(res, 401, { error: "Unauthorized" });
+      if (!accepts(hdr)) return refuse();
       const j = jobs.get(decodeURIComponent(jm[1]));
       if (!j) return send(res, 404, { bridgeJobId: jm[1], known: false, instanceId: "fake-1" });
       return send(res, 200, { bridgeJobId: jm[1], known: true, state: j.state, instanceId: "fake-1" });
     }
 
     if (req.method === "POST" && url.pathname === "/generate") {
-      if (req.headers["x-bridge-secret"] !== secret) return send(res, 401, { error: "Unauthorized" });
+      if (!accepts(hdr)) return refuse();
       let payload;
       try { payload = JSON.parse(raw); } catch { requests.push({ at: Date.now(), raw, payload: null }); return send(res, 400, { error: "Invalid JSON body" }); }
       requests.push({ at: Date.now(), raw, payload });
@@ -203,7 +231,10 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
           elapsedSeconds: Number(((Date.now() - started) / 1000).toFixed(1)),
           stderr: "[fake build] section 2 of 5 written\n",
         };
-        await postCallback(callbackUrl, stopBody);
+        // RUN 20: the same body once per offset in stopCopyAt (one copy by default).
+        const offsets = Array.isArray(opts.stopCopyAt) && opts.stopCopyAt.length ? opts.stopCopyAt : [0];
+        await Promise.all(offsets.map(async (ms) => { if (ms > 0) await wait(ms); await postCallback(callbackUrl, stopBody); }));
+        if (opts.stopCopyAfterMs !== null) { await wait(opts.stopCopyAfterMs); await postCallback(callbackUrl, stopBody); }
         stops.push({ at: Date.now(), bridgeJobId, status: callbacks[callbacks.length - 1]?.status });
         job.state = "done";
         if (opts.lateNormalAfterMs !== null) {
@@ -246,6 +277,8 @@ export function createFakeEngine({ secret, log = () => {} } = {}) {
     requests,
     drains,
     stops,
+    refused,
+    seen,
     jobs,
     set(o) { Object.assign(opts, o); },
     cold() { readyAt = null; },
