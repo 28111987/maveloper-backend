@@ -3024,11 +3024,12 @@ app.get("/health", (req, res) => {
     authConfigured: Boolean(SUPABASE_JWT_SECRET),
     framework: "master-v2",
     version: "9.1.0-async-preview",
-    // v9.0.0: Claude Code engine status
-    engine: {
-      claudeCodeBridgeConfigured: Boolean(MAC_BRIDGE_URL),
-      bridgeUrl: MAC_BRIDGE_URL ? `${MAC_BRIDGE_URL.substring(0, 30)}...` : null,
-    },
+    // 17 NOV 2026: the `engine` block (claudeCodeBridgeConfigured and the first
+    // 30 characters of MAC_BRIDGE_URL) is gone. /health is public and answers at
+    // api.mavloper.dev for the uptime monitor; it named an AI product beside the
+    // platform's "No AI" claim and showed part of the engine's address. Nothing
+    // read it (console probeBackend reads `version`; the monitor reads
+    // "status":"ok"). route-doors.test.mjs 6b-6d hold this.
   });
 });
 

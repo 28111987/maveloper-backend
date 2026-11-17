@@ -377,6 +377,14 @@ try {
     // /health still answers without any token, and reports no AI key field.
     const r = await fetch(B + "/health").then((x) => x.json());
     check("6a /health is open and carries no apiKeyConfigured / aiEngine.default", r.status === "ok" && !("apiKeyConfigured" in r) && !(r.aiEngine && "default" in r.aiEngine), JSON.stringify(r).slice(0, 200));
+    // 17 NOV 2026: /health is public, and since 17 NOV it also answers at
+    // api.mavloper.dev for the uptime monitor. It must not name an AI product
+    // (the platform's claim is "No AI") nor show any part of the engine's address.
+    check("6b /health names no AI product anywhere (no 'claude' in any key or value)", !/claude/i.test(JSON.stringify(r)), JSON.stringify(r).slice(0, 200));
+    check("6c /health carries no engine block and no bridge address", !("engine" in r) && !/bridgeUrl/i.test(JSON.stringify(r)), JSON.stringify(r).slice(0, 200));
+    // ...and still carries the two things its readers use: the uptime monitor
+    // looks for "status":"ok", the console's probeBackend reads `version`.
+    check("6d /health still answers \"status\":\"ok\" and a version string", JSON.stringify(r).includes('"status":"ok"') && typeof r.version === "string" && r.version.length > 0, JSON.stringify(r).slice(0, 200));
   }
 } finally {
   backend.child.kill();
