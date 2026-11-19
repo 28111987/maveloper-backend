@@ -176,8 +176,16 @@ export function createSpacesRoutes({ app, supabaseAdmin, requireAuth, log, env }
         });
       }
 
-      const { data: org, error: orgErr } = await supabaseAdmin
-        .from('orgs').insert({ name, slug, is_internal: false }).select().single();
+      // 19 NOV: A NEW SPACE MUST CONNECT ITS OWN FIGMA ACCOUNT before it takes
+      // orders (orgs.figma_required). If the column does not exist yet (the
+      // migration is not applied), the space is created exactly as before.
+      let { data: org, error: orgErr } = await supabaseAdmin
+        .from('orgs').insert({ name, slug, is_internal: false, figma_required: true }).select().single();
+      if (orgErr && (orgErr.code === '42703' || orgErr.code === 'PGRST204')) {
+        log('warn', 'spaces: orgs.figma_required is absent, space created without it', { slug });
+        ({ data: org, error: orgErr } = await supabaseAdmin
+          .from('orgs').insert({ name, slug, is_internal: false }).select().single());
+      }
       if (orgErr) throw new Error(orgErr.message);
 
       // SEED THE FIRST OWNER IN THE SAME REQUEST. A space with no owner is

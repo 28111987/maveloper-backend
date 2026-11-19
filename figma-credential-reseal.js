@@ -41,8 +41,8 @@ import {
 
 // The table names are each written ONCE, in the module that owns the table.
 import { CREDENTIAL_TABLE } from "./figma-credential.js";
-import { OAUTH_TABLE } from "./figma-oauth.js";
-export { CREDENTIAL_TABLE, OAUTH_TABLE };
+import { OAUTH_TABLE, MEMBER_OAUTH_TABLE } from "./figma-oauth.js";
+export { CREDENTIAL_TABLE, OAUTH_TABLE, MEMBER_OAUTH_TABLE };
 
 function emptyCounts() {
   return { rows: 0, current: 0, resealed: 0, unopenable: 0, raceSkipped: 0 };
@@ -95,6 +95,10 @@ export async function resealAll({ db, env = process.env, log = () => {} } = {}) 
 
   const oauth = emptyCounts();
   const pasted = { ...emptyCounts(), inactiveSkipped: 0, plainActive: 0 };
+  // 19 NOV: each person's own connection per space. Same rule as a space's
+  // OAuth row: both values move together or not at all. A database without the
+  // table yet (42P01) is skipped, not an error.
+  const member = { ...emptyCounts(), tableAbsent: false };
 
   try {
     // -- OAuth connections: both values of a row move together or not at all.
@@ -155,16 +159,42 @@ export async function resealAll({ db, env = process.env, log = () => {} } = {}) 
         else pasted.resealed++;
       }
     }
+    {
+      const { data, error } = await db.from(MEMBER_OAUTH_TABLE).select("org_id,user_id,access_token,refresh_token");
+      if (error && error.code === "42P01") member.tableAbsent = true;
+      else if (error) throw new Error(`${MEMBER_OAUTH_TABLE} read failed`);
+      for (const row of (error ? [] : data) || []) {
+        member.rows++;
+        const a = classify(row.access_token, current, previous);
+        const r = classify(row.refresh_token, current, previous);
+        if (a.kind === "unopenable" || r.kind === "unopenable") { member.unopenable++; continue; }
+        if (a.kind !== "previous" && r.kind !== "previous") { member.current++; continue; }
+        const update = {};
+        if (a.kind === "previous") { const x = sealToken(a.token, current); if (!x.ok) { member.unopenable++; continue; } update.access_token = x.sealed; }
+        if (r.kind === "previous") { const x = sealToken(r.token, current); if (!x.ok) { member.unopenable++; continue; } update.refresh_token = x.sealed; }
+        const { data: hit, error: upErr } = await db
+          .from(MEMBER_OAUTH_TABLE)
+          .update(update)
+          .eq("org_id", row.org_id)
+          .eq("user_id", row.user_id)
+          .eq("access_token", row.access_token)
+          .eq("refresh_token", row.refresh_token)
+          .select("org_id");
+        if (upErr) throw new Error(`${MEMBER_OAUTH_TABLE} write failed`);
+        if ((hit?.length ?? 0) === 0) member.raceSkipped++;
+        else member.resealed++;
+      }
+    }
   } catch (err) {
     // Our own message only: never the driver's, which could quote a value.
-    const summary = { ran: false, reason: String(err && err.message ? err.message : "re-seal failed").slice(0, 80), oauth, pasted };
+    const summary = { ran: false, reason: String(err && err.message ? err.message : "re-seal failed").slice(0, 80), oauth, pasted, member };
     log("warn", "figma credential re-seal stopped", summary);
     return summary;
   }
 
-  const summary = { ran: true, reason: null, oauth, pasted };
+  const summary = { ran: true, reason: null, oauth, pasted, member };
   log("info", "figma credential re-seal", summary);
   return summary;
 }
 
-export default { resealAll, CREDENTIAL_TABLE, OAUTH_TABLE };
+export default { resealAll, CREDENTIAL_TABLE, OAUTH_TABLE, MEMBER_OAUTH_TABLE };

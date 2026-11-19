@@ -15,7 +15,7 @@ import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
 import { createRouteDoors } from "./route-doors.js";
 import { createOrderActions } from "./order-actions.js";
-import { plainReason, figmaCannotOpen, accountNameOf, NO_FIGMA_ACCOUNT, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
+import { plainReason, figmaCannotOpen, figmaCannotOpenEither, accountNameOf, NO_FIGMA_ACCOUNT, NO_SPACE_FIGMA, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
@@ -29,7 +29,8 @@ import { createFigmaCredentialRoutes } from "./figma-credential-routes.js";
 // connection first and falls through to resolveFigmaToken UNCHANGED when
 // there is none. Fails OPEN exactly like the resolver it wraps: a space with
 // no OAuth connection and no pasted token behaves exactly as it does today.
-import { resolveFigmaOAuth, shapeOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
+import { resolveFigmaOAuth, resolveMemberFigmaOAuth, shapeOAuthResolution, shapeMemberOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
+import { spaceRequiresFigma, refuseWithoutSpaceFigma, readAgainAsSpace, createFigmaMemberRoutes } from "./figma-member-routes.js";
 // FIGMA_CRED_KEY rotation (17 NOV 2026): runs at boot ONLY while
 // FIGMA_CRED_KEY_PREVIOUS is set. See figma-credential-reseal.js.
 import { resealAll } from "./figma-credential-reseal.js";
@@ -3182,13 +3183,43 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
     // calling that wrapper, so this file keeps a real, direct call to
     // resolveFigmaToken in its own text.
     const oauthCred = await resolveFigmaOAuth(req.body?.orgId, { db: supabaseAdmin });
-    const figmaCred = oauthCred
+    const spaceCred = oauthCred
       ? shapeOAuthResolution(oauthCred, req.body?.orgId)
       : await resolveFigmaToken(req.body?.orgId, {
           db: supabaseAdmin,
           globalToken: FIGMA_API_TOKEN,
         });
-    const figmaToken = figmaCred.token;
+
+    // ── ★★ 19 NOV: THE ORDERER'S OWN FIGMA ACCOUNT COMES FIRST. ─────────────
+    // A person may connect their own Figma account for their own orders in this
+    // space (member_figma_oauth, keyed on space + person). When they have, it
+    // reads the design; when they have not, or it does not resolve, the space's
+    // credential above reads it, exactly as before this block existed. The
+    // space's credential is resolved either way because it is also the
+    // fallback when Figma refuses the person's account for this file (below).
+    //
+    // ★ WHOSE ACCOUNT. A signed-in HTTP caller can only ever use their OWN
+    // connection: req.user.id, never a body field, so nobody can name a
+    // colleague and read with that colleague's Figma account. Only the queue
+    // runner (an internal call with no user) passes the orderer on the body,
+    // copied from os_queue.lead_user_id.
+    const ordererId = req.user ? req.user.id : req.body?.leadUserId;
+    const memberCred = await resolveMemberFigmaOAuth(req.body?.orgId, ordererId, { db: supabaseAdmin });
+    let figmaCred = memberCred ? shapeMemberOAuthResolution(memberCred, req.body?.orgId) : spaceCred;
+    let figmaToken = figmaCred.token;
+
+    // ── ★ A SPACE THAT MUST CONNECT ITS OWN FIGMA ACCOUNT. ──────────────────
+    // Spaces created from 19 NOV carry orgs.figma_required. Until the space's
+    // own account is connected, its orders are refused in plain words instead
+    // of being read with the Mavlers token. Every other space is unchanged.
+    if (refuseWithoutSpaceFigma(spaceCred, await spaceRequiresFigma(supabaseAdmin, req.body?.orgId))) {
+      log("warn", "Figma credential: space must connect its own Figma account first", { requestId: req.id, orgId: req.body?.orgId ?? null });
+      return res.status(409).json({
+        error: "Figma not connected",
+        details: NO_SPACE_FIGMA,
+        requestId: req.id,
+      });
+    }
 
     // ★ THE ONLY SAFE SHAPE TO LOG. describeResolution replaces `token` with a
     // BOOLEAN, so there is no code path by which this line can print a
@@ -3225,13 +3256,32 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
     // --- Stage 1 (Figma): parse URL â†’ fetch â†’ produce designSpec ---
     let figmaResult;
     try {
-      figmaResult = await figmaToDesignSpec({
-        figmaUrl,
-        // ★ RUN 3 SITE 1 OF 3. Reads the client's design file. Was the Mavlers
-        // global; is now this space's own credential when one is stored.
-        token: figmaToken,
-        devOverrides: { emailWidth, primaryFont, secondaryFont },
-      });
+      try {
+        figmaResult = await figmaToDesignSpec({
+          figmaUrl,
+          // ★ RUN 3 SITE 1 OF 3. Reads the client's design file. Was the Mavlers
+          // global; is now this space's own credential when one is stored, and
+          // the orderer's own account when they connected one (19 NOV).
+          token: figmaToken,
+          devOverrides: { emailWidth, primaryFont, secondaryFont },
+        });
+      } catch (memberErr) {
+        // ── ★ THE ORDERER'S ACCOUNT WAS REFUSED: READ ONCE MORE AS THE SPACE. ──
+        // Only when the person's own account was used, only when Figma refused
+        // it (401, 403 or 404), and only when the space has a different token.
+        // Every later read (images, the engine) then uses the space's account,
+        // and the provenance line says both what read the file and what could not.
+        if (!readAgainAsSpace({ usedMember: Boolean(memberCred), message: memberErr?.message, spaceToken: spaceCred.token, usedToken: figmaToken })) throw memberErr;
+        log("warn", "Figma credential: the orderer's own account was refused, reading as the space", { requestId: req.id });
+        const memberLabel = figmaCred.label;
+        figmaCred = { ...spaceCred, memberRefused: { label: memberLabel } };
+        figmaToken = figmaCred.token;
+        figmaResult = await figmaToDesignSpec({
+          figmaUrl,
+          token: figmaToken,
+          devOverrides: { emailWidth, primaryFont, secondaryFont },
+        });
+      }
     } catch (figmaErr) {
       // Surface user-facing errors (bad URL, multi-frame ambiguity) as 400.
       // Network / token / API errors are 502.
@@ -3255,7 +3305,11 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
             : isUserError
             ? "Invalid Figma URL"
             : "Figma fetch failed",
-        details: refusedAccess ? figmaCannotOpen(accountNameOf(figmaCred)) : msg,
+        details: refusedAccess
+          ? (figmaCred.memberRefused
+              ? figmaCannotOpenEither(accountNameOf({ source: "member-oauth", label: figmaCred.memberRefused.label }), accountNameOf(figmaCred))
+              : figmaCannotOpen(accountNameOf(figmaCred)))
+          : msg,
         candidates: figmaErr.candidates ?? undefined, // structured list for picker UI
         requestId: req.id,
       });
@@ -5822,6 +5876,8 @@ createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, log, env: process
 // space with no OAuth connection (no row, or org_figma_oauth not yet created)
 // resolves through resolveFigmaToken exactly as it does today.
 createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
+// 19 NOV: each person's own Figma account, per space. figma-member-routes.js.
+createFigmaMemberRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 
 const queueRunner = createQueueRunner({
   supabaseAdmin,

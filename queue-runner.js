@@ -35,6 +35,7 @@ import { computeQueuePlan } from './queue-priority.js';
 // written to end, and an org-id rule that drifts between the producer and the
 // consumer reintroduces the "null" string bug on whichever side falls behind.
 import { normalisedOrgId as normaliseOrgId } from './figma-credential.js';
+import { normalisedUserId } from './figma-oauth.js';
 // RUN 17: what a client reads on a failed order, in one place (order-words.js).
 import { plainReason, tookTooLong, ENGINE_LOST } from './order-words.js';
 
@@ -355,6 +356,14 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
     // is exactly today's behaviour for every order that predates this feature.
     const orgId = normaliseOrgId(pick.org_id);
     if (orgId !== null) jobBody.orgId = orgId;
+
+    // ── WHO ORDERED IT. The person whose own Figma connection in this space,
+    // if they made one, reads the design. lead_user_id is already in
+    // ACTIVE_COLUMNS, so no select changes. Same rule as orgId: the key is set
+    // only for a real id, and an order without one reads with the space's
+    // account exactly as before.
+    const leadUserId = normalisedUserId(pick.lead_user_id);
+    if (orgId !== null && leadUserId !== null) jobBody.leadUserId = leadUserId;
     return jobBody;
   }
 

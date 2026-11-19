@@ -364,7 +364,11 @@ section("5b. THE OLD NO-OP CHECK, KEPT FOR THE FILES THAT ARE STILL UNMOUNTED");
   // which is exactly what this exclusion list exists to tell apart, and
   // exactly why each addition here is paid for by name immediately below
   // rather than silently widening the filter.
-  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs"]);
+  // ★ 19 NOV ADDS TWO, PAID FOR THE SAME WAY. figma-member-routes.js (each
+  // person's own Figma account per space) seals with the same crypto helpers,
+  // reuses sendSafe and reads CREDENTIAL_TABLE to describe the space's default
+  // without a token; figma-member.test.mjs builds its fixtures from them.
+  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs", "figma-member-routes.js", "figma-member.test.mjs"]);
   const files = readdirSync(here).filter(f =>
     (f.endsWith(".js") || f.endsWith(".mjs")) && !f.startsWith("figma-credential") && !WIRED_BY_DESIGN.has(f));
   const importers = files.filter(f => {

@@ -67,7 +67,23 @@ export function accountNameOf(resolution) {
     return label.includes("@") ? label.split("@")[0] : label.slice(0, 60);
   }
   if (r.source === "oauth" || r.source === "org") return "this space's Figma account";
+  if (r.source === "member-oauth") return label ? (label.includes("@") ? label.split("@")[0] : label.slice(0, 60)) : "your own Figma account";
   return "Mavloper's own Figma account";
+}
+
+/**
+ * The orderer had connected their OWN Figma account in this space and it could
+ * not open the file, and neither could the space's account that was tried next.
+ * Both are named (never an address), so the person knows which two to check.
+ */
+export function figmaCannotOpenEither(memberName, spaceName) {
+  return (
+    "Mavloper could not open this Figma file with your own connected Figma account (" +
+    String(memberName || "your own Figma account") +
+    ") or with this space's (" +
+    String(spaceName || "this space's Figma account") +
+    "). Make sure one of them can open the file: it needs a Dev or Full seat in the team that owns it."
+  );
 }
 
 /** T2: the Figma refusal, naming the account that was used. */
@@ -106,6 +122,10 @@ export function istClock(d) {
   return `${hh}:${mm} IST`;
 }
 
+/** A space created after 19 NOV 2026 takes no orders until its own Figma account is connected. */
+export const NO_SPACE_FIGMA =
+  "This space has no Figma account connected yet. An Admin of the space connects one on the Admin page, then orders can be placed.";
+
 /** No Figma credential at all for this order. */
 export const NO_FIGMA_ACCOUNT =
   "Mavloper has no Figma account to read this design with. Connect a Figma account to this space, or write to " + SUPPORT + ".";
@@ -115,11 +135,12 @@ export const NO_FIGMA_ACCOUNT =
 // sentence of ours is found and returned on its own.
 const OURS = [
   ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
-  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE,
+  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, NO_SPACE_FIGMA,
 ];
 const OURS_RE = [
   /The build ran longer than \d+ minutes and was stopped on our side\. Please resubmit\./,
   /Mavloper could not open this Figma file with the Figma account connected to this space \(.+?\)\. Make sure that account can open the file: it needs a Dev or Full seat in the team that owns it\./,
+  /Mavloper could not open this Figma file with your own connected Figma account \(.+?\) or with this space's \(.+?\)\. Make sure one of them can open the file: it needs a Dev or Full seat in the team that owns it\./,
   /Stopped by .+ \(Admin\)\.(?: A late result arrived at .+)?$/,
   /Cancelled by .+ before it started\. It never ran\.(?: A late result arrived at .+)?$/,
 ];
@@ -166,7 +187,7 @@ export function plainReason(raw) {
 
 export default {
   SUPPORT, ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
-  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, ENGINE_RESENT,
-  tookTooLong, accountNameOf, figmaCannotOpen, stoppedBy, cancelledBy, lateResultNote,
+  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, ENGINE_RESENT, NO_SPACE_FIGMA,
+  tookTooLong, accountNameOf, figmaCannotOpen, figmaCannotOpenEither, stoppedBy, cancelledBy, lateResultNote,
   lateResultDelivered, istClock, plainReason,
 };

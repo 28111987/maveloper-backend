@@ -966,7 +966,7 @@ await ta("7a  server.js MOUNTS the credential routes (import AND call)", async (
 // this file's exports" and "who mounts its routes" - are now different
 // questions, and are asserted separately rather than collapsed back into one
 // deepEqual that a legitimate reuse would fail.
-await ta("7a2 figma-credential-routes is reached only by server.js (mounts it) and figma-oauth-routes.js (reuses its helpers)", async () => {
+await ta("7a2 figma-credential-routes is reached only by server.js (mounts it), figma-oauth-routes.js and figma-member-routes.js (reuse its helpers)", async () => {
   const dir = new URL("./", import.meta.url);
   const files = fs.readdirSync(dir).filter((f) => /\.(js|mjs)$/.test(f) && !/^figma-credential/.test(f));
   const importers = files.filter((f) =>
@@ -974,10 +974,17 @@ await ta("7a2 figma-credential-routes is reached only by server.js (mounts it) a
   );
   assert.deepEqual(
     importers.slice().sort(),
-    ["figma-oauth-routes.js", "server.js"],
-    "expected exactly server.js and figma-oauth-routes.js to reach this file, got: " + importers.join(", "),
+    ["figma-member-routes.js", "figma-oauth-routes.js", "server.js"],
+    "expected exactly server.js, figma-oauth-routes.js and figma-member-routes.js to reach this file, got: " + importers.join(", "),
   );
   assert.ok(files.length > 10, "only " + files.length + " files scanned - the scan is not reaching the repo");
+});
+
+await ta("7a4 figma-member-routes.js reuses sendSafe only and does NOT mount a second copy of these routes", async () => {
+  const src = fs.readFileSync(new URL("./figma-member-routes.js", import.meta.url), "utf8");
+  assert.ok(src.length > 0, "figma-member-routes.js could not be read - this check is vacuous");
+  assert.ok(/import \{ sendSafe \} from "\.\/figma-credential-routes\.js";/.test(src), "figma-member-routes.js no longer reuses sendSafe");
+  assert.ok(!/createFigmaCredentialRoutes\(/.test(src), "figma-member-routes.js calls createFigmaCredentialRoutes(...)");
 });
 
 await ta("7a3 figma-oauth-routes.js reuses createRequireSpaceAdmin/sendSafe but does NOT mount a second copy of these routes", async () => {

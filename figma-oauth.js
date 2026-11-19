@@ -333,15 +333,22 @@ export async function fetchFigmaIdentity({ accessToken, fetchImpl = null, timeou
  * and never affects the caller's return value — a diagnostic that could itself
  * fail the request it is trying to explain would be worse than no diagnostic.
  */
-async function recordRefreshOutcome(db, orgId, ok, note, nowIso) {
+async function recordRefreshOutcome(db, table, match, ok, note, nowIso) {
   try {
-    await db
-      .from(OAUTH_TABLE)
-      .update({ last_refresh_at: nowIso, last_refresh_ok: ok, last_refresh_note: note ? String(note).slice(0, 300) : null })
-      .eq("org_id", orgId);
+    await whereMatch(
+      db.from(table).update({ last_refresh_at: nowIso, last_refresh_ok: ok, last_refresh_note: note ? String(note).slice(0, 300) : null }),
+      match,
+    );
   } catch {
     // Best effort. The caller already has its answer (null, or a fresh token).
   }
+}
+
+/** Apply one .eq() per key of `match`, in key order. One key for a space row, two for a member row. */
+function whereMatch(query, match) {
+  let q = query;
+  for (const [col, val] of Object.entries(match)) q = q.eq(col, val);
+  return q;
 }
 
 /**
@@ -360,20 +367,51 @@ async function recordRefreshOutcome(db, orgId, ok, note, nowIso) {
  * returns null rather than handing back the stale access token.
  */
 export async function resolveFigmaOAuth(orgId, { db = null, key = null, previousKey = null, now = null, env = null, fetchImpl = null } = {}) {
+  orgId = normalisedOrgId(orgId);
+  if (!orgId) return null;
+  return resolveOAuthRow({ table: OAUTH_TABLE, match: { org_id: orgId }, db, key, previousKey, now, env, fetchImpl });
+}
+
+/** One person's own connection in one space. Same contract as resolveFigmaOAuth: null for every failure, never throws, never a token past its expiry. */
+export const MEMBER_OAUTH_TABLE = "member_figma_oauth";
+
+/** A Supabase auth user id: a uuid string, or null. Anything else is treated as "no person". */
+export function normalisedUserId(userId) {
+  if (typeof userId !== "string") return null;
+  const v = userId.trim().toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v) ? v : null;
+}
+
+/**
+ * resolveMemberFigmaOAuth(orgId, userId, opts) - the Figma account ONE PERSON
+ * connected for THEIR OWN orders in ONE space. Returns the same shape as
+ * resolveFigmaOAuth, or null when that person has no working connection there
+ * (the normal case: they then read with the space's account).
+ */
+export async function resolveMemberFigmaOAuth(orgId, userId, { db = null, key = null, previousKey = null, now = null, env = null, fetchImpl = null } = {}) {
+  orgId = normalisedOrgId(orgId);
+  const uid = normalisedUserId(userId);
+  if (!orgId || !uid) return null;
+  return resolveOAuthRow({ table: MEMBER_OAUTH_TABLE, match: { org_id: orgId, user_id: uid }, db, key, previousKey, now, env, fetchImpl });
+}
+
+/**
+ * THE ONE RESOLVER BODY, shared by a space's connection and a person's. It was
+ * written for org_figma_oauth and is unchanged in behaviour: only the table
+ * and the row's key are parameters now.
+ */
+async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, fetchImpl }) {
   const nowMs = now ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
-  orgId = normalisedOrgId(orgId);
-  if (!orgId) return null;
   if (!db || typeof db.from !== "function") return null;
 
   let row = null;
   try {
-    const { data, error } = await db
-      .from(OAUTH_TABLE)
-      .select("org_id,access_token,refresh_token,expires_at,figma_user_id,figma_email,figma_handle,scopes,is_active")
-      .eq("org_id", orgId)
-      .maybeSingle();
+    const { data, error } = await whereMatch(
+      db.from(table).select("org_id,access_token,refresh_token,expires_at,figma_user_id,figma_email,figma_handle,scopes,is_active"),
+      match,
+    ).maybeSingle();
     if (error) return null;
     row = data;
   } catch {
@@ -413,7 +451,7 @@ export async function resolveFigmaOAuth(orgId, { db = null, key = null, previous
 
     const r = await refreshAccessToken({ refreshToken: refreshTokenVal, clientId, clientSecret, fetchImpl });
     if (!r.ok) {
-      await recordRefreshOutcome(db, orgId, false, r.error, nowIso);
+      await recordRefreshOutcome(db, table, match, false, r.error, nowIso);
       return null;
     }
 
@@ -426,9 +464,8 @@ export async function resolveFigmaOAuth(orgId, { db = null, key = null, previous
     const sealedRefresh = sealToken(refreshTokenVal, sealingKey);
     if (sealedAccess.ok && sealedRefresh.ok) {
       try {
-        await db
-          .from(OAUTH_TABLE)
-          .update({
+        await whereMatch(
+          db.from(table).update({
             access_token: sealedAccess.sealed,
             refresh_token: sealedRefresh.sealed,
             expires_at: expiresAt,
@@ -436,8 +473,9 @@ export async function resolveFigmaOAuth(orgId, { db = null, key = null, previous
             last_refresh_at: nowIso,
             last_refresh_ok: true,
             last_refresh_note: null,
-          })
-          .eq("org_id", orgId);
+          }),
+          match,
+        );
       } catch {
         // The refreshed token is still valid for THIS call even if the
         // rewrite fails; the next call will just refresh again.
@@ -484,6 +522,15 @@ export function shapeOAuthResolution(oauth, orgId) {
 }
 
 /**
+ * The same mapping for a PERSON's connection. Its own source value, so the
+ * provenance line and the logs can never confuse "this person's account" with
+ * "this space's account".
+ */
+export function shapeMemberOAuthResolution(oauth, orgId) {
+  return { ...shapeOAuthResolution(oauth, orgId), source: "member-oauth", reason: "member-" + oauth.reason };
+}
+
+/**
  * resolveFigmaCredential(orgId, opts) — tries this space's OAuth connection
  * first; falls through to resolveFigmaToken() UNCHANGED when there is none.
  *
@@ -525,6 +572,17 @@ export async function resolveFigmaCredential(orgId, { db, globalToken, now, key,
  * itself is written to.
  */
 export function figmaCredentialProvenanceLine(r) {
+  if (r && r.source === "member-oauth") {
+    return "Figma credential: the orderer's own connected Figma account" + (r.label ? " (" + String(r.label).slice(0, 60) + ")" : "");
+  }
+  if (r && r.memberRefused) {
+    // The orderer's own account could not open this file, so the space's read it.
+    return spaceLine(r) + ". The orderer's own Figma account" + (r.memberRefused.label ? " (" + String(r.memberRefused.label).slice(0, 60) + ")" : "") + " could not open this file";
+  }
+  return spaceLine(r);
+}
+
+function spaceLine(r) {
   if (r && r.source === "oauth") {
     return "Figma credential: this space's connected Figma account" + (r.label ? " (" + String(r.label).slice(0, 60) + ")" : "");
   }
@@ -546,7 +604,11 @@ export default {
   FIGMA_ME_TIMEOUT_MS,
   fetchFigmaIdentity,
   resolveFigmaOAuth,
+  resolveMemberFigmaOAuth,
+  MEMBER_OAUTH_TABLE,
+  normalisedUserId,
   shapeOAuthResolution,
+  shapeMemberOAuthResolution,
   resolveFigmaCredential,
   figmaCredentialProvenanceLine,
 };
