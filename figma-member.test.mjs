@@ -21,6 +21,8 @@ import { resolveMemberFigmaOAuth, resolveFigmaOAuth, MEMBER_OAUTH_TABLE, normali
 import { createFigmaMemberRoutes, spaceRequiresFigma, describeSpaceDefault, refuseWithoutSpaceFigma, readAgainAsSpace, MEMBER_PUBLIC_COLUMNS } from "./figma-member-routes.js";
 import { readKey, sealToken, isSealed, openToken } from "./figma-credential-crypto.js";
 import { resealAll } from "./figma-credential-reseal.js";
+import { createRequireSpaceAdmin } from "./figma-credential-routes.js";
+import { createFigmaPlatformTokenRoutes, readExpiryDate } from "./figma-platform-token.js";
 import { accountNameOf, figmaCannotOpenEither, plainReason, NO_SPACE_FIGMA } from "./order-words.js";
 
 let pass = 0, fail = 0;
@@ -332,6 +334,74 @@ await t("R13 a closed or unknown space is refused before any seat is read", asyn
   const tables = world(); tables.orgs[0].is_deleted = true;
   const { app } = mount(tables);
   ok((await run(app.routes["get /os/spaces/:slug/me/figma"], as("one@acme.test", U1))).statusCode === 404);
+});
+
+// -- G ------------------------------------------------------------------------
+console.log("\nG  the space-admin gate admits the platform owner (19 NOV ruling)");
+async function gate(email, tables, env = {}) {
+  const mw = createRequireSpaceAdmin({ supabaseAdmin: makeDb(tables), log: () => {}, env });
+  const req = { user: { email }, params: { slug: "acme" } };
+  const res = makeRes(); let passed = false;
+  await mw(req, res, () => { passed = true; });
+  return { passed, res };
+}
+await t("G1 the platform owner by PLATFORM_OWNERS passes with only a member seat", async () => {
+  const r = await gate("owner@mavlers.test", world(), { PLATFORM_OWNERS: "owner@mavlers.test" });
+  ok(r.passed, JSON.stringify(r.res.body));
+});
+await t("G2 the platform owner by the platform_owners table passes with no seat at all", async () => {
+  ok((await gate("owner@mavlers.test", world())).passed);
+});
+await t("G3 a Dev of the space is still refused, with the same words", async () => {
+  const r = await gate("one@acme.test", world({ platform_owners: [] }));
+  ok(!r.passed && r.res.statusCode === 403 && /do not hold an admin seat/.test(r.res.body.details || ""), JSON.stringify(r.res.body));
+});
+await t("G4 an Admin of the space passes, as before", async () => {
+  ok((await gate("admin@acme.test", world({ platform_owners: [] }))).passed);
+});
+await t("G5 the owner table unreadable: no crash, a stranger still refused", async () => {
+  const tables = world(); delete tables.platform_owners;
+  const r = await gate("stranger@else.test", tables);
+  ok(!r.passed && r.res.statusCode === 403);
+});
+
+// -- T ------------------------------------------------------------------------
+console.log("\nT  Mavloper's own Figma token, measured");
+function mountToken(tables, env, fetchImpl, clock) {
+  const app = makeApp();
+  createFigmaPlatformTokenRoutes({ app, supabaseAdmin: makeDb(tables), requireAuth: passAuth, log: () => {}, env, fetchImpl, now: clock || (() => Date.now()) });
+  return app.routes["get /os/platform/figma-token"];
+}
+const PAT = "figd_" + "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0";
+await t("T1 working: Figma answered 200, the token never appears, the expiry is the recorded one", async () => {
+  let calls = 0;
+  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT, FIGMA_API_TOKEN_EXPIRES: "2027-01-17" }, async () => { calls++; return { ok: true, status: 200, json: async () => ({ handle: "mavloper-production" }) }; });
+  const res = await run(route, as("owner@mavlers.test", U1));
+  ok(res.statusCode === 200 && res.body.working === true && res.body.expiresOn === "2027-01-17", JSON.stringify(res.body));
+  ok(!JSON.stringify(res.body).includes(PAT), "token not returned");
+  await run(route, as("owner@mavlers.test", U1));
+  ok(calls === 1, "cached, asked Figma " + calls + " times");
+});
+await t("T2 refused: Figma answered 403, working false and a plain note", async () => {
+  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({}) }));
+  const res = await run(route, as("owner@mavlers.test", U1));
+  ok(res.body.working === false && /expired, revoked or wrong/.test(res.body.note) && res.body.expiresOn === null, JSON.stringify(res.body));
+});
+await t("T3 Figma did not answer: working is null (unknown), never false", async () => {
+  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => { throw new Error("net"); });
+  ok((await run(route, as("owner@mavlers.test", U1))).body.working === null);
+});
+await t("T4 only the platform owner may read it", async () => {
+  const route = mountToken(world({ platform_owners: [] }), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+  ok((await run(route, as("admin@acme.test", U1))).statusCode === 403);
+});
+await t("T5 it counts the live spaces that would read with it", async () => {
+  const tables = world({ orgs: [{ ...SPACE }, { id: ORG_B, slug: "b", is_deleted: false }, { id: "33333333-3333-4333-8333-333333333333", slug: "c", is_deleted: true }] });
+  const route = mountToken(tables, { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+  ok((await run(route, as("owner@mavlers.test", U1))).body.spacesUsingIt === 1);
+});
+await t("T6 the recorded expiry must be a real date", async () => {
+  ok(readExpiryDate("2027-01-17") === "2027-01-17" && readExpiryDate("2027-02-30") === null && readExpiryDate("17 Jan") === null && readExpiryDate(undefined) === null);
 });
 
 // -- K ------------------------------------------------------------------------

@@ -132,7 +132,7 @@ export function oauthPublicShape(row, { now = Date.now() } = {}) {
 // ---------------------------------------------------------------------------
 
 export function createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, env = process.env, fetchImpl = null }) {
-  const requireSpaceAdmin = createRequireSpaceAdmin({ supabaseAdmin, log });
+  const requireSpaceAdmin = createRequireSpaceAdmin({ supabaseAdmin, log, env });
   const doFetch = fetchImpl || globalThis.fetch;
   const stateStore = createStateStore();
 

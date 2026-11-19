@@ -240,7 +240,29 @@ export function sendSafe(res, status, body, log) {
  * ★ EVERY UNCERTAINTY DENIES. A lookup error, an absent column, an absent table,
  * a missing email claim: all 403 or 503. This gate has no fail-open branch.
  */
-export function createRequireSpaceAdmin({ supabaseAdmin, log }) {
+export function createRequireSpaceAdmin({ supabaseAdmin, log, env = process.env }) {
+  /**
+   * ★ 19 NOV, THE OWNER'S RULING: THE PLATFORM OWNER ADMINISTERS EVERY SPACE.
+   * "Despite of being the owner of this entire platform, why I'm unable to ...
+   * Connect the Figma account." This gate was the one place left that said
+   * "not Mavlers": the database's os_is_admin(), the Admin screen and the order
+   * actions already treat the platform owner as an Admin of every space. The
+   * owner is read from PLATFORM_OWNERS (the list the space routes use) or the
+   * platform_owners table (the one is_platform_owner() reads). A failed lookup
+   * is not an error here: it falls through to the seat check below, which
+   * denies on every uncertainty exactly as before.
+   */
+  async function isPlatformOwner(email) {
+    const listed = String(env.PLATFORM_OWNERS || "").split(/[,\s]+/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+    if (listed.includes(email)) return true;
+    try {
+      const { data, error } = await supabaseAdmin.from("platform_owners").select("email").eq("email", email).limit(1);
+      return !error && Array.isArray(data) && data.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   return async function requireSpaceAdmin(req, res, next) {
     const slug = String(req.params.slug || "").toLowerCase();
     const email = String(req.user?.email || "").toLowerCase().trim();
@@ -317,7 +339,7 @@ export function createRequireSpaceAdmin({ supabaseAdmin, log }) {
     }
 
     // ★ LENGTH, NOT TRUTHINESS. `[]` is truthy.
-    if ((seats?.length ?? 0) === 0) {
+    if ((seats?.length ?? 0) === 0 && !(await isPlatformOwner(email))) {
       return sendSafe(res, 403, {
         error: "Only a space admin may manage this space's Figma credential",
         details:
@@ -337,7 +359,7 @@ export function createRequireSpaceAdmin({ supabaseAdmin, log }) {
 // ---------------------------------------------------------------------------
 
 export function createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, log, env = process.env, fetchImpl = null }) {
-  const requireSpaceAdmin = createRequireSpaceAdmin({ supabaseAdmin, log });
+  const requireSpaceAdmin = createRequireSpaceAdmin({ supabaseAdmin, log, env });
   const doFetch = fetchImpl || globalThis.fetch;
 
   /**

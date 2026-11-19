@@ -368,7 +368,9 @@ section("5b. THE OLD NO-OP CHECK, KEPT FOR THE FILES THAT ARE STILL UNMOUNTED");
   // person's own Figma account per space) seals with the same crypto helpers,
   // reuses sendSafe and reads CREDENTIAL_TABLE to describe the space's default
   // without a token; figma-member.test.mjs builds its fixtures from them.
-  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs", "figma-member-routes.js", "figma-member.test.mjs"]);
+  // figma-platform-token.js reuses sendSafe and reads CREDENTIAL_TABLE to count
+  // the spaces that would read with Mavloper's own token.
+  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs", "figma-member-routes.js", "figma-member.test.mjs", "figma-platform-token.js"]);
   const files = readdirSync(here).filter(f =>
     (f.endsWith(".js") || f.endsWith(".mjs")) && !f.startsWith("figma-credential") && !WIRED_BY_DESIGN.has(f));
   const importers = files.filter(f => {

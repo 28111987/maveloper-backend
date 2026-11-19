@@ -974,8 +974,8 @@ await ta("7a2 figma-credential-routes is reached only by server.js (mounts it), 
   );
   assert.deepEqual(
     importers.slice().sort(),
-    ["figma-member-routes.js", "figma-oauth-routes.js", "server.js"],
-    "expected exactly server.js, figma-oauth-routes.js and figma-member-routes.js to reach this file, got: " + importers.join(", "),
+    ["figma-member-routes.js", "figma-member.test.mjs", "figma-oauth-routes.js", "figma-platform-token.js", "server.js"],
+    "expected exactly server.js, figma-oauth-routes.js, figma-member-routes.js, figma-platform-token.js and figma-member.test.mjs (which tests the admin gate) to reach this file, got: " + importers.join(", "),
   );
   assert.ok(files.length > 10, "only " + files.length + " files scanned - the scan is not reaching the repo");
 });

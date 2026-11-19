@@ -31,6 +31,7 @@ import { createFigmaCredentialRoutes } from "./figma-credential-routes.js";
 // no OAuth connection and no pasted token behaves exactly as it does today.
 import { resolveFigmaOAuth, resolveMemberFigmaOAuth, shapeOAuthResolution, shapeMemberOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
 import { spaceRequiresFigma, refuseWithoutSpaceFigma, readAgainAsSpace, createFigmaMemberRoutes } from "./figma-member-routes.js";
+import { createFigmaPlatformTokenRoutes } from "./figma-platform-token.js";
 // FIGMA_CRED_KEY rotation (17 NOV 2026): runs at boot ONLY while
 // FIGMA_CRED_KEY_PREVIOUS is set. See figma-credential-reseal.js.
 import { resealAll } from "./figma-credential-reseal.js";
@@ -5878,6 +5879,8 @@ createFigmaCredentialRoutes({ app, supabaseAdmin, requireAuth, log, env: process
 createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 // 19 NOV: each person's own Figma account, per space. figma-member-routes.js.
 createFigmaMemberRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
+// 19 NOV: Mavloper's own Figma token, MEASURED by asking Figma, not dated in console code.
+createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth, log, env: process.env });
 
 const queueRunner = createQueueRunner({
   supabaseAdmin,
