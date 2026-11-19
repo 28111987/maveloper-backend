@@ -147,6 +147,52 @@ export function bridgeSecretAccepts(header, cfg) {
  *       that is gone, so nothing will ever dispatch it.
  *   stage(name, fields) - one timing line per backend stage (T4).
  */
+/**
+ * ★ 19 NOV: WHEN A HEARTBEAT MAY ASK THE ENGINE /health. Pure, so it is tested
+ * on its own (heartbeat-probe.test.mjs).
+ *
+ * Probe ONLY when the queue was read, nothing is processing, and something is
+ * pending: the engine is about to be woken for that order anyway.
+ *
+ *   nothing pending or processing  no probe (1434d1d): a probe would wake the
+ *                                  idle engine and bill it for ~15 minutes.
+ *   an order processing            no probe (engine chat, 19 NOV): the engine
+ *                                  runs containerConcurrency 1, so a /health
+ *                                  sent to the busy instance makes Cloud Run
+ *                                  start a SECOND instance just to answer it
+ *                                  (cold start ~30 to 40 s, at least one billed
+ *                                  minute, up to 15 idle minutes), and the
+ *                                  answer comes from an instance that is not
+ *                                  building. The order's own progress updates
+ *                                  already prove the engine is alive.
+ *   counts unknown                 no probe. Before 19 NOV an unknown count
+ *                                  probed, so an outage would be seen; but the
+ *                                  count is unknown only when Supabase did not
+ *                                  answer, and the probe's result is written to
+ *                                  that same Supabase, so it could not reach
+ *                                  the console either. Not probing cannot start
+ *                                  a second instance mid-build.
+ *
+ * engine_online is then written NULL ("not asked"), which the console reads as
+ * IDLE or BUSY from the queue, never as ENGINE OFFLINE (console b105dff).
+ * HEARTBEAT_ALWAYS=1 still restores probing on every beat.
+ */
+export function heartbeatProbeDecision(c) {
+  const p = c ? c.pending : null;
+  const q = c ? c.processing : null;
+  const known = (v) => v !== null && v !== undefined && Number.isFinite(Number(v));
+  if (!known(p) || !known(q)) {
+    return { probe: false, note: "not probed - the queue counts could not be read" };
+  }
+  if (Number(q) > 0) {
+    return { probe: false, note: "building - not probed (an order is processing; its progress shows the engine is alive)" };
+  }
+  if (Number(p) === 0) {
+    return { probe: false, note: "idle - not probed (no pending or processing orders)" };
+  }
+  return { probe: true, note: null };
+}
+
 export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env, probeEngineJob = null, isLocalJob = null, stage = null }) {
   const cfg = {
     enabled: env.RUNNER_ENABLED === 'true',
@@ -691,34 +737,36 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
   //   GENERATION SPEED IS UNAFFECTED: dispatch does not depend on engine_online.
   //   counts() is the same Supabase query the status route already makes; Supabase is
   //   not billed per request and never touches Cloud Run.
+  // ★ 19 NOV: AND NOT WHILE AN ORDER IS PROCESSING, OR WHEN THE QUEUE CANNOT BE READ.
+  //   See heartbeatProbeDecision. With the probe confined to "something pending,
+  //   nothing processing", the beat itself is one Supabase upsert, so HEARTBEAT_MS
+  //   can go back to 30 seconds and the console's 90-second stale rule (three missed
+  //   beats) is true again. Measured 19 NOV: production beat roughly every 30 minutes,
+  //   and Admin read ENGINE OFFLINE with nothing wrong.
   async function heartbeat() {
     state.runnerLastSeen = new Date().toISOString();
     if (!(Number(env.HEARTBEAT_ALWAYS) === 1)) {
+      let decision;
       try {
-        const c = await counts();
-        // counts() SWALLOWS ITS OWN ERROR and returns {processing:null,pending:null} on
-        //   any Supabase failure, so Number(null)||0 would read as ZERO WORK and skip the
-        //   probe forever during an outage - the console would never learn the engine was
-        //   down. NULL MEANS UNKNOWN AND UNKNOWN MUST PROBE. Only two real zeroes skip.
-        const p = c.pending, q = c.processing;
-        const known = Number.isFinite(Number(p)) && p !== null && Number.isFinite(Number(q)) && q !== null;
-        if (known && Number(p) === 0 && Number(q) === 0) {
-          state.engineOnline = null;
-          state.engineError = "idle - not probed (no pending or processing orders)";
-          try {
-            await supabaseAdmin.from("runner_status").upsert({
-              id: "singleton",
-              runner_last_seen: state.runnerLastSeen,
-              engine_online: null,
-              engine_last_ok: state.engineLastOk,
-              engine_error: state.engineError,
-              updated_at: new Date().toISOString(),
-            });
-          } catch (e) { log("warn", "Runner: idle runner_status upsert threw", { error: e.message }); }
-          return;
-        }
+        decision = heartbeatProbeDecision(await counts());
       } catch (e) {
-        log("warn", "Runner: idle check failed, probing anyway", { error: e.message });
+        decision = heartbeatProbeDecision({ processing: null, pending: null });
+        log("warn", "Runner: queue count failed, not probing", { error: e.message });
+      }
+      if (!decision.probe) {
+        state.engineOnline = null;
+        state.engineError = decision.note;
+        try {
+          await supabaseAdmin.from("runner_status").upsert({
+            id: "singleton",
+            runner_last_seen: state.runnerLastSeen,
+            engine_online: null,
+            engine_last_ok: state.engineLastOk,
+            engine_error: state.engineError,
+            updated_at: new Date().toISOString(),
+          });
+        } catch (e) { log("warn", "Runner: unprobed runner_status upsert threw", { error: e.message }); }
+        return;
       }
     }
     let online = false;
