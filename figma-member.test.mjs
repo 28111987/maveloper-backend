@@ -22,7 +22,7 @@ import { createFigmaMemberRoutes, spaceRequiresFigma, describeSpaceDefault, refu
 import { readKey, sealToken, isSealed, openToken } from "./figma-credential-crypto.js";
 import { resealAll } from "./figma-credential-reseal.js";
 import { createRequireSpaceAdmin } from "./figma-credential-routes.js";
-import { createFigmaPlatformTokenRoutes, readExpiryDate } from "./figma-platform-token.js";
+import { createFigmaPlatformTokenRoutes, readExpiryDate, accountRefusal, spaceState } from "./figma-platform-token.js";
 import { accountNameOf, figmaCannotOpenEither, plainReason, NO_SPACE_FIGMA } from "./order-words.js";
 
 let pass = 0, fail = 0;
@@ -54,7 +54,7 @@ function makeDb(tables) {
     calls, tables,
     from(table) {
       const q = { table, op: "select", cols: null, filters: [], payload: null, opts: null, wantRows: false };
-      const rows = () => (tables[table] || []).filter((r) => q.filters.every(([c, v]) => (v && v.re ? v.re.test(String(r[c] ?? "")) : r[c] === v)));
+      const rows = () => (tables[table] || []).filter((r) => q.filters.every(([c, v]) => (v && v.re ? v.re.test(String(r[c] ?? "")) : v && v.in ? v.in.has(r[c]) : r[c] === v)));
       const run = async () => {
         calls.push({ table, op: q.op, cols: q.cols, filters: [...q.filters] });
         if (tables[table] === undefined) return { data: null, error: { code: "42P01", message: "relation does not exist" } };
@@ -79,6 +79,7 @@ function makeDb(tables) {
         upsert(p, o) { q.op = "upsert"; q.payload = p; q.opts = o; return b; },
         delete() { q.op = "delete"; return b; },
         eq(c, v) { q.filters.push([c, v]); return b; },
+        in(c, vals) { q.filters.push([c, { in: new Set(vals) }]); return b; },
         ilike(c, v) { const re = new RegExp("^" + String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*") + "$", "i"); q.filters.push([c, { re }]); return b; },
         order() { return b; },
         limit() { return b; },
@@ -368,76 +369,95 @@ await t("G5 the owner table unreadable: no crash, a stranger still refused", asy
 });
 
 // -- T ------------------------------------------------------------------------
-console.log("\nT  Mavloper's own Figma token, measured");
-function mountToken(tables, env, fetchImpl, clock) {
+console.log("\nT  Mavloper's own Figma account: read from orders, never asked of Figma");
+function mountToken(tables, env, clock) {
   const app = makeApp();
-  createFigmaPlatformTokenRoutes({ app, supabaseAdmin: makeDb(tables), requireAuth: passAuth, log: () => {}, env, fetchImpl, now: clock || (() => Date.now()) });
+  createFigmaPlatformTokenRoutes({ app, supabaseAdmin: makeDb(tables), requireAuth: passAuth, log: () => {}, env, now: clock || (() => Date.now()) });
   return app.routes["get /os/platform/figma-token"];
 }
 const PAT = "figd_" + "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0";
-await t("T1 working: Figma answered 200, the token never appears, the expiry is the recorded one", async () => {
-  let calls = 0;
-  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT, FIGMA_API_TOKEN_EXPIRES: "2027-01-17" }, async () => { calls++; return { ok: true, status: 200, json: async () => ({ handle: "mavloper-production" }) }; });
-  const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.statusCode === 200 && res.body.working === true && res.body.expiresOn === "2027-01-17", JSON.stringify(res.body));
-  ok(!JSON.stringify(res.body).includes(PAT), "token not returned");
-  await run(route, as("owner@mavlers.test", U1));
-  ok(calls === 1, "cached, asked Figma " + calls + " times");
+const LEAD = "55555555-5555-4555-8555-555555555555";
+const RND = "44444444-4444-4444-8444-444444444444";
+const ORGS = [
+  { ...SPACE },
+  { id: LEAD, slug: "leadership", name: "Leadership", is_deleted: false, figma_required: false },
+  { id: RND, slug: "r-d", name: "R&D", is_deleted: false, figma_required: true },
+  { id: "33333333-3333-4333-8333-333333333333", slug: "gone", name: "Gone", is_deleted: true },
+];
+const GLOBAL = "Generation complete in 120s | Figma credential: global Mavlers token (reason: no-row-for-org)";
+const OWN = "Generation complete in 120s | Figma credential: this space's connected Figma account (design)";
+const PAYWALL = "Figma refused to send this design because the Figma plan that owns the file has reached its plan limit.";
+const NOTSHARED = "Figma could not open this file (404). Share it with the account that reads your files.";
+const order = (id, status, at, job, err = null) => ({ org_id: LEAD, order_id: id, status, finished_at: at, job_id: job, error_text: err });
+
+await t("T1 NO CALL TO FIGMA, ever: the route never touches the network, and never returns the token", async () => {
+  const real = globalThis.fetch; let calls = 0;
+  globalThis.fetch = async () => { calls++; return { ok: true, status: 200, json: async () => ({}) }; };
+  try {
+    const route = mountToken(world({ orgs: ORGS, os_queue: [], maveloper_jobs: [] }), { FIGMA_API_TOKEN: PAT, FIGMA_API_TOKEN_EXPIRES: "2027-01-17" });
+    const res = await run(route, as("owner@mavlers.test", U1));
+    ok(res.statusCode === 200 && res.body.configured === true && res.body.expiresOn === "2027-01-17", JSON.stringify(res.body));
+    ok(!JSON.stringify(res.body).includes(PAT), "token not returned");
+    ok(calls === 0, "fetch called " + calls + " times");
+  } finally { globalThis.fetch = real; }
 });
-await t("T2 who-is-this refused and no recent design to test: not working, Figma's own words, no guessed cause", async () => {
-  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({ status: 403, err: "Invalid scope" }) }));
-  const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.body.working === false && res.body.figmaStatus === 403 && res.body.figmaSaid === "Invalid scope", JSON.stringify(res.body));
-  ok(!/expired, revoked or wrong/.test(res.body.note) && /Current user permission/.test(res.body.note), res.body.note);
+await t("T2 names the spaces that read with it, and lists a new space apart, never as reading with it", async () => {
+  const route = mountToken(world({ orgs: ORGS, os_queue: [], maveloper_jobs: [] }), { FIGMA_API_TOKEN: PAT });
+  const b = (await run(route, as("owner@mavlers.test", U1))).body;
+  ok(JSON.stringify(b.using.map((u) => u.space)) === JSON.stringify(["Leadership"]), JSON.stringify(b.using));
+  ok(JSON.stringify(b.waiting) === JSON.stringify(["R&D"]), JSON.stringify(b.waiting));
+  ok(b.using[0].lastRead === null && b.using[0].refused === null, "no orders, no claims");
 });
-const JOBS = { maveloper_jobs: [{ status: "completed", figma_url: "https://www.figma.com/design/AbCdEfGhIjKl12345/Email?node-id=1-2", progress_message: "Generation complete | Figma credential: global Mavlers token (reason: no-row-for-org)", created_at: "2026-11-18T16:56:00Z" }] };
-await t("T7 who-is-this refused but the last design it read still opens: working, reads designs, cannot name itself", async () => {
-  const seen = [];
-  const route = mountToken(world(JOBS), { FIGMA_API_TOKEN: PAT }, async (url) => {
-    seen.push(String(url));
-    return String(url).includes("/v1/me") ? { ok: false, status: 403, json: async () => ({ err: "Invalid scope" }) } : { ok: true, status: 200, json: async () => ({}) };
-  });
-  const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.body.working === true && res.body.readsDesigns === true && res.body.canName === false, JSON.stringify(res.body));
-  ok(seen.some((u) => u.includes("/v1/files/AbCdEfGhIjKl12345?depth=1")), seen.join(" "));
+await t("T3 last read: the newest DELIVERED order whose job recorded the global token, not one read with another account", async () => {
+  const tables = world({ orgs: ORGS,
+    os_queue: [order("L-1", "delivered", "2026-11-18T10:00:00Z", "j1"), order("L-2", "delivered", "2026-11-19T10:00:00Z", "j2")],
+    maveloper_jobs: [{ id: "j1", progress_message: GLOBAL }, { id: "j2", progress_message: OWN }] });
+  const b = (await run(mountToken(tables, { FIGMA_API_TOKEN: PAT }), as("owner@mavlers.test", U1))).body;
+  ok(b.using[0].lastRead && b.using[0].lastRead.orderId === "L-1", JSON.stringify(b.using[0]));
 });
-await t("T8 both refused: not working, and both of Figma's answers are shown", async () => {
-  const route = mountToken(world(JOBS), { FIGMA_API_TOKEN: PAT }, async (url) => ({ ok: false, status: String(url).includes("/v1/me") ? 403 : 404, json: async () => ({ err: String(url).includes("/v1/me") ? "Invalid token" : "Not found" }) }));
-  const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.body.working === false && res.body.readsDesigns === false && /403 "Invalid token"/.test(res.body.note) && /404 "Not found"/.test(res.body.note), res.body.note);
+await t("T4 refused: an ACCOUNT-level refusal newer than the last read is reported; a file not shared is not", async () => {
+  const tables = world({ orgs: ORGS,
+    os_queue: [order("L-1", "delivered", "2026-11-18T10:00:00Z", "j1"), order("L-3", "failed", "2026-11-19T11:00:00Z", null, NOTSHARED), order("L-4", "failed", "2026-11-19T12:00:00Z", null, PAYWALL)],
+    maveloper_jobs: [{ id: "j1", progress_message: GLOBAL }] });
+  const u = (await run(mountToken(tables, { FIGMA_API_TOKEN: PAT }), as("owner@mavlers.test", U1))).body.using[0];
+  ok(u.refused && u.refused.orderId === "L-4" && /too many requests/.test(u.refused.why), JSON.stringify(u));
 });
-await t("T9 Figma echoing a token-shaped string is redacted before it reaches the page", async () => {
-  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({ err: "bad token " + PAT }) }));
-  const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.statusCode === 200 && !JSON.stringify(res.body).includes(PAT), JSON.stringify(res.body));
+await t("T5 a refusal OLDER than the last successful read is history, not a warning", async () => {
+  const tables = world({ orgs: ORGS,
+    os_queue: [order("L-4", "failed", "2026-11-17T12:00:00Z", null, PAYWALL), order("L-1", "delivered", "2026-11-18T10:00:00Z", "j1")],
+    maveloper_jobs: [{ id: "j1", progress_message: GLOBAL }] });
+  const u = (await run(mountToken(tables, { FIGMA_API_TOKEN: PAT }), as("owner@mavlers.test", U1))).body.using[0];
+  ok(u.refused === null && u.lastRead.orderId === "L-1", JSON.stringify(u));
 });
-await t("T3 Figma did not answer: working is null (unknown), never false", async () => {
-  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => { throw new Error("net"); });
-  ok((await run(route, as("owner@mavlers.test", U1))).body.working === null);
-});
-await t("T4 only the platform owner may read it", async () => {
-  const route = mountToken(world({ platform_owners: [] }), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+await t("T6 only the platform owner may read it", async () => {
+  const route = mountToken(world({ platform_owners: [], orgs: ORGS }), { FIGMA_API_TOKEN: PAT });
   ok((await run(route, as("admin@acme.test", U1))).statusCode === 403);
 });
-await t("T5 it counts the live spaces that would read with it", async () => {
-  const tables = world({ orgs: [{ ...SPACE }, { id: ORG_B, slug: "b", is_deleted: false }, { id: "33333333-3333-4333-8333-333333333333", slug: "c", is_deleted: true }] });
-  const route = mountToken(tables, { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
-  ok((await run(route, as("owner@mavlers.test", U1))).body.spacesUsingIt === 1);
+await t("T7 cached a minute on the server: a second read inside it does not ask the database again", async () => {
+  let clock = 1_000_000;
+  const tables = world({ orgs: ORGS, os_queue: [], maveloper_jobs: [] });
+  const db = makeDb(tables);
+  const app = makeApp();
+  createFigmaPlatformTokenRoutes({ app, supabaseAdmin: db, requireAuth: passAuth, log: () => {}, env: { FIGMA_API_TOKEN: PAT }, now: () => clock });
+  const route = app.routes["get /os/platform/figma-token"];
+  await run(route, as("owner@mavlers.test", U1));
+  const n = db.calls.filter((c) => c.table === "orgs").length;
+  clock += 30_000; await run(route, as("owner@mavlers.test", U1));
+  ok(db.calls.filter((c) => c.table === "orgs").length === n, "re-read inside the minute");
+  clock += 61_000; await run(route, as("owner@mavlers.test", U1));
+  ok(db.calls.filter((c) => c.table === "orgs").length > n, "not re-read after the minute");
 });
-await t("T10 it NAMES the spaces reading with it, and lists a space that must connect apart, never as reading with it", async () => {
-  const tables = world({ orgs: [
-    { ...SPACE },
-    { id: ORG_B, slug: "leadership", name: "Leadership", is_deleted: false, figma_required: false },
-    { id: "44444444-4444-4444-8444-444444444444", slug: "r-d", name: "R&D", is_deleted: false, figma_required: true },
-    { id: "33333333-3333-4333-8333-333333333333", slug: "gone", name: "Gone", is_deleted: true },
-  ] });
-  const route = mountToken(tables, { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
-  const b = (await run(route, as("owner@mavlers.test", U1))).body;
-  ok(b.spacesUsingIt === 1, "count " + b.spacesUsingIt);
-  ok(JSON.stringify(b.spacesUsingItNames) === JSON.stringify(["Leadership"]), JSON.stringify(b.spacesUsingItNames));
-  ok(JSON.stringify(b.spacesWaitingNames) === JSON.stringify(["R&D"]), JSON.stringify(b.spacesWaitingNames));
+await t("T8 the account-refusal words: plan limit and 429 and a rejected token match; a file not shared does not", async () => {
+  ok(/too many requests/.test(accountRefusal(PAYWALL)) && /too many requests/.test(accountRefusal("Figma returned 429")));
+  ok(/rejected/.test(accountRefusal("Figma returned 401: invalid token")));
+  ok(accountRefusal(NOTSHARED) === null && accountRefusal(null) === null);
+  ok(!/[\u2014\u2013]/.test(accountRefusal(PAYWALL) + accountRefusal("401")));
 });
-await t("T6 the recorded expiry must be a real date", async () => {
+await t("T9 spaceState is pure: no orders, no claims", async () => {
+  const s = spaceState([], new Set());
+  ok(s.lastRead === null && s.refused === null);
+});
+await t("T10 the recorded expiry must be a real date", async () => {
   ok(readExpiryDate("2027-01-17") === "2027-01-17" && readExpiryDate("2027-02-30") === null && readExpiryDate("17 Jan") === null && readExpiryDate(undefined) === null);
 });
 
