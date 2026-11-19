@@ -36,6 +36,20 @@ export const DECLINED =
 export const FIGMA_PLAN_LIMIT =
   "Figma refused to send this design because the Figma plan that owns the file has reached its plan limit. " +
   "Wait an hour and resubmit, or copy the file into a team on a paid Figma plan.";
+/**
+ * ★ 19 NOV: Figma answered 429 (too many requests). Measured on HAMILTON
+ * (job af5a2a94): the engine's picture export got 429 for one file, and the
+ * client read "an automatic quality check stopped it ... learn what to change",
+ * which sent them to change a design that had nothing wrong with it. The words
+ * the engine chat asked for, 19 NOV 22:04.
+ */
+export const FIGMA_TOO_MANY =
+  "Figma refused too many requests for this file, so the design could not be read. Wait a few minutes and resubmit. " +
+  "If it happens again, the Figma plan that owns the file may be out of its allowance: copy the file into the Mavlers Figma space and submit the new link.";
+/** Figma sent no picture for some elements, and no 429 was recorded. */
+export const FIGMA_PICTURES_MISSING =
+  "Figma did not send the pictures this design needs. Wait a few minutes and resubmit. " +
+  "If it happens again, write to " + SUPPORT + " with the order id.";
 /** The link itself is wrong. */
 export const BAD_LINK =
   "This Figma link does not point at one email frame. In Figma, right-click the email frame, choose Copy link to selection, and submit that link.";
@@ -135,7 +149,7 @@ export const NO_FIGMA_ACCOUNT =
 // sentence of ours is found and returned on its own.
 const OURS = [
   ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
-  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, NO_SPACE_FIGMA,
+  ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, NO_SPACE_FIGMA, FIGMA_TOO_MANY, FIGMA_PICTURES_MISSING,
 ];
 const OURS_RE = [
   /The build ran longer than \d+ minutes and was stopped on our side\. Please resubmit\./,
@@ -167,11 +181,22 @@ export function plainReason(raw) {
   if (/engine draining:|\(HTTP 503, draining\)/i.test(s)) return ENGINE_UPDATING;
   if (/engine stopped:|\bengineStopped\b|engine was stopped before this order finished building/i.test(s)) return ENGINE_STOPPED_MORE_THAN_ONCE;
   if (/No Figma credential|Figma not configured|FIGMA_API_TOKEN is not set/i.test(s)) return NO_FIGMA_ACCOUNT;
+  // ★ 19 NOV: Figma did not send the pictures. AHEAD of the guard rule below:
+  // the engine reports it as a guard (FIGMA_RENDER_INCOMPLETE, "THE COMPILER
+  // REFUSED"), but its own record says "NOT a verdict on this design". With a
+  // 429 anywhere in the reason it is too many requests; without, it is said
+  // as missing pictures, never as a quality check.
+  if (/Figma did not render|FIGMA_RENDER_INCOMPLETE/i.test(s)) {
+    return /\b429\b|too many requests|rate[- ]?limit/i.test(s) ? FIGMA_TOO_MANY : FIGMA_PICTURES_MISSING;
+  }
   // the handler's user errors: a wrong link, a page instead of a frame, several frames
   if (/Multiple email frames|Invalid Figma URL|Figma URL|node-id|Copy link|email-shaped|email design frame|no content\. Check the URL/i.test(s)) {
     return BAD_LINK;
   }
-  if (/\b429\b|rate-limited|rate limited|too many requests|\b402\b|plan limit|quota/i.test(s)) return FIGMA_PLAN_LIMIT;
+  // A 429 is too many requests (it can clear in minutes); a 402 or a stated
+  // plan limit or quota is the plan itself. They were one sentence before 19 NOV.
+  if (/\b429\b|rate-limited|rate limited|too many requests/i.test(s)) return FIGMA_TOO_MANY;
+  if (/\b402\b|plan limit|quota/i.test(s)) return FIGMA_PLAN_LIMIT;
   if (/\b(401|403|404)\b|rejected the token|not found|no access|forbidden/i.test(s) && /figma/i.test(s)) {
     return figmaCannotOpen(null);
   }
@@ -186,7 +211,7 @@ export function plainReason(raw) {
 }
 
 export default {
-  SUPPORT, ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, BAD_LINK, NO_FIGMA_ACCOUNT,
+  SUPPORT, ENGINE_LOST, START_FAILED, NO_EMAIL, INTERNAL, DECLINED, FIGMA_PLAN_LIMIT, FIGMA_TOO_MANY, FIGMA_PICTURES_MISSING, BAD_LINK, NO_FIGMA_ACCOUNT,
   ENGINE_UPDATING, ENGINE_STOPPED_MORE_THAN_ONCE, ENGINE_RESENT, NO_SPACE_FIGMA,
   tookTooLong, accountNameOf, figmaCannotOpen, figmaCannotOpenEither, stoppedBy, cancelledBy, lateResultNote,
   lateResultDelivered, istClock, plainReason,

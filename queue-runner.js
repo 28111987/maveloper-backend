@@ -267,17 +267,25 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
     return ok;
   }
 
-  // §5 FAILED — every failure leaves a CLEAN, re-dispatchable row (null job_id/started/finished).
+  // §5 FAILED: every failure leaves a re-dispatchable row.
   // RUN 17 T2: error_text is what a client reads, so it goes through plainReason;
   // the raw reason stays in maveloper_jobs.error_message and in the log.
+  // ★ 19 NOV: THE FAILURE TIME AND THE START ARE KEPT. Both were wiped here, so
+  // every failed order read "failed, time not recorded" and the screen could not
+  // say when it failed (HAMILTON, 19 NOV). Nothing re-dispatches a failed row
+  // except Retry, which clears both itself (order-actions.js doRetry).
+  // ★ job_id IS STILL CLEARED, ON PURPOSE: a console tab still polling this job
+  // writes to os_queue BY job_id (OsShell persistTerminal, and the queued ->
+  // processing write), so a failed row that kept its job_id could be flipped
+  // back to processing or delivered by a browser. Keeping it needs those writes
+  // guarded first; until then the build is found by order_id and time.
   async function settleFailed(id, reason, meta = {}) {
     const t0 = Date.now();
     const patch = {
       status: 'failed',
       error_text: plainReason(reason),
       job_id: null,
-      started_at: null,
-      finished_at: null,
+      finished_at: new Date().toISOString(),
     };
     let ok = await updateRow(id, patch);
     if (!ok) ok = await updateRow(id, patch); // one retry
@@ -518,9 +526,12 @@ export function createQueueRunner({ supabaseAdmin, startFigmaJobAsync, log, env,
             // Guard: the __BRIDGE__:<id> dispatch tag is a side-channel, not a reason.
             const rawReason = String(job.error_message || '').trim();
             const meaningful = rawReason && !rawReason.startsWith('__BRIDGE__:') ? rawReason : '';
-            const reason = meaningful
-              ? meaningful.slice(0, 500)
-              : 'Bridge/generation failed, no detail returned';
+            // ★ 19 NOV: the WHOLE reason reaches plainReason. It was cut at 500
+            // characters, which left HAMILTON's "429" out and its "THE COMPILER
+            // REFUSED" banner in, so a Figma rate limit read as a quality check.
+            // plainReason returns one fixed sentence, never the raw text, so the
+            // length of what goes in is never what is stored.
+            const reason = meaningful || 'Bridge/generation failed, no detail returned';
             await settleFailed(r.id, reason, { orderId: r.order_id });
             log('warn', 'Runner: settled failed (maveloper_jobs failed)', { id: r.id, order: r.order_id, reason: reason.slice(0, 160) });
             continue;
