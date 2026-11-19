@@ -54,7 +54,7 @@ function makeDb(tables) {
     calls, tables,
     from(table) {
       const q = { table, op: "select", cols: null, filters: [], payload: null, opts: null, wantRows: false };
-      const rows = () => (tables[table] || []).filter((r) => q.filters.every(([c, v]) => r[c] === v));
+      const rows = () => (tables[table] || []).filter((r) => q.filters.every(([c, v]) => (v && v.re ? v.re.test(String(r[c] ?? "")) : r[c] === v)));
       const run = async () => {
         calls.push({ table, op: q.op, cols: q.cols, filters: [...q.filters] });
         if (tables[table] === undefined) return { data: null, error: { code: "42P01", message: "relation does not exist" } };
@@ -79,6 +79,8 @@ function makeDb(tables) {
         upsert(p, o) { q.op = "upsert"; q.payload = p; q.opts = o; return b; },
         delete() { q.op = "delete"; return b; },
         eq(c, v) { q.filters.push([c, v]); return b; },
+        ilike(c, v) { const re = new RegExp("^" + String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*") + "$", "i"); q.filters.push([c, { re }]); return b; },
+        order() { return b; },
         limit() { return b; },
         async maybeSingle() { const r = await run(); return { data: r.data && r.data[0] ? r.data[0] : null, error: r.error }; },
         then(res, rej) { return run().then(res, rej); },
@@ -382,10 +384,32 @@ await t("T1 working: Figma answered 200, the token never appears, the expiry is 
   await run(route, as("owner@mavlers.test", U1));
   ok(calls === 1, "cached, asked Figma " + calls + " times");
 });
-await t("T2 refused: Figma answered 403, working false and a plain note", async () => {
-  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({}) }));
+await t("T2 who-is-this refused and no recent design to test: not working, Figma's own words, no guessed cause", async () => {
+  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({ status: 403, err: "Invalid scope" }) }));
   const res = await run(route, as("owner@mavlers.test", U1));
-  ok(res.body.working === false && /expired, revoked or wrong/.test(res.body.note) && res.body.expiresOn === null, JSON.stringify(res.body));
+  ok(res.body.working === false && res.body.figmaStatus === 403 && res.body.figmaSaid === "Invalid scope", JSON.stringify(res.body));
+  ok(!/expired, revoked or wrong/.test(res.body.note) && /Current user permission/.test(res.body.note), res.body.note);
+});
+const JOBS = { maveloper_jobs: [{ status: "completed", figma_url: "https://www.figma.com/design/AbCdEfGhIjKl12345/Email?node-id=1-2", progress_message: "Generation complete | Figma credential: global Mavlers token (reason: no-row-for-org)", created_at: "2026-11-18T16:56:00Z" }] };
+await t("T7 who-is-this refused but the last design it read still opens: working, reads designs, cannot name itself", async () => {
+  const seen = [];
+  const route = mountToken(world(JOBS), { FIGMA_API_TOKEN: PAT }, async (url) => {
+    seen.push(String(url));
+    return String(url).includes("/v1/me") ? { ok: false, status: 403, json: async () => ({ err: "Invalid scope" }) } : { ok: true, status: 200, json: async () => ({}) };
+  });
+  const res = await run(route, as("owner@mavlers.test", U1));
+  ok(res.body.working === true && res.body.readsDesigns === true && res.body.canName === false, JSON.stringify(res.body));
+  ok(seen.some((u) => u.includes("/v1/files/AbCdEfGhIjKl12345?depth=1")), seen.join(" "));
+});
+await t("T8 both refused: not working, and both of Figma's answers are shown", async () => {
+  const route = mountToken(world(JOBS), { FIGMA_API_TOKEN: PAT }, async (url) => ({ ok: false, status: String(url).includes("/v1/me") ? 403 : 404, json: async () => ({ err: String(url).includes("/v1/me") ? "Invalid token" : "Not found" }) }));
+  const res = await run(route, as("owner@mavlers.test", U1));
+  ok(res.body.working === false && res.body.readsDesigns === false && /403 "Invalid token"/.test(res.body.note) && /404 "Not found"/.test(res.body.note), res.body.note);
+});
+await t("T9 Figma echoing a token-shaped string is redacted before it reaches the page", async () => {
+  const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => ({ ok: false, status: 403, json: async () => ({ err: "bad token " + PAT }) }));
+  const res = await run(route, as("owner@mavlers.test", U1));
+  ok(res.statusCode === 200 && !JSON.stringify(res.body).includes(PAT), JSON.stringify(res.body));
 });
 await t("T3 Figma did not answer: working is null (unknown), never false", async () => {
   const route = mountToken(world(), { FIGMA_API_TOKEN: PAT }, async () => { throw new Error("net"); });

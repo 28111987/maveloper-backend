@@ -22,8 +22,8 @@
  *   GET /os/platform/figma-token     platform owner only. Never the token.
  */
 
-import { sendSafe } from "./figma-credential-routes.js";
-import { CREDENTIAL_TABLE } from "./figma-credential.js";
+import { CREDENTIAL_TABLE, redactTokens } from "./figma-credential.js";
+import { sendSafe, parseFigmaFileKey } from "./figma-credential-routes.js";
 import { OAUTH_TABLE } from "./figma-oauth.js";
 import { platformOwners } from "./spaces.js";
 
@@ -38,30 +38,82 @@ export function readExpiryDate(v) {
   return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : null;
 }
 
-/** Ask Figma whether the token authenticates. Never throws; never returns the token. */
-export async function probeFigmaToken({ token, fetchImpl = globalThis.fetch, timeoutMs = PROBE_TIMEOUT_MS }) {
-  if (!token) return { working: false, status: null, handle: null, note: "No platform Figma token is set on the backend." };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+/** Figma's own error text from a response body, short, never containing a token. */
+async function figmaWords(r) {
   try {
-    const r = await fetchImpl("https://api.figma.com/v1/me", { method: "GET", headers: { "X-Figma-Token": token }, signal: controller.signal });
-    if (r && r.ok) {
-      let me = {};
-      try { me = await r.json(); } catch { me = {}; }
-      return { working: true, status: r.status, handle: typeof me.handle === "string" ? me.handle : null, note: null };
-    }
-    const status = r ? r.status : null;
-    return {
-      working: false,
-      status,
-      handle: null,
-      note: status === 401 || status === 403 ? "Figma refused the token: it is expired, revoked or wrong." : "Figma answered " + status + ".",
-    };
+    const b = await r.json();
+    const w = (b && (b.err || b.message || b.error)) || "";
+    return redactTokens(String(w)).slice(0, 160) || null;
   } catch {
-    return { working: null, status: null, handle: null, note: "Figma did not answer, so the token could not be checked." };
-  } finally {
-    clearTimeout(timer);
+    return null;
   }
+}
+
+/**
+ * Ask Figma about the token, in two questions, and report Figma's own words.
+ *
+ *   1. GET /v1/me: "who is this?". Needs the token's "Current user" permission.
+ *   2. Only when 1 is refused and a file this token read before is known:
+ *      GET /v1/files/:key?depth=1, "can it still read a design?". This is the
+ *      job the token actually does for orders.
+ *
+ * 19 NOV: the first version asked only question 1 and, on a refusal, printed
+ * its own guess ("expired, revoked or wrong") while the same token had read
+ * designs the evening before. A token made without "Current user" fails 1 and
+ * passes 2. Never throws; never returns the token.
+ *
+ * working: true  = a question succeeded (canName says which)
+ *          false = both were refused, or only 1 was asked and it was refused
+ *          null  = Figma did not answer
+ */
+export async function probeFigmaToken({ token, fileKey = null, fetchImpl = globalThis.fetch, timeoutMs = PROBE_TIMEOUT_MS }) {
+  const none = { working: null, canName: false, readsDesigns: null, status: null, handle: null, figmaSaid: null, fileStatus: null, note: null };
+  if (!token) return { ...none, working: false, note: "No platform Figma token is set on the backend." };
+  const ask = async (url) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetchImpl(url, { method: "GET", headers: { "X-Figma-Token": token }, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let me;
+  try {
+    me = await ask("https://api.figma.com/v1/me");
+  } catch {
+    return { ...none, note: "Figma did not answer, so the token could not be checked." };
+  }
+  if (me && me.ok) {
+    let body = {};
+    try { body = await me.json(); } catch { body = {}; }
+    return { ...none, working: true, canName: true, readsDesigns: null, status: me.status, handle: typeof body.handle === "string" ? body.handle : null, note: null };
+  }
+  const status = me ? me.status : null;
+  const figmaSaid = me ? await figmaWords(me) : null;
+  if (!fileKey) {
+    return {
+      ...none, working: false, status, figmaSaid,
+      note: "Figma answered " + status + (figmaSaid ? ' ("' + figmaSaid + '")' : "") + " to who-is-this, and no recent design was known to test a read. The token may only lack the Current user permission.",
+    };
+  }
+  let file;
+  try {
+    file = await ask("https://api.figma.com/v1/files/" + encodeURIComponent(fileKey) + "?depth=1");
+  } catch {
+    return { ...none, working: null, status, figmaSaid, note: "Figma answered " + status + " to who-is-this and did not answer the design read." };
+  }
+  if (file && file.ok) {
+    return {
+      ...none, working: true, canName: false, readsDesigns: true, status, figmaSaid, fileStatus: file.status,
+      note: "Reads designs. It cannot say whose account it is (Figma answered " + status + (figmaSaid ? ' "' + figmaSaid + '"' : "") + " to who-is-this), so it was most likely made without the Current user permission.",
+    };
+  }
+  const fileSaid = file ? await figmaWords(file) : null;
+  return {
+    ...none, working: false, readsDesigns: false, status, figmaSaid, fileStatus: file ? file.status : null,
+    note: "Figma refused both questions: who-is-this " + status + (figmaSaid ? ' "' + figmaSaid + '"' : "") + ", design read " + (file ? file.status : "no answer") + (fileSaid ? ' "' + fileSaid + '"' : "") + ".",
+  };
 }
 
 export function createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth, log, env = process.env, fetchImpl = null, now = () => Date.now() }) {
@@ -96,16 +148,37 @@ export function createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth
     }
   }
 
+  /** The file of the most recent order that read with Mavloper's own token. */
+  async function recentFileKey() {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from("maveloper_jobs")
+        .select("figma_url,progress_message,created_at")
+        .eq("status", "completed")
+        .ilike("progress_message", "%global Mavlers token%")
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (error || !data || !data[0]) return null;
+      return parseFigmaFileKey(data[0].figma_url);
+    } catch {
+      return null;
+    }
+  }
+
   app.get("/os/platform/figma-token", requireAuth, requirePlatformOwner, async (req, res) => {
     const t = now();
     if (!cache || t - cache.at > PROBE_TTL_MS) {
-      const probe = await probeFigmaToken({ token: env.FIGMA_API_TOKEN, fetchImpl: fetchImpl || globalThis.fetch });
+      const probe = await probeFigmaToken({ token: env.FIGMA_API_TOKEN, fileKey: await recentFileKey(), fetchImpl: fetchImpl || globalThis.fetch });
       cache = { at: t, probe };
       log("info", "figma-platform-token: probed", { working: probe.working, status: probe.status });
     }
     return sendSafe(res, 200, {
       configured: Boolean(env.FIGMA_API_TOKEN),
       working: cache.probe.working,
+      canName: cache.probe.canName,
+      readsDesigns: cache.probe.readsDesigns,
+      figmaStatus: cache.probe.status,
+      figmaSaid: cache.probe.figmaSaid,
       figmaHandle: cache.probe.handle,
       note: cache.probe.note,
       checkedAt: new Date(cache.at).toISOString(),
