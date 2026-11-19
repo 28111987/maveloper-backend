@@ -16,8 +16,9 @@
  * records in FIGMA_API_TOKEN_EXPIRES (YYYY-MM-DD, read off Figma's own token
  * screen). Absent, the console says "expiry not recorded" rather than guess.
  *
- * It also counts the live spaces that would read with this token today (no
- * space account of their own), so "does it matter if it lapses" has a number.
+ * It also names the live spaces that read with this token today (no space
+ * account of their own), so "does it matter if it lapses" has an answer, and,
+ * apart, the new spaces that have no account yet and take no orders (19 NOV).
  *
  *   GET /os/platform/figma-token     platform owner only. Never the token.
  */
@@ -130,10 +131,20 @@ export function createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth
     return sendSafe(res, 403, { error: "Only the platform owner can read this" }, log);
   }
 
-  async function spacesUsingIt() {
+  /**
+   * The live spaces with no Figma account of their own, split in two (19 NOV):
+   *   using    read with this token today (older spaces, figma_required false);
+   *   waiting  spaces created from 19 NOV (figma_required true): their orders
+   *            are REFUSED until they connect one (NO_SPACE_FIGMA), so they do
+   *            not read with this token and must not be counted as if they did.
+   * Names, not ids, because this is read by the platform owner only, who asked
+   * which spaces they are. Null when the spaces could not be read.
+   */
+  async function spacesWithoutOwnAccount() {
     try {
-      const [orgs, oauth, pasted] = await Promise.all([
-        supabaseAdmin.from("orgs").select("id,is_deleted"),
+      let orgs = await supabaseAdmin.from("orgs").select("id,name,is_deleted,figma_required");
+      if (orgs.error) orgs = await supabaseAdmin.from("orgs").select("id,name,is_deleted");
+      const [oauth, pasted] = await Promise.all([
         supabaseAdmin.from(OAUTH_TABLE).select("org_id,is_active"),
         supabaseAdmin.from(CREDENTIAL_TABLE).select("org_id,is_active"),
       ]);
@@ -142,7 +153,13 @@ export function createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth
         ...((oauth.data || []).filter((r) => r.is_active !== false).map((r) => r.org_id)),
         ...((pasted.data || []).filter((r) => r.is_active !== false).map((r) => r.org_id)),
       ]);
-      return (orgs.data || []).filter((o) => !o.is_deleted && !own.has(o.id)).length;
+      const without = (orgs.data || []).filter((o) => !o.is_deleted && !own.has(o.id));
+      const nameOf = (o) => String(o.name || o.slug || "unnamed space");
+      const byName = (x, y) => x.localeCompare(y);
+      return {
+        using: without.filter((o) => o.figma_required !== true).map(nameOf).sort(byName),
+        waiting: without.filter((o) => o.figma_required === true).map(nameOf).sort(byName),
+      };
     } catch {
       return null;
     }
@@ -183,7 +200,15 @@ export function createFigmaPlatformTokenRoutes({ app, supabaseAdmin, requireAuth
       note: cache.probe.note,
       checkedAt: new Date(cache.at).toISOString(),
       expiresOn: readExpiryDate(env.FIGMA_API_TOKEN_EXPIRES),
-      spacesUsingIt: await spacesUsingIt(),
+      ...(await (async () => {
+        const w = await spacesWithoutOwnAccount();
+        return {
+          // Kept for the console that reads a count; now excludes the waiting spaces.
+          spacesUsingIt: w ? w.using.length : null,
+          spacesUsingItNames: w ? w.using : null,
+          spacesWaitingNames: w ? w.waiting : null,
+        };
+      })()),
     }, log);
   });
 }

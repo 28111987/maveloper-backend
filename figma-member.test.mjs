@@ -424,6 +424,19 @@ await t("T5 it counts the live spaces that would read with it", async () => {
   const route = mountToken(tables, { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
   ok((await run(route, as("owner@mavlers.test", U1))).body.spacesUsingIt === 1);
 });
+await t("T10 it NAMES the spaces reading with it, and lists a space that must connect apart, never as reading with it", async () => {
+  const tables = world({ orgs: [
+    { ...SPACE },
+    { id: ORG_B, slug: "leadership", name: "Leadership", is_deleted: false, figma_required: false },
+    { id: "44444444-4444-4444-8444-444444444444", slug: "r-d", name: "R&D", is_deleted: false, figma_required: true },
+    { id: "33333333-3333-4333-8333-333333333333", slug: "gone", name: "Gone", is_deleted: true },
+  ] });
+  const route = mountToken(tables, { FIGMA_API_TOKEN: PAT }, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+  const b = (await run(route, as("owner@mavlers.test", U1))).body;
+  ok(b.spacesUsingIt === 1, "count " + b.spacesUsingIt);
+  ok(JSON.stringify(b.spacesUsingItNames) === JSON.stringify(["Leadership"]), JSON.stringify(b.spacesUsingItNames));
+  ok(JSON.stringify(b.spacesWaitingNames) === JSON.stringify(["R&D"]), JSON.stringify(b.spacesWaitingNames));
+});
 await t("T6 the recorded expiry must be a real date", async () => {
   ok(readExpiryDate("2027-01-17") === "2027-01-17" && readExpiryDate("2027-02-30") === null && readExpiryDate("17 Jan") === null && readExpiryDate(undefined) === null);
 });
