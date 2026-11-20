@@ -400,6 +400,51 @@ export async function resolveMemberFigmaOAuth(orgId, userId, { db = null, key = 
  * written for org_figma_oauth and is unchanged in behaviour: only the table
  * and the row's key are parameters now.
  */
+const GRANT_COLUMNS = "org_id,access_token,refresh_token,expires_at,figma_user_id,figma_email,figma_handle,scopes,is_active,updated_at,last_refresh_ok";
+
+/**
+ * ★ ONE FIGMA ACCOUNT HOLDS ONE GRANT (21 NOV 2026). Figma keeps one
+ * authorisation per Figma account per app: when the same Figma account
+ * authorises Mavloper again (for another space, or as a person's own account),
+ * the earlier authorisation is replaced and its token answers 401. Measured on
+ * production 20 NOV: design@mavlers.com connected to R&D at 17:30:21 UTC, and
+ * the Mavlers space (06 Oct) and a personal connection (19 Nov) to the same
+ * account failed from then; email@mavlers.com held by two spaces and one person
+ * likewise, only the newest working. Mavloper stored one token per space; the
+ * truth is one token per FIGMA ACCOUNT.
+ *
+ * So a row is still what AUTHORISES its space or person to read with that
+ * Figma account (no row, no account), but the TOKEN used is the newest one
+ * written for that Figma account (figma_user_id) in either table: the one Figma
+ * still honours. updated_at is written only by a connect or a successful
+ * refresh (recordRefreshOutcome never touches it), and a row whose last
+ * renewal failed is never the newest. Any failure here returns null and the
+ * row's own token is used, exactly as before.
+ */
+async function newestGrantFor(db, row) {
+  const id = row && row.figma_user_id;
+  if (!id) return null;
+  try {
+    const [sp, me] = await Promise.all([
+      db.from(OAUTH_TABLE).select(GRANT_COLUMNS).eq("figma_user_id", id).eq("is_active", true),
+      db.from(MEMBER_OAUTH_TABLE).select(GRANT_COLUMNS + ",user_id").eq("figma_user_id", id).eq("is_active", true),
+    ]);
+    const cand = [
+      ...((sp && !sp.error && Array.isArray(sp.data) ? sp.data : []).map((r) => ({ row: r, table: OAUTH_TABLE, match: { org_id: r.org_id } }))),
+      ...((me && !me.error && Array.isArray(me.data) ? me.data : []).map((r) => ({ row: r, table: MEMBER_OAUTH_TABLE, match: { org_id: r.org_id, user_id: r.user_id } }))),
+    ].filter((c) => c.row.last_refresh_ok !== false && c.row.access_token && c.row.refresh_token && Number.isFinite(new Date(c.row.updated_at).getTime()));
+    if (!cand.length) return null;
+    cand.sort((a, b) => new Date(b.row.updated_at).getTime() - new Date(a.row.updated_at).getTime());
+    const best = cand[0];
+    const mine = new Date(row.updated_at).getTime();
+    if (Number.isFinite(mine) && new Date(best.row.updated_at).getTime() <= mine) return null;
+    if (best.row.access_token === row.access_token) return null;
+    return best;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, fetchImpl }) {
   const nowMs = now ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
@@ -409,7 +454,7 @@ async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, f
   let row = null;
   try {
     const { data, error } = await whereMatch(
-      db.from(table).select("org_id,access_token,refresh_token,expires_at,figma_user_id,figma_email,figma_handle,scopes,is_active"),
+      db.from(table).select(GRANT_COLUMNS),
       match,
     ).maybeSingle();
     if (error) return null;
@@ -420,6 +465,18 @@ async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, f
 
   if (!row) return null;
   if (row.is_active === false) return null;
+
+  // ★ The newest grant for this Figma account, when another row holds it.
+  // Identity words stay this row's; a refresh writes back to the row it read.
+  const own = row;
+  let sharedGrant = false;
+  const newer = await newestGrantFor(db, row);
+  if (newer) {
+    row = { ...newer.row, figma_email: own.figma_email ?? newer.row.figma_email, figma_handle: own.figma_handle ?? newer.row.figma_handle };
+    table = newer.table;
+    match = newer.match;
+    sharedGrant = true;
+  }
 
   let sealingKey = key;
   let previous = previousKey;
@@ -486,7 +543,7 @@ async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, f
   return {
     token: accessToken,
     source: "oauth",
-    reason: refreshed ? "oauth-refreshed" : "oauth-credential",
+    reason: (refreshed ? "oauth-refreshed" : "oauth-credential") + (sharedGrant ? "-newest-grant" : ""),
     expiresAt,
     refreshed,
     figmaEmail: row.figma_email ?? null,

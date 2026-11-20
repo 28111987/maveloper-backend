@@ -117,6 +117,21 @@ export function figmaCannotOpen(accountName) {
   return "Mavloper could not open this Figma file with the Figma account (" + String(accountName || "this space's") + "). " + CONNECT_OR_SHARE + "that account" + SEAT_THEN;
 }
 
+/**
+ * 21 NOV: Figma answered 401. The account's connection has ended (Figma keeps
+ * one grant per account and app; a revoked or replaced grant answers 401), so
+ * the file is not the problem and sharing it would not help. Same opening
+ * words as the refusal above, so every reader that recognises Mavloper's own
+ * sentence still does (the automation, the Queue's causes).
+ */
+export function figmaConnectionEnded(accountName) {
+  const a = String(accountName || "this space's");
+  return (
+    "Mavloper could not open this Figma file with the Figma account (" + a + "): its connection has ended. " +
+    "Reconnect it on the Admin page, or connect your own with Connect my Figma account on Generate, then resubmit."
+  );
+}
+
 /** K6 STOP. "(Admin)" for an Admin and for the platform owner alike, as the rule words it. */
 export function stoppedBy(name) {
   return `Stopped by ${name} (Admin).`;
@@ -166,6 +181,8 @@ const OURS_RE = [
   // 20 NOV 17:31 wording (short, connect first). Rows already written keep theirs and match above.
   /Mavloper could not open this Figma file with the Figma account \(.+?\)\. Connect the Figma account that owns it on Generate, or share the file with that account \(Dev or Full seat\), then resubmit\./,
   /Mavloper could not open this Figma file with your account \(.+?\) or the space's \(.+?\)\. Connect the Figma account that owns it on Generate, or share the file with either \(Dev or Full seat\), then resubmit\./,
+  // 21 NOV: the connection ended (Figma 401)
+  /Mavloper could not open this Figma file with the Figma account \(.+?\): its connection has ended\. Reconnect it on the Admin page, or connect your own with Connect my Figma account on Generate, then resubmit\./,
   // the 19 NOV wording of the no-account sentence, on rows already written
   /This space has no Figma account connected yet\. An Admin of the space connects one on the Admin page, then orders can be placed\./,
   /Stopped by .+ \(Admin\)\.(?: A late result arrived at .+)?$/,

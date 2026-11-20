@@ -15,7 +15,7 @@ import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
 import { createRouteDoors } from "./route-doors.js";
 import { createOrderActions } from "./order-actions.js";
-import { plainReason, figmaCannotOpen, figmaCannotOpenEither, accountNameOf, NO_FIGMA_ACCOUNT, NO_SPACE_FIGMA, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
+import { plainReason, figmaCannotOpen, figmaCannotOpenEither, figmaConnectionEnded, accountNameOf, NO_FIGMA_ACCOUNT, NO_SPACE_FIGMA, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
 import { buildDeliveryZip, mergeCompilerSlices } from "./zip-delivery.js";
 import { persistSliceMapToDrafts } from "./drafts-persist.js";
 import { pruneImages } from "./dropbox-prune.js";
@@ -3309,7 +3309,9 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
         details: refusedAccess
           ? (figmaCred.memberRefused
               ? figmaCannotOpenEither(accountNameOf({ source: "member-oauth", label: figmaCred.memberRefused.label }), accountNameOf(figmaCred))
-              : figmaCannotOpen(accountNameOf(figmaCred)))
+              : /rejected the token \(401\)/.test(msg)
+                ? figmaConnectionEnded(accountNameOf(figmaCred))
+                : figmaCannotOpen(accountNameOf(figmaCred)))
           : msg,
         candidates: figmaErr.candidates ?? undefined, // structured list for picker UI
         requestId: req.id,

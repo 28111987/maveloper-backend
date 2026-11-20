@@ -24,7 +24,8 @@ import { resealAll } from "./figma-credential-reseal.js";
 import { createRequireSpaceAdmin } from "./figma-credential-routes.js";
 import { createFigmaPlatformTokenRoutes, readExpiryDate, accountRefusal, spaceState } from "./figma-platform-token.js";
 import { accountNameOf, figmaCannotOpenEither, plainReason, NO_SPACE_FIGMA, NO_FIGMA_ACCOUNT } from "./order-words.js";
-import { checkFileAccess, decideFigmaAccess, refusedOne, refusedBoth, readsAsSpaceInstead, CHECK_URL, CHECK_TIMEOUT_MS } from "./figma-access-check.js";
+import { checkFileAccess, decideFigmaAccess, refusedOne, refusedBoth, readsAsSpaceInstead, connectionEnded, CHECK_URL, CHECK_TIMEOUT_MS } from "./figma-access-check.js";
+import { figmaConnectionEnded } from "./order-words.js";
 
 let pass = 0, fail = 0;
 async function t(name, fn) {
@@ -111,10 +112,17 @@ await t("P3 the same person's row in ANOTHER space is never used", async () => {
   const db = makeDb({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_B, U1, "one@x.test", ACC1, REF1)] });
   ok((await resolveMemberFigmaOAuth(ORG_A, U1, { db, key: KEY })) === null);
 });
-await t("P4 the same Figma account in two spaces: each space reads its own row", async () => {
-  const db = makeDb({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@x.test", ACC1, REF1), memberRow(ORG_B, U1, "one@x.test", ACC2, REF2)] });
-  ok((await resolveMemberFigmaOAuth(ORG_A, U1, { db, key: KEY })).token === ACC1);
-  ok((await resolveMemberFigmaOAuth(ORG_B, U1, { db, key: KEY })).token === ACC2);
+// ★ 21 NOV: REWRITTEN. P4 asserted "each space reads its own row" for one Figma
+// account connected in two spaces. Figma keeps ONE grant per account, so the
+// older row's token is dead (measured on production 20 NOV). Both now read with
+// the newer grant; a tie (written the same instant) still reads its own row.
+await t("P4 the same Figma account in two spaces: both read with the grant written last", async () => {
+  const t1 = "2026-11-19T12:00:00.000Z", t2 = "2026-11-20T12:00:00.000Z";
+  const db = makeDb({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@x.test", ACC1, REF1, { updated_at: t1 }), memberRow(ORG_B, U1, "one@x.test", ACC2, REF2, { updated_at: t2 })] });
+  ok((await resolveMemberFigmaOAuth(ORG_A, U1, { db, key: KEY })).token === ACC2, "older row reads with the newer grant");
+  ok((await resolveMemberFigmaOAuth(ORG_B, U1, { db, key: KEY })).token === ACC2, "newer row reads its own");
+  const tie = makeDb({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@x.test", ACC1, REF1, { updated_at: t1 }), memberRow(ORG_B, U1, "one@x.test", ACC2, REF2, { updated_at: t1 })] });
+  ok((await resolveMemberFigmaOAuth(ORG_A, U1, { db: tie, key: KEY })).token === ACC1, "a tie reads its own row");
 });
 await t("P5 no person, a non-uuid person, no space: null without a query", async () => {
   const db = makeDb({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@x.test", ACC1, REF1)] });
@@ -476,6 +484,67 @@ await t("K1 rows sealed with the previous key are re-sealed with the current one
   ok(r2.ran && r2.member.tableAbsent === true, JSON.stringify(r2));
 });
 
+// -- G ------------------------------------------------------------------------
+// 21 NOV, MEASURED ON PRODUCTION: Figma keeps ONE grant per Figma account per
+// app. design@mavlers.com connected to R&D at 17:30:21 UTC; the Mavlers space
+// (06 Oct) and a personal connection (19 Nov) to the same account answered 401
+// from then. The row still decides WHO may read with an account; the token is
+// the newest one written for that Figma account.
+console.log("\nG  one Figma account, one grant: the newest token wins");
+const FIGMA_DESIGN = "1261019814302790804";
+const ORG_C = "33333333-3333-4333-8333-333333333333";
+const at = (iso) => new Date(iso).toISOString();
+const spaceGrant = (org, acc, ref, updated, extra = {}) => ({
+  org_id: org, access_token: seal(acc), refresh_token: seal(ref), expires_at: future(), figma_user_id: FIGMA_DESIGN,
+  figma_email: "design@mavlers.test", figma_handle: "design", scopes: "x", is_active: true,
+  connected_at: updated, updated_at: updated, last_refresh_at: null, last_refresh_ok: null, last_refresh_note: null, ...extra,
+});
+const OLD = at("2026-10-06T17:36:51Z"), MID = at("2026-11-19T12:09:47Z"), NEW = at("2026-11-20T17:30:21Z");
+await t("G1 Mavlers' old row reads with R&D's newer token for the same Figma account", async () => {
+  const db = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD), spaceGrant(ORG_B, ACC2, REF2, NEW)], [MEMBER_OAUTH_TABLE]: [] });
+  const r = await resolveFigmaOAuth(ORG_A, { db, key: KEY });
+  ok(r && r.token === ACC2 && /newest-grant$/.test(r.reason) && r.figmaEmail === "design@mavlers.test", JSON.stringify(r && { reason: r.reason }));
+});
+await t("G2 a person's newer connection to the same account is the token a space uses", async () => {
+  const mem = memberRow(ORG_C, U1, "one@x.test", ACC2, REF2, { figma_user_id: FIGMA_DESIGN, updated_at: MID });
+  const db = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD)], [MEMBER_OAUTH_TABLE]: [mem] });
+  const r = await resolveFigmaOAuth(ORG_A, { db, key: KEY });
+  ok(r && r.token === ACC2, "space used the member's newer grant");
+});
+await t("G3 the newest row's own read is unchanged, and so is a different Figma account", async () => {
+  const other = spaceGrant(ORG_B, ACC2, REF2, NEW, { figma_user_id: "999" });
+  const db = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD), other], [MEMBER_OAUTH_TABLE]: [] });
+  const a = await resolveFigmaOAuth(ORG_A, { db, key: KEY });
+  const b = await resolveFigmaOAuth(ORG_B, { db, key: KEY });
+  ok(a.token === ACC1 && a.reason === "oauth-credential" && b.token === ACC2 && b.reason === "oauth-credential", JSON.stringify([a.reason, b.reason]));
+});
+await t("G4 a newer row whose renewal failed, or that is switched off, is never the grant", async () => {
+  const db1 = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD), spaceGrant(ORG_B, ACC2, REF2, NEW, { last_refresh_ok: false })], [MEMBER_OAUTH_TABLE]: [] });
+  const db2 = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD), spaceGrant(ORG_B, ACC2, REF2, NEW, { is_active: false })], [MEMBER_OAUTH_TABLE]: [] });
+  ok((await resolveFigmaOAuth(ORG_A, { db: db1, key: KEY })).token === ACC1, "failed renewal skipped");
+  ok((await resolveFigmaOAuth(ORG_A, { db: db2, key: KEY })).token === ACC1, "inactive skipped");
+});
+await t("G5 no row of its own, no account: another space's grant authorises nobody else", async () => {
+  const db = makeDb({ org_figma_oauth: [spaceGrant(ORG_B, ACC2, REF2, NEW)], [MEMBER_OAUTH_TABLE]: [memberRow(ORG_B, U2, "two@x.test", ACC2, REF2, { figma_user_id: FIGMA_DESIGN, updated_at: NEW })] });
+  ok((await resolveFigmaOAuth(ORG_A, { db, key: KEY })) === null, "space without a row");
+  ok((await resolveMemberFigmaOAuth(ORG_B, U1, { db, key: KEY })) === null, "person without a row");
+});
+await t("G6 a renewal of the shared grant is written to the row that holds it, never to the old row", async () => {
+  const NEWACC = "figu_" + "N".repeat(40), NEWREF = "figur_" + "R".repeat(40);
+  const holder = spaceGrant(ORG_B, ACC2, REF2, NEW, { expires_at: new Date(Date.now() + 60e3).toISOString() });
+  const old = spaceGrant(ORG_A, ACC1, REF1, OLD);
+  const db = makeDb({ org_figma_oauth: [old, holder], [MEMBER_OAUTH_TABLE]: [] });
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ access_token: NEWACC, refresh_token: NEWREF, expires_in: 7776000 }) });
+  const r = await resolveFigmaOAuth(ORG_A, { db, key: KEY, env: ENV, fetchImpl });
+  ok(r && r.token === NEWACC && r.refreshed, "renewed");
+  ok(openToken(holder.access_token, KEY).token === NEWACC, "the holder carries the new token");
+  ok(openToken(old.access_token, KEY).token === ACC1, "the old row is untouched");
+});
+await t("G7 the database not answering the lookup leaves the row's own token, as before", async () => {
+  const db = makeDb({ org_figma_oauth: [spaceGrant(ORG_A, ACC1, REF1, OLD)] }); // no member table: lookup errors
+  ok((await resolveFigmaOAuth(ORG_A, { db, key: KEY })).token === ACC1);
+});
+
 // -- C ------------------------------------------------------------------------
 // 20 NOV, THE OWNER: refuse a file at submission when the account the order
 // will read with cannot open it. Expected values are Figma's documented
@@ -648,6 +717,21 @@ await t("C16 never slower than 3 s: Figma that does not answer is unknown when t
   const t0 = Date.now();
   const a = await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: hang, timeoutMs: 150 });
   ok(a.verdict === "unknown" && a.why === "no-answer" && Date.now() - t0 < 1000, JSON.stringify(a));
+});
+
+await t("C17 a 401 is a connection that has ended: refused, and the words say reconnect, not share", async () => {
+  const a = await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: async () => answer(401, { status: 401, err: "Invalid token" }) });
+  ok(a.verdict === "refused" && a.why === "token", JSON.stringify(a));
+  const sp = { token: "S", source: "oauth" };
+  const d = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: null, words: W, ask: ASK({ S: { verdict: "refused", why: "token" } }) });
+  ok(d.verdict === "refused" && d.message === connectionEnded(W.space) && !/share/i.test(d.message), d.message);
+  const m = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: { token: "M", source: "oauth" }, memberCred: { token: "M" }, words: W, ask: ASK({ M: { verdict: "refused", why: "token" } }) });
+  ok(m.message === connectionEnded(W.mine, { own: true }), m.message);
+  ok(![connectionEnded("x"), connectionEnded("x", { own: true })].some((x) => /[\u2014\u2013]/.test(x)), "no dash");
+});
+await t("C18 the order's sentence for a 401 opens like Mavloper's own refusal, so every reader still knows it", async () => {
+  const s = figmaConnectionEnded("design");
+  ok(s.startsWith("Mavloper could not open this Figma file with ") && /connection has ended/.test(s) && plainReason("Figma fetch failed: " + s) === s, s);
 });
 
 // -- W ------------------------------------------------------------------------

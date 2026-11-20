@@ -124,8 +124,16 @@ export async function fetchFigmaNode({ fileKey, nodeId, token, fetchImpl = fetch
     clearTimeout(timer);
   }
 
-  if (response.status === 401 || response.status === 403) {
-    throw new Error("Figma API rejected the token (401/403). Check FIGMA_API_TOKEN env var has File content read scope.");
+  // 21 NOV: the two codes are said apart. 401 is a token Figma no longer
+  // accepts (a connection replaced or revoked); 403 is a refusal, and Figma's
+  // own words say which. Both keep "rejected the token" for every reader of it.
+  if (response.status === 401) {
+    throw new Error("Figma API rejected the token (401): its connection has ended.");
+  }
+  if (response.status === 403) {
+    let said = "";
+    try { const b = await response.json(); said = String((b && (b.err || b.message)) || "").slice(0, 160); } catch { said = ""; }
+    throw new Error("Figma API rejected the token (403)" + (said ? ": " + said : "") + ".");
   }
   if (response.status === 404) {
     throw new Error("Figma file or node not found (404). Check the URL and that the token has access to the file.");

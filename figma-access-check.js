@@ -73,6 +73,10 @@ export async function checkFileAccess({ token, fileKey, fetchImpl = globalThis.f
     return { verdict: "open", fileName: typeof name === "string" ? name.slice(0, 120) : null };
   }
   const said = await figmaSaid(r);
+  // 21 NOV: 401 is a connection Figma no longer accepts (its grant was replaced
+  // or revoked). The order would fail with certainty, so it is refused, and the
+  // words say to reconnect, not to share the file.
+  if (r.status === 401) return { verdict: "refused", status: 401, said, why: "token" };
   if (r.status === 404) return { verdict: "refused", status: 404, said };
   if (r.status === 403) {
     // A token made without file_metadata:read cannot ask this question at all.
@@ -110,6 +114,12 @@ export function refusedBoth(mine, space) {
   );
 }
 
+export function connectionEnded(account, { own = false } = {}) {
+  return own
+    ? "Your Figma connection (" + (account || "yours") + ") has ended. Reconnect it with Connect my Figma account."
+    : (account || "This space's Figma account") + "'s connection to Mavloper has ended. Reconnect it on the Admin page, or connect your own with Connect my Figma account.";
+}
+
 export function readsAsSpaceInstead(mine, space) {
   return "Your account (" + (mine || "yours") + ") can't open this file, so " + (space || "the space's account") + " will read it.";
 }
@@ -139,17 +149,17 @@ export async function decideFigmaAccess({ refuseForSpace, noAccountWords, spaceC
     const a = await ask(memberCred.token);
     if (a.verdict === "open") return out("open", "own", words.mine, { fileName: a.fileName });
     if (a.verdict === "unknown") return out("unknown", "own", words.mine, { why: a.why });
-    if (!spaceToken || spaceToken === memberCred.token) return out("refused", "own", words.mine, { message: refusedOne(words.mine) });
+    if (!spaceToken || spaceToken === memberCred.token) return out("refused", "own", words.mine, { why: a.why || null, message: a.why === "token" ? connectionEnded(words.mine, { own: true }) : refusedOne(words.mine) });
     const b = await ask(spaceToken);
     if (b.verdict === "open") return out("open", spaceKind, words.space, { fileName: b.fileName, message: readsAsSpaceInstead(words.mine, words.space) });
     if (b.verdict === "unknown") return out("unknown", spaceKind, words.space, { why: b.why });
-    return out("refused", "own", words.mine, { message: refusedBoth(words.mine, words.space) });
+    return out("refused", "own", words.mine, { why: b.why || null, message: b.why === "token" ? connectionEnded(words.space) : refusedBoth(words.mine, words.space) });
   }
   if (!spaceToken) return out("blocked", "none", null, { message: noAccountWords.none });
   const c = await ask(spaceToken);
   if (c.verdict === "open") return out("open", spaceKind, words.space, { fileName: c.fileName });
   if (c.verdict === "unknown") return out("unknown", spaceKind, words.space, { why: c.why });
-  return out("refused", spaceKind, words.space, { message: refusedOne(words.space, { mavlers: spaceKind === "mavlers" }) });
+  return out("refused", spaceKind, words.space, { why: c.why || null, message: c.why === "token" ? connectionEnded(words.space) : refusedOne(words.space, { mavlers: spaceKind === "mavlers" }) });
 }
 
-export default { checkFileAccess, decideFigmaAccess, refusedOne, refusedBoth, readsAsSpaceInstead, CONNECT_CTA, CHECK_URL, CHECK_CACHE_MS, CHECK_TIMEOUT_MS };
+export default { checkFileAccess, decideFigmaAccess, refusedOne, refusedBoth, readsAsSpaceInstead, connectionEnded, CONNECT_CTA, CHECK_URL, CHECK_CACHE_MS, CHECK_TIMEOUT_MS };
