@@ -51,6 +51,7 @@ import {
   fetchFigmaIdentity,
   OAUTH_TABLE,
   DEFAULT_SCOPES,
+  handOverGrant,
 } from "./figma-oauth.js";
 
 /** Every column the console's read shape may ever show. NO token column. */
@@ -310,6 +311,8 @@ export function createFigmaOAuthRoutes({ app, supabaseAdmin, requireAuth, log, e
   // =========================================================================
   app.delete("/os/spaces/:slug/figma-oauth", requireAuth, requireSpaceAdmin, async (req, res) => {
     try {
+      // 21 NOV: this row may hold the only live token for its Figma account.
+      await handOverGrant(supabaseAdmin, OAUTH_TABLE, { org_id: req.space.id });
       const { data, error } = await supabaseAdmin
         .from(OAUTH_TABLE)
         .update({ is_active: false, access_token: "revoked", refresh_token: "revoked", updated_at: new Date().toISOString() })

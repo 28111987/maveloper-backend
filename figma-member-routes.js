@@ -40,7 +40,7 @@ import { readKey, sealToken, KEY_ENV } from "./figma-credential-crypto.js";
 import { CREDENTIAL_TABLE, resolveFigmaToken } from "./figma-credential.js";
 import {
   buildAuthorizeUrl, exchangeCode, fetchFigmaIdentity, OAUTH_TABLE, MEMBER_OAUTH_TABLE, DEFAULT_SCOPES, normalisedUserId,
-  resolveFigmaOAuth, resolveMemberFigmaOAuth, shapeOAuthResolution,
+  resolveFigmaOAuth, resolveMemberFigmaOAuth, shapeOAuthResolution, handOverGrant,
 } from "./figma-oauth.js";
 import { platformOwners } from "./spaces.js";
 import { checkFileAccess, decideFigmaAccess, CHECK_CACHE_MS } from "./figma-access-check.js";
@@ -413,6 +413,8 @@ export function createFigmaMemberRoutes({ app, supabaseAdmin, requireAuth, log, 
   // =========================================================================
   app.delete("/os/spaces/:slug/me/figma-oauth", requireAuth, requireSpaceSeat, async (req, res) => {
     try {
+      // 21 NOV: this row may hold the only live token for its Figma account.
+      await handOverGrant(supabaseAdmin, MEMBER_OAUTH_TABLE, { org_id: req.space.id, user_id: normalisedUserId(req.me.userId) || req.me.userId });
       const { data, error } = await supabaseAdmin
         .from(MEMBER_OAUTH_TABLE)
         .delete()
@@ -549,6 +551,7 @@ export function createFigmaMemberRoutes({ app, supabaseAdmin, requireAuth, log, 
     const userId = normalisedUserId(req.params.userId);
     if (!userId) return sendSafe(res, 400, { error: "Not a member id" }, log);
     try {
+      await handOverGrant(supabaseAdmin, MEMBER_OAUTH_TABLE, { org_id: req.space.id, user_id: userId });
       const { data, error } = await supabaseAdmin
         .from(MEMBER_OAUTH_TABLE)
         .delete()

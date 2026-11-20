@@ -445,6 +445,59 @@ async function newestGrantFor(db, row) {
   }
 }
 
+/**
+ * ★ HAND THE GRANT OVER BEFORE A CONNECTION LEAVES (21 NOV 2026). With one
+ * grant per Figma account, the newest row may hold the ONLY token Figma still
+ * honours for that account; the other rows' tokens are dead. Disconnecting
+ * that row (a person's own, an Admin removing it, or a space disconnecting)
+ * would leave every other space and person on that account answering 401.
+ * Mavloper never revokes at Figma, so the grant itself lives on: before the
+ * row goes, its sealed token pair is copied to every other active row of the
+ * same Figma account (sealed values move as they are; the key is the same),
+ * stamped with the leaving row's write time so the newest-grant rule keeps
+ * reading it. Best effort: a failure here never blocks the disconnect.
+ * Returns how many rows took the grant over.
+ */
+export async function handOverGrant(db, table, match) {
+  try {
+    const { data: leaving, error } = await whereMatch(db.from(table).select(GRANT_COLUMNS), match).maybeSingle();
+    if (error || !leaving || leaving.is_active === false || !leaving.figma_user_id) return 0;
+    if (!leaving.access_token || !leaving.refresh_token || leaving.last_refresh_ok === false) return 0;
+    const newest = await newestGrantFor(db, leaving);
+    if (newest) return 0; // another row already holds a newer grant: nothing of value leaves
+    const id = leaving.figma_user_id;
+    const [sp, me] = await Promise.all([
+      db.from(OAUTH_TABLE).select("org_id,is_active").eq("figma_user_id", id).eq("is_active", true),
+      db.from(MEMBER_OAUTH_TABLE).select("org_id,user_id,is_active").eq("figma_user_id", id).eq("is_active", true),
+    ]);
+    const same = (m) => Object.entries(match).every(([k, v]) => m[k] === v);
+    const targets = [
+      ...((sp && !sp.error && Array.isArray(sp.data) ? sp.data : []).map((r) => ({ table: OAUTH_TABLE, match: { org_id: r.org_id } }))),
+      ...((me && !me.error && Array.isArray(me.data) ? me.data : []).map((r) => ({ table: MEMBER_OAUTH_TABLE, match: { org_id: r.org_id, user_id: r.user_id } }))),
+    ].filter((t) => !(t.table === table && same(t.match)));
+    let moved = 0;
+    for (const t of targets) {
+      try {
+        await whereMatch(
+          db.from(t.table).update({
+            access_token: leaving.access_token,
+            refresh_token: leaving.refresh_token,
+            expires_at: leaving.expires_at,
+            updated_at: leaving.updated_at,
+            last_refresh_ok: null,
+            last_refresh_note: null,
+          }),
+          t.match,
+        );
+        moved++;
+      } catch { /* the next row may still take it */ }
+    }
+    return moved;
+  } catch {
+    return 0;
+  }
+}
+
 async function resolveOAuthRow({ table, match, db, key, previousKey, now, env, fetchImpl }) {
   const nowMs = now ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();

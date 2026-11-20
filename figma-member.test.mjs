@@ -17,7 +17,7 @@
  */
 
 import fs from "node:fs";
-import { resolveMemberFigmaOAuth, resolveFigmaOAuth, MEMBER_OAUTH_TABLE, normalisedUserId, shapeMemberOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
+import { resolveMemberFigmaOAuth, resolveFigmaOAuth, handOverGrant, MEMBER_OAUTH_TABLE, normalisedUserId, shapeMemberOAuthResolution, figmaCredentialProvenanceLine } from "./figma-oauth.js";
 import { createFigmaMemberRoutes, spaceRequiresFigma, describeSpaceDefault, refuseWithoutSpaceFigma, readAgainAsSpace, MEMBER_PUBLIC_COLUMNS } from "./figma-member-routes.js";
 import { readKey, sealToken, isSealed, openToken } from "./figma-credential-crypto.js";
 import { resealAll } from "./figma-credential-reseal.js";
@@ -732,6 +732,47 @@ await t("C17 a 401 is a connection that has ended: refused, and the words say re
 await t("C18 the order's sentence for a 401 opens like Mavloper's own refusal, so every reader still knows it", async () => {
   const s = figmaConnectionEnded("design");
   ok(s.startsWith("Mavloper could not open this Figma file with ") && /connection has ended/.test(s) && plainReason("Figma fetch failed: " + s) === s, s);
+});
+
+// -- H ------------------------------------------------------------------------
+// 21 NOV: with one grant per Figma account, the newest row may hold the ONLY
+// live token. Removing it must not leave the other spaces on 401.
+console.log("\nH  a connection that leaves hands its grant over");
+const hSpace = (org, acc, ref, updated, extra = {}) => ({
+  org_id: org, access_token: seal(acc), refresh_token: seal(ref), expires_at: future(), figma_user_id: "F1",
+  figma_email: "design@mavlers.test", figma_handle: "design", scopes: "x", is_active: true,
+  updated_at: updated, last_refresh_ok: null, last_refresh_note: null, ...extra,
+});
+const H_OLD = "2026-10-06T17:36:51.000Z", H_NEW = "2026-11-20T17:30:21.000Z";
+await t("H1 a person disconnects the account's newest grant: the space on that account keeps working", async () => {
+  const holder = memberRow(ORG_A, U1, "one@acme.test", ACC2, REF2, { figma_user_id: "F1", updated_at: H_NEW });
+  const tables = world({ org_figma_oauth: [hSpace(ORG_A, ACC1, REF1, H_OLD), hSpace(ORG_B, ACC1, REF1, H_OLD)], [MEMBER_OAUTH_TABLE]: [holder] });
+  const { app } = mount(tables);
+  const r = await run(app.routes["delete /os/spaces/:slug/me/figma-oauth"], { user: { email: "one@acme.test", id: U1 }, params: { slug: "acme" }, body: {} });
+  ok(r.statusCode === 200 && tables[MEMBER_OAUTH_TABLE].length === 0, "disconnected");
+  const db = makeDb(tables);
+  ok((await resolveFigmaOAuth(ORG_A, { db, key: KEY })).token === ACC2, "space A reads with the handed-over grant");
+  ok((await resolveFigmaOAuth(ORG_B, { db, key: KEY })).token === ACC2, "space B too");
+});
+await t("H2 a row that does not hold the newest grant leaves without touching anyone", async () => {
+  const tables = { org_figma_oauth: [hSpace(ORG_A, ACC1, REF1, H_OLD), hSpace(ORG_B, ACC2, REF2, H_NEW)], [MEMBER_OAUTH_TABLE]: [] };
+  const db = makeDb(tables);
+  const before = tables.org_figma_oauth[1].access_token;
+  ok((await handOverGrant(db, "org_figma_oauth", { org_id: ORG_A })) === 0, "nothing moved");
+  ok(tables.org_figma_oauth[1].access_token === before, "the holder is untouched");
+});
+await t("H3 a space disconnecting the newest grant hands it to the person on the same account", async () => {
+  const mem = memberRow(ORG_C, U1, "one@x.test", ACC1, REF1, { figma_user_id: "F1", updated_at: H_OLD });
+  const tables = { org_figma_oauth: [hSpace(ORG_A, ACC2, REF2, H_NEW)], [MEMBER_OAUTH_TABLE]: [mem] };
+  const db = makeDb(tables);
+  ok((await handOverGrant(db, "org_figma_oauth", { org_id: ORG_A })) === 1, "one row took it");
+  tables.org_figma_oauth[0].is_active = false; // the disconnect itself
+  ok((await resolveMemberFigmaOAuth(ORG_C, U1, { db, key: KEY })).token === ACC2, "the person reads with it");
+});
+await t("H4 a grant whose renewal failed is not handed over, and a database that does not answer never blocks", async () => {
+  const tables = { org_figma_oauth: [hSpace(ORG_A, ACC2, REF2, H_NEW, { last_refresh_ok: false }), hSpace(ORG_B, ACC1, REF1, H_OLD)], [MEMBER_OAUTH_TABLE]: [] };
+  ok((await handOverGrant(makeDb(tables), "org_figma_oauth", { org_id: ORG_A })) === 0, "dead grant not spread");
+  ok((await handOverGrant({ from() { throw new Error("down"); } }, "org_figma_oauth", { org_id: ORG_A })) === 0, "no throw");
 });
 
 // -- W ------------------------------------------------------------------------
