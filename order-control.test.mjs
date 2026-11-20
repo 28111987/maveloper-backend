@@ -805,7 +805,7 @@ async function S7() {
     // space B's credential in the seed: OAuth row (sealed with a key this
     // server does not hold) and a pasted token labelled "grid B"; the resolver
     // decides which one read the design, and the sentence must name it.
-    const want = /^Mavloper could not open this Figma file with the Figma account connected to this space \((.+)\)\. Make sure that account can open the file: it needs a Dev or Full seat in the team that owns it\.$/;
+    const want = /^Mavloper could not open this Figma file with the Figma account \((.+)\)\. Connect the Figma account that owns it on Generate, or share the file with that account \(Dev or Full seat\), then resubmit\.$/;
     record("S7", "space B, Figma answers 403", "T2 the exact sentence, naming the account", true, want.test(text || ""));
     record("S7", "space B, Figma answers 403", "T2 no internal names", true, !PLAIN.test(text || "") && NO_EM_DASH(text));
     record("S7", "space B, Figma answers 403", "seen text", "(recorded)", "(recorded)");

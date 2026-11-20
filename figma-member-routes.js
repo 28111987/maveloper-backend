@@ -18,6 +18,7 @@
  *   GET    /os/spaces/:slug/me/figma-oauth/start     mint state, authorize URL     any seat in the space
  *   POST   /os/spaces/:slug/me/figma-oauth/callback  exchange, seal, store         any seat in the space
  *   DELETE /os/spaces/:slug/me/figma-oauth           disconnect mine               any seat in the space
+ *   POST   /os/spaces/:slug/me/figma-check           can my order open this file?  any seat in the space (20 NOV)
  *   GET    /os/spaces/:slug/figma-accounts           every member's account        space admin or platform owner
  *   DELETE /os/spaces/:slug/figma-accounts/:userId   remove a member's own one     space admin or platform owner
  *
@@ -34,11 +35,16 @@
  */
 
 import crypto from "node:crypto";
-import { sendSafe } from "./figma-credential-routes.js";
+import { sendSafe, parseFigmaFileKey } from "./figma-credential-routes.js";
 import { readKey, sealToken, KEY_ENV } from "./figma-credential-crypto.js";
-import { CREDENTIAL_TABLE } from "./figma-credential.js";
-import { buildAuthorizeUrl, exchangeCode, fetchFigmaIdentity, OAUTH_TABLE, MEMBER_OAUTH_TABLE, DEFAULT_SCOPES, normalisedUserId } from "./figma-oauth.js";
+import { CREDENTIAL_TABLE, resolveFigmaToken } from "./figma-credential.js";
+import {
+  buildAuthorizeUrl, exchangeCode, fetchFigmaIdentity, OAUTH_TABLE, MEMBER_OAUTH_TABLE, DEFAULT_SCOPES, normalisedUserId,
+  resolveFigmaOAuth, resolveMemberFigmaOAuth, shapeOAuthResolution,
+} from "./figma-oauth.js";
 import { platformOwners } from "./spaces.js";
+import { checkFileAccess, decideFigmaAccess, CHECK_CACHE_MS } from "./figma-access-check.js";
+import { NO_SPACE_FIGMA, NO_FIGMA_ACCOUNT } from "./order-words.js";
 
 /** Every column any response may be built from. NO token column. */
 export const MEMBER_PUBLIC_COLUMNS =
@@ -425,6 +431,81 @@ export function createFigmaMemberRoutes({ app, supabaseAdmin, requireAuth, log, 
     } catch (err) {
       log("error", "figma-member: disconnect failed", { slug: req.space.slug, error: err.message });
       return sendSafe(res, 500, { error: "Could not disconnect that Figma account", details: err.message }, log);
+    }
+  });
+
+  // =========================================================================
+  // POST /me/figma-check - CAN THE ACCOUNT MY ORDER WILL READ WITH OPEN THIS FILE?
+  // =========================================================================
+  // 20 NOV, THE OWNER: refuse a file at submission when the account the order
+  // will read with cannot open it, instead of failing the order minutes later.
+  // The credentials are resolved by the SAME calls, in the SAME order, as
+  // server.js /generate-from-figma; figma-access-check.js holds the decision.
+  // One Tier 3 call per account asked (GET /v1/files/:key/meta), cached.
+  // Never returns a token: the body is built field by field from the verdict.
+  const checks = new Map();
+  const RECHECK_REFUSED_MS = 30 * 1000;
+  const CHECKS_MAX = 500;
+  function cachedAsk(fileKey) {
+    return async (token) => {
+      const k = crypto.createHash("sha256").update(String(token)).digest("hex").slice(0, 24) + ":" + fileKey;
+      const t = now();
+      const hit = checks.get(k);
+      if (hit && hit.until > t) return hit.answer;
+      const answer = await checkFileAccess({ token, fileKey, fetchImpl: doFetch });
+      const ttl = answer.verdict === "open" ? CHECK_CACHE_MS : answer.verdict === "refused" ? RECHECK_REFUSED_MS : 0;
+      if (ttl > 0) {
+        if (checks.size >= CHECKS_MAX) for (const [key, v] of checks) if (v.until <= t || checks.size >= CHECKS_MAX) checks.delete(key);
+        checks.set(k, { until: t + ttl, answer });
+      }
+      return answer;
+    };
+  }
+
+  app.post("/os/spaces/:slug/me/figma-check", requireAuth, requireSpaceSeat, async (req, res) => {
+    const figmaUrl = typeof req.body?.figmaUrl === "string" ? req.body.figmaUrl.trim() : "";
+    const fileKey = parseFigmaFileKey(figmaUrl);
+    if (!fileKey) {
+      return sendSafe(res, 400, { error: "Not a Figma file link", details: "Paste a figma.com/design or /file link to one email frame." }, log);
+    }
+    try {
+      const orgId = req.space.id;
+      // env is process.env in production (server.js mounts with it), which is
+      // what the order path's resolvers read when they are given none.
+      const oauthCred = await resolveFigmaOAuth(orgId, { db: supabaseAdmin, env, fetchImpl: doFetch });
+      const spaceCred = oauthCred
+        ? shapeOAuthResolution(oauthCred, orgId)
+        : await resolveFigmaToken(orgId, { db: supabaseAdmin, globalToken: env.FIGMA_API_TOKEN, env });
+      const memberCred = await resolveMemberFigmaOAuth(orgId, req.me.userId, { db: supabaseAdmin, env, fetchImpl: doFetch });
+      const figmaRequired = await spaceRequiresFigma(supabaseAdmin, orgId);
+      const spaceKind = spaceCred && (spaceCred.source === "oauth" || spaceCred.source === "org") ? "space" : "mavlers";
+      const words = {
+        mine: memberCred ? memberCred.figmaEmail || memberCred.figmaHandle || "your own Figma account" : null,
+        space: spaceKind === "mavlers"
+          ? "Mavloper's Figma account"
+          : (oauthCred && (oauthCred.figmaEmail || oauthCred.figmaHandle)) || (spaceCred && spaceCred.label) || "this space's Figma account",
+        spaceKind,
+      };
+      const d = await decideFigmaAccess({
+        refuseForSpace: refuseWithoutSpaceFigma(spaceCred, figmaRequired),
+        noAccountWords: { space: NO_SPACE_FIGMA, none: NO_FIGMA_ACCOUNT },
+        spaceCred,
+        memberCred,
+        words,
+        ask: cachedAsk(fileKey),
+      });
+      log("info", "figma-check", { slug: req.space.slug, verdict: d.verdict, reads: d.readsWith.kind, why: d.why });
+      return sendSafe(res, 200, {
+        verdict: d.verdict,
+        readsWith: { kind: d.readsWith.kind, account: d.readsWith.account },
+        fileName: d.fileName,
+        message: d.message,
+        why: d.why,
+      }, log);
+    } catch (err) {
+      // Our own failure is never a refusal: the order is accepted as before.
+      log("warn", "figma-check failed", { slug: req.space.slug, error: err.message });
+      return sendSafe(res, 200, { verdict: "unknown", readsWith: { kind: "none", account: null }, fileName: null, message: null, why: "check-failed" }, log);
     }
   });
 

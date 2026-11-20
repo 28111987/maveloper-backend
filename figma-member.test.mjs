@@ -23,7 +23,8 @@ import { readKey, sealToken, isSealed, openToken } from "./figma-credential-cryp
 import { resealAll } from "./figma-credential-reseal.js";
 import { createRequireSpaceAdmin } from "./figma-credential-routes.js";
 import { createFigmaPlatformTokenRoutes, readExpiryDate, accountRefusal, spaceState } from "./figma-platform-token.js";
-import { accountNameOf, figmaCannotOpenEither, plainReason, NO_SPACE_FIGMA } from "./order-words.js";
+import { accountNameOf, figmaCannotOpenEither, plainReason, NO_SPACE_FIGMA, NO_FIGMA_ACCOUNT } from "./order-words.js";
+import { checkFileAccess, decideFigmaAccess, refusedOne, refusedBoth, readsAsSpaceInstead, CHECK_URL, CHECK_TIMEOUT_MS } from "./figma-access-check.js";
 
 let pass = 0, fail = 0;
 async function t(name, fn) {
@@ -473,6 +474,180 @@ await t("K1 rows sealed with the previous key are re-sealed with the current one
   ok(openToken(row.access_token, KEY).token === ACC1 && openToken(row.refresh_token, KEY).token === REF1, "opens with the current key");
   const r2 = await resealAll({ db: makeDb({ org_figma_oauth: [], org_figma_credentials: [] }), env: { FIGMA_CRED_KEY: KEY_HEX, FIGMA_CRED_KEY_PREVIOUS: OLD_HEX } });
   ok(r2.ran && r2.member.tableAbsent === true, JSON.stringify(r2));
+});
+
+// -- C ------------------------------------------------------------------------
+// 20 NOV, THE OWNER: refuse a file at submission when the account the order
+// will read with cannot open it. Expected values are Figma's documented
+// answers for GET /v1/files/:key/meta (200 the file, 404 not found, 403 an
+// invalid token or a missing scope, 429 too many requests), never the code's.
+console.log("\nC  can my order open this file? (POST /me/figma-check)");
+const FILE = "AbCdEfGhIjKlMnOp";
+const answer = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+await t("C1 one call, to /v1/files/:key/meta, in the header the token's kind needs", async () => {
+  const seen = [];
+  const f = async (url, init) => { seen.push({ url: String(url), h: init.headers }); return answer(200, { file: { name: "Spring sale" } }); };
+  const a = await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: f });
+  const b = await checkFileAccess({ token: "figd_" + "x".repeat(30), fileKey: FILE, fetchImpl: f });
+  ok(seen.length === 2 && seen[0].url === "https://api.figma.com/v1/files/" + FILE + "/meta" && CHECK_URL(FILE) === seen[0].url, JSON.stringify(seen.map((x) => x.url)));
+  ok(seen[0].h.Authorization === "Bearer " + ACC1 && !seen[0].h["X-Figma-Token"], "OAuth token as Bearer");
+  ok(seen[1].h["X-Figma-Token"] && !seen[1].h.Authorization, "personal token as X-Figma-Token");
+  ok(a.verdict === "open" && a.fileName === "Spring sale" && b.verdict === "open", JSON.stringify(a));
+});
+await t("C2 only a definite refusal refuses: 404, and a 403 that is not about scope", async () => {
+  const v = async (status, body) => (await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: async () => answer(status, body) })).verdict;
+  ok((await v(404, { status: 404, err: "Not found" })) === "refused", "404");
+  ok((await v(403, { status: 403, err: "Forbidden" })) === "refused", "403 forbidden");
+  ok((await v(403, { status: 403, err: "Invalid scope(s): file_content:read. This endpoint requires the file_metadata:read scope" })) === "unknown", "403 scope");
+  ok((await v(429, { status: 429, err: "Rate limit exceeded" })) === "unknown", "429");
+  ok((await v(500, {})) === "unknown", "500");
+  ok((await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: async () => { throw new Error("ECONNRESET"); } })).verdict === "unknown", "no answer");
+  ok((await checkFileAccess({ token: null, fileKey: FILE, fetchImpl: async () => answer(200, {}) })).verdict === "unknown", "no token");
+});
+const ASK = (map) => async (tok) => map[tok] || { verdict: "unknown", why: "other" };
+const W = { mine: "dhruv@client.test", space: "design@mavlers.test", spaceKind: "space" };
+const NOACC = { space: NO_SPACE_FIGMA, none: NO_FIGMA_ACCOUNT };
+await t("C3 the decision follows the order path: blocked, own, read-again-as-space, refused", async () => {
+  const sp = { token: "S", source: "oauth" }, me = { token: "M" };
+  const d0 = await decideFigmaAccess({ refuseForSpace: true, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({}) });
+  ok(d0.verdict === "blocked" && d0.message === NO_SPACE_FIGMA, "figma_required with no space account");
+  const d1 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({ M: { verdict: "open", fileName: "F" } }) });
+  ok(d1.verdict === "open" && d1.readsWith.kind === "own" && d1.readsWith.account === W.mine && d1.message === null, JSON.stringify(d1));
+  const d2 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({ M: { verdict: "refused" }, S: { verdict: "open", fileName: "F" } }) });
+  ok(d2.verdict === "open" && d2.readsWith.kind === "space" && d2.message === readsAsSpaceInstead(W.mine, W.space), JSON.stringify(d2));
+  const d3 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({ M: { verdict: "refused" }, S: { verdict: "refused" } }) });
+  ok(d3.verdict === "refused" && d3.message === refusedBoth(W.mine, W.space), JSON.stringify(d3));
+  const d4 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: { token: "M", source: "oauth" }, memberCred: me, words: W, ask: ASK({ M: { verdict: "refused" } }) });
+  ok(d4.verdict === "refused" && d4.message === refusedOne(W.mine), "same token: no second account to try");
+  const d5 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: null, words: W, ask: ASK({ S: { verdict: "refused" } }) });
+  ok(d5.verdict === "refused" && d5.readsWith.kind === "space" && d5.message === refusedOne(W.space), JSON.stringify(d5));
+  const d6 = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: { token: null, source: "none" }, memberCred: null, words: W, ask: ASK({}) });
+  ok(d6.verdict === "blocked" && d6.message === NO_FIGMA_ACCOUNT, "no credential at all");
+});
+await t("C4 our own uncertainty never refuses: unknown on either account is unknown", async () => {
+  const sp = { token: "S", source: "oauth" }, me = { token: "M" };
+  const a = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({ M: { verdict: "unknown", why: "rate-limited" } }) });
+  const b = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: sp, memberCred: me, words: W, ask: ASK({ M: { verdict: "refused" }, S: { verdict: "unknown", why: "scope" } }) });
+  const c = await decideFigmaAccess({ refuseForSpace: false, noAccountWords: NOACC, spaceCred: { token: "G", source: "global" }, memberCred: null, words: { ...W, spaceKind: "mavlers" }, ask: ASK({ G: { verdict: "unknown", why: "scope" } }) });
+  ok(a.verdict === "unknown" && b.verdict === "unknown" && c.verdict === "unknown" && c.readsWith.kind === "mavlers", JSON.stringify([a, b, c]));
+});
+await t("C5 the sentences name the full account, say both ways out, and carry no dash", async () => {
+  const all = [refusedOne(W.space), refusedBoth(W.mine, W.space), refusedOne(null, { mavlers: true }), readsAsSpaceInstead(W.mine, W.space)];
+  // 17:04, the owner: connect first, then share; and the button is named as it reads.
+  ok(all[0] === "design@mavlers.test can't open this file. Connect the Figma account that owns it, or share the file with design@mavlers.test (Dev or Full seat).", all[0]);
+  ok(all.slice(0, 3).every((x) => x.indexOf("Connect the Figma account that owns it") > -1 && (x.indexOf("share") === -1 || x.indexOf("Connect the Figma account") < x.indexOf("share"))), "connect comes before share in every refusal");
+  ok(all[1].includes("dhruv@client.test") && all[1].includes("design@mavlers.test"), all[1]);
+  // 17:31, the owner: short. No refusal on Generate runs past two sentences or 200 characters (with two full addresses in it).
+  ok(all.every((x) => x.split(". ").length <= 2 && x.length <= 200), all.map((x) => x.length).join(","));
+  ok(!all.some((x) => /[\u2014\u2013]/.test(x)), "no em or en dash");
+});
+
+function checkWorld(extra = {}) {
+  return world({
+    org_figma_oauth: [{ org_id: ORG_A, access_token: seal(ACC2), refresh_token: seal(REF2), expires_at: future(), figma_email: "design@mavlers.test", figma_handle: "design", is_active: true, last_refresh_ok: true }],
+    ...extra,
+  });
+}
+// Figma, as a stub: which token may open the file.
+const figmaFiles = (opens, calls) => async (url, init) => {
+  const h = init && init.headers ? init.headers : {};
+  const tok = String(h.Authorization || "").replace(/^Bearer /, "") || h["X-Figma-Token"];
+  calls.push({ url: String(url), tok });
+  return opens.has(tok) ? answer(200, { file: { name: "Spring sale" } }) : answer(404, { status: 404, err: "Not found" });
+};
+const checkReq = (email, id, figmaUrl) => ({ user: { email, id }, params: { slug: "acme" }, body: { figmaUrl } });
+const LINK = "https://www.figma.com/design/" + FILE + "/Spring?node-id=1-2";
+await t("C6 the route: the space's account cannot open it -> refused, naming design@mavlers.test, no token in the body", async () => {
+  const calls = [];
+  const { app } = mount(checkWorld(), { fetchImpl: figmaFiles(new Set(), calls) });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.statusCode === 200 && r.body.verdict === "refused", JSON.stringify(r.body));
+  ok(r.body.readsWith.kind === "space" && r.body.readsWith.account === "design@mavlers.test", JSON.stringify(r.body.readsWith));
+  ok(r.body.message === refusedOne("design@mavlers.test"), r.body.message);
+  ok(calls.length === 1 && calls[0].tok === ACC2 && calls[0].url.endsWith("/v1/files/" + FILE + "/meta"), JSON.stringify(calls.map((c) => c.url)));
+  ok(!JSON.stringify(r.body).includes("figu_") && !JSON.stringify(r.body).includes("figur_"), "no token");
+});
+await t("C7 the route: my own account opens it -> open as mine; the space is never asked", async () => {
+  const calls = [];
+  const tables = checkWorld({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@acme.test", ACC1, REF1)] });
+  const { app } = mount(tables, { fetchImpl: figmaFiles(new Set([ACC1]), calls) });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.body.verdict === "open" && r.body.readsWith.kind === "own" && r.body.readsWith.account === "one+figma@acme.test" && r.body.fileName === "Spring sale", JSON.stringify(r.body));
+  ok(calls.length === 1 && calls[0].tok === ACC1, "asked once, with my account");
+});
+await t("C8 the route: my account refused, the space's opens -> open, and it says the order reads as the space", async () => {
+  const calls = [];
+  const tables = checkWorld({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@acme.test", ACC1, REF1)] });
+  const { app } = mount(tables, { fetchImpl: figmaFiles(new Set([ACC2]), calls) });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.body.verdict === "open" && r.body.readsWith.account === "design@mavlers.test" && /can't open this file, so design@mavlers\.test will read it/.test(r.body.message || ""), JSON.stringify(r.body));
+  ok(calls.map((c) => c.tok).join(",") === ACC1 + "," + ACC2, "mine, then the space's");
+});
+await t("C9 the route: a colleague's own account is never asked for me", async () => {
+  const calls = [];
+  const tables = checkWorld({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U2, "two@acme.test", ACC1, REF1)] });
+  const { app } = mount(tables, { fetchImpl: figmaFiles(new Set([ACC1]), calls) });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.body.verdict === "refused" && calls.every((c) => c.tok !== ACC1), JSON.stringify(r.body));
+});
+await t("C10 the route: a space that must connect and has not -> blocked, without asking Figma", async () => {
+  const calls = [];
+  const { app } = mount(world({ org_figma_oauth: [] }), { fetchImpl: figmaFiles(new Set(), calls), env: { ...ENV, FIGMA_API_TOKEN: "figd_" + "g".repeat(30) } });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.body.verdict === "blocked" && r.body.message === NO_SPACE_FIGMA && calls.length === 0, JSON.stringify(r.body));
+});
+await t("C11 the route: an older space on Mavloper's token, whose token lacks the scope -> unknown, never refused", async () => {
+  const G = "figd_" + "g".repeat(30);
+  const f = async () => answer(403, { status: 403, err: "Invalid scope(s): file_content:read" });
+  const { app } = mount(world({ orgs: [{ ...SPACE, figma_required: false }], org_figma_oauth: [] }), { fetchImpl: f, env: { ...ENV, FIGMA_API_TOKEN: G } });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.body.verdict === "unknown" && r.body.why === "scope" && r.body.readsWith.kind === "mavlers" && !JSON.stringify(r.body).includes(G), JSON.stringify(r.body));
+});
+await t("C12 the route: who may ask, and what is not a Figma link", async () => {
+  const { app } = mount(checkWorld(), { fetchImpl: figmaFiles(new Set(), []) });
+  const out = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("stranger@else.test", U1, LINK));
+  ok(out.statusCode === 403, "no seat in the space: " + out.statusCode);
+  const bad = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, "https://example.com/x"));
+  ok(bad.statusCode === 400, "not a link: " + bad.statusCode);
+});
+await t("C13 the route: an open answer is cached per account and file; a refusal is asked again after 30 s", async () => {
+  const calls = [];
+  let clock = Date.now();
+  const tables = checkWorld({ [MEMBER_OAUTH_TABLE]: [memberRow(ORG_A, U1, "one@acme.test", ACC1, REF1)] });
+  const app = makeApp();
+  createFigmaMemberRoutes({ app, supabaseAdmin: makeDb(tables), requireAuth: passAuth, log: () => {}, env: ENV, fetchImpl: figmaFiles(new Set([ACC1]), calls), now: () => clock });
+  for (let i = 0; i < 3; i++) await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(calls.length === 1, "three checks of one file, one call: " + calls.length);
+  const calls2 = [];
+  const app2 = makeApp();
+  createFigmaMemberRoutes({ app: app2, supabaseAdmin: makeDb(checkWorld()), requireAuth: passAuth, log: () => {}, env: ENV, fetchImpl: figmaFiles(new Set(), calls2), now: () => clock });
+  await run(app2.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  await run(app2.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(calls2.length === 1, "refusal cached inside 30 s");
+  clock += 31 * 1000;
+  await run(app2.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(calls2.length === 2, "asked again after 30 s: " + calls2.length);
+});
+await t("C14 the route: our own failure answers unknown, never an error the console would read as a refusal", async () => {
+  const env = { ...ENV };
+  Object.defineProperty(env, "FIGMA_API_TOKEN", { get() { throw new Error("boom"); }, enumerable: true });
+  const app = makeApp();
+  createFigmaMemberRoutes({ app, supabaseAdmin: makeDb(world({ org_figma_oauth: [] })), requireAuth: passAuth, log: () => {}, env, fetchImpl: figmaFiles(new Set(), []) });
+  const r = await run(app.routes["post /os/spaces/:slug/me/figma-check"], checkReq("one@acme.test", U1, LINK));
+  ok(r.statusCode === 200 && r.body.verdict === "unknown" && r.body.why === "check-failed", JSON.stringify(r.body));
+});
+await t("C15 the failure sentence an order still gets says both ways out, and is passed through as ours", async () => {
+  const either = figmaCannotOpenEither("dhruv", "design");
+  ok(either.indexOf("Connect the Figma account that owns it on Generate") > -1 && either.indexOf("Connect") < either.indexOf("share the file with either"), either);
+  ok(plainReason("Figma fetch failed: " + either) === either);
+});
+
+await t("C16 never slower than 3 s: Figma that does not answer is unknown when the clock runs out", async () => {
+  ok(CHECK_TIMEOUT_MS === 3000, "timeout " + CHECK_TIMEOUT_MS);
+  const hang = (url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+  const t0 = Date.now();
+  const a = await checkFileAccess({ token: ACC1, fileKey: FILE, fetchImpl: hang, timeoutMs: 150 });
+  ok(a.verdict === "unknown" && a.why === "no-answer" && Date.now() - t0 < 1000, JSON.stringify(a));
 });
 
 // -- W ------------------------------------------------------------------------

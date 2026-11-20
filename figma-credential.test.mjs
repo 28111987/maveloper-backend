@@ -370,7 +370,11 @@ section("5b. THE OLD NO-OP CHECK, KEPT FOR THE FILES THAT ARE STILL UNMOUNTED");
   // without a token; figma-member.test.mjs builds its fixtures from them.
   // figma-platform-token.js reuses sendSafe and reads CREDENTIAL_TABLE to count
   // the spaces that would read with Mavloper's own token.
-  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs", "figma-member-routes.js", "figma-member.test.mjs", "figma-platform-token.js"]);
+  // ★ 20 NOV ADDS ONE, PAID FOR THE SAME WAY. figma-access-check.js (does the
+  // account an order will read with open this file, asked before the order is
+  // queued) reuses redactTokens so Figma's answer is cut before it is kept,
+  // and nothing else; the resolver is called from figma-member-routes.js.
+  const WIRED_BY_DESIGN = new Set(["server.js", "queue-runner.js", "figma-oauth.js", "figma-oauth-routes.js", "figma-oauth.test.mjs", "figma-member-routes.js", "figma-member.test.mjs", "figma-platform-token.js", "figma-access-check.js"]);
   const files = readdirSync(here).filter(f =>
     (f.endsWith(".js") || f.endsWith(".mjs")) && !f.startsWith("figma-credential") && !WIRED_BY_DESIGN.has(f));
   const importers = files.filter(f => {

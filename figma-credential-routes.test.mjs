@@ -980,10 +980,12 @@ await ta("7a2 figma-credential-routes is reached only by server.js (mounts it), 
   assert.ok(files.length > 10, "only " + files.length + " files scanned - the scan is not reaching the repo");
 });
 
-await ta("7a4 figma-member-routes.js reuses sendSafe only and does NOT mount a second copy of these routes", async () => {
+await ta("7a4 figma-member-routes.js reuses sendSafe and parseFigmaFileKey only and does NOT mount a second copy of these routes", async () => {
   const src = fs.readFileSync(new URL("./figma-member-routes.js", import.meta.url), "utf8");
   assert.ok(src.length > 0, "figma-member-routes.js could not be read - this check is vacuous");
-  assert.ok(/import \{ sendSafe \} from "\.\/figma-credential-routes\.js";/.test(src), "figma-member-routes.js no longer reuses sendSafe");
+  // 20 NOV: the pre-submit check reads the file key with the SAME parser the
+  // credential routes use, rather than a second regex for the same link.
+  assert.ok(/import \{ sendSafe, parseFigmaFileKey \} from "\.\/figma-credential-routes\.js";/.test(src), "figma-member-routes.js no longer reuses sendSafe and parseFigmaFileKey");
   assert.ok(!/createFigmaCredentialRoutes\(/.test(src), "figma-member-routes.js calls createFigmaCredentialRoutes(...)");
 });
 

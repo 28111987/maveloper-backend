@@ -86,27 +86,35 @@ export function accountNameOf(resolution) {
 }
 
 /**
+ * 20 NOV, THE OWNER: the failure said what was wrong and nothing a developer
+ * could do about it. Both refusals now end with the two ways out, connecting
+ * the account that owns the file FIRST (17:04, his order), then sharing the
+ * file with the account that was used. Generate now refuses such a link before
+ * it is queued (figma-access-check.js), so these sentences are the rare case
+ * the check could not see in advance. The failure email carries the same
+ * "Connect my Figma account" button.
+ */
+// 17:31, the owner: shorter and sharper. Connect first, then share, then resubmit.
+const CONNECT_OR_SHARE = "Connect the Figma account that owns it on Generate, or share the file with ";
+const SEAT_THEN = " (Dev or Full seat), then resubmit.";
+
+/**
  * The orderer had connected their OWN Figma account in this space and it could
  * not open the file, and neither could the space's account that was tried next.
  * Both are named (never an address), so the person knows which two to check.
  */
 export function figmaCannotOpenEither(memberName, spaceName) {
   return (
-    "Mavloper could not open this Figma file with your own connected Figma account (" +
-    String(memberName || "your own Figma account") +
-    ") or with this space's (" +
-    String(spaceName || "this space's Figma account") +
-    "). Make sure one of them can open the file: it needs a Dev or Full seat in the team that owns it."
+    "Mavloper could not open this Figma file with your account (" + String(memberName || "yours") +
+    ") or the space's (" + String(spaceName || "the space's") + "). " + CONNECT_OR_SHARE + "either" + SEAT_THEN
   );
 }
 
 /** T2: the Figma refusal, naming the account that was used. */
 export function figmaCannotOpen(accountName) {
-  return (
-    "Mavloper could not open this Figma file with the Figma account connected to this space (" +
-    String(accountName || "this space's Figma account") +
-    "). Make sure that account can open the file: it needs a Dev or Full seat in the team that owns it."
-  );
+  // The account's name in brackets: on a client's screen it is a handle or an
+  // address cut to its local part (accountNameOf), which reads as a word, not a name.
+  return "Mavloper could not open this Figma file with the Figma account (" + String(accountName || "this space's") + "). " + CONNECT_OR_SHARE + "that account" + SEAT_THEN;
 }
 
 /** K6 STOP. "(Admin)" for an Admin and for the platform owner alike, as the rule words it. */
@@ -138,7 +146,7 @@ export function istClock(d) {
 
 /** A space created after 19 NOV 2026 takes no orders until its own Figma account is connected. */
 export const NO_SPACE_FIGMA =
-  "This space has no Figma account connected yet. An Admin of the space connects one on the Admin page, then orders can be placed.";
+  "This space has no Figma account yet. An Admin connects one on the Admin page.";
 
 /** No Figma credential at all for this order. */
 export const NO_FIGMA_ACCOUNT =
@@ -155,6 +163,11 @@ const OURS_RE = [
   /The build ran longer than \d+ minutes and was stopped on our side\. Please resubmit\./,
   /Mavloper could not open this Figma file with the Figma account connected to this space \(.+?\)\. Make sure that account can open the file: it needs a Dev or Full seat in the team that owns it\./,
   /Mavloper could not open this Figma file with your own connected Figma account \(.+?\) or with this space's \(.+?\)\. Make sure one of them can open the file: it needs a Dev or Full seat in the team that owns it\./,
+  // 20 NOV 17:31 wording (short, connect first). Rows already written keep theirs and match above.
+  /Mavloper could not open this Figma file with the Figma account \(.+?\)\. Connect the Figma account that owns it on Generate, or share the file with that account \(Dev or Full seat\), then resubmit\./,
+  /Mavloper could not open this Figma file with your account \(.+?\) or the space's \(.+?\)\. Connect the Figma account that owns it on Generate, or share the file with either \(Dev or Full seat\), then resubmit\./,
+  // the 19 NOV wording of the no-account sentence, on rows already written
+  /This space has no Figma account connected yet\. An Admin of the space connects one on the Admin page, then orders can be placed\./,
   /Stopped by .+ \(Admin\)\.(?: A late result arrived at .+)?$/,
   /Cancelled by .+ before it started\. It never ran\.(?: A late result arrived at .+)?$/,
 ];
