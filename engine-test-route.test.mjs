@@ -83,7 +83,8 @@ eq("a routed order that cannot go fails before anything is sent", true,
   src.includes("if (engineRoute && engineRoute.error) throw new Error(engineRoute.error);"));
 eq("every health wait in the dispatch asks the same engine", 3, (src.match(/waitForEngineHealth\(requestId, engineBase\)/g) || []).length);
 eq("the order path reads ENGINE_TEST_ROUTE and passes the route", [true, true],
-  [src.includes("raw: process.env.ENGINE_TEST_ROUTE,"), src.includes("          engineRoute,\n        });")]);
+  // \r?\n: on a Windows checkout server.js has CRLF line endings (the 25 NOV run on the owner's machine).
+  [src.includes("raw: process.env.ENGINE_TEST_ROUTE,"), /\n {10}engineRoute,\r?\n {8}\}\);/.test(src)]);
 eq("an unrouted order's log line, pending entry and two delivery_meta writes gain no key", 4, (src.match(/\.\.\.\(engineTag \? \{ engine(Tag|Base) \} : \{\}\)/g) || []).length);
 eq("the health message for an unrouted order is unchanged", true,
   src.includes('`engine${engineTag ? " tag " + engineTag : ""} did not answer /health within'));
