@@ -65,6 +65,25 @@ export function readConcurrency(raw, dflt, min = 1, max = 32) {
  * @param {Function} [o.now]         clock, injectable
  * @returns {Promise<Object>} imageUrlMap { filename: directUrl } — MISSING KEY = FAILED FILE
  */
+/**
+ * ★ 25 NOV: WHY DROPBOX REFUSED. The SDK's DropboxResponseError carries the HTTP
+ * status and Dropbox's own body ({ error_summary, error }); the log kept only
+ * the generic message, so "em_spacer.gif refused twice with 409" on TEST25-0219
+ * had no reason. This returns the status and Dropbox's summary (or the body,
+ * shortened), never headers. An error without a body gives status and summary
+ * null, and the log line is otherwise unchanged.
+ */
+export function dropboxErrorDetail(err) {
+  const status = typeof err?.status === "number" ? err.status : null;
+  const body = err?.error;
+  let summary = null;
+  if (body && typeof body === "object") {
+    if (typeof body.error_summary === "string") summary = body.error_summary;
+    else { try { summary = JSON.stringify(body); } catch { summary = null; } }
+  } else if (typeof body === "string" && body) summary = body;
+  return { status, summary: summary ? summary.slice(0, 300) : null };
+}
+
 export async function uploadImagesWithConcurrency({
   images,
   folderPath,
@@ -102,6 +121,7 @@ export async function uploadImagesWithConcurrency({
       } catch (err) {
         logFn("warn", `Upload failed for ${img.filename}, queued for retry`, {
           error: err?.message || String(err),
+          ...dropboxErrorDetail(err),
         });
         failedIdx.push(i);
       }
@@ -132,7 +152,7 @@ export async function uploadImagesWithConcurrency({
         recovered++;
         logFn("info", `Retry succeeded for ${img.filename}`);
       } catch (retryErr) {
-        logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr?.message || String(retryErr) });
+        logFn("error", `Retry also failed for ${img.filename}`, { error: retryErr?.message || String(retryErr), ...dropboxErrorDetail(retryErr) });
       }
       await sleep(interRetryMs);
     }

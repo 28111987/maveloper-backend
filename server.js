@@ -13,6 +13,8 @@ import jwt from "jsonwebtoken";
 import { Agent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 import { createQueueRunner, engineUpdateLimits, isDrainAnswer, retryAfterSeconds, bridgeSecretConfig, bridgeSecretAccepts } from "./queue-runner.js";
 import { createSpacesRoutes, platformOwners } from "./spaces.js";
+// 25 NOV: one prefixed test order from a platform owner to a named engine revision (TOPAZ gate 9).
+import { decideEngineRoute, isPlatformOwnerById } from "./engine-test-route.js";
 import { createRouteDoors } from "./route-doors.js";
 import { createOrderActions } from "./order-actions.js";
 import { plainReason, figmaCannotOpen, figmaCannotOpenEither, figmaConnectionEnded, accountNameOf, NO_FIGMA_ACCOUNT, NO_SPACE_FIGMA, lateResultNote, lateResultDelivered, ENGINE_RESENT } from "./order-words.js";
@@ -2512,14 +2514,14 @@ async function mergeDeliveryMeta(jobId, patch) {
 }
 
 /** L3: wait until the engine answers /health, at most ENGINE_HEALTH_WAIT_MS. */
-async function waitForEngineHealth(requestId) {
+async function waitForEngineHealth(requestId, base = MAC_BRIDGE_URL) {
   const t0 = Date.now();
   let attempts = 0;
   while (Date.now() - t0 < ENGINE_HEALTH_WAIT_MS) {
     attempts++;
     const left = ENGINE_HEALTH_WAIT_MS - (Date.now() - t0);
     try {
-      const r = await fetch(`${MAC_BRIDGE_URL}/health`, {
+      const r = await fetch(`${base}/health`, {
         method: "GET",
         headers: { "ngrok-skip-browser-warning": "true" },
         signal: AbortSignal.timeout(Math.max(1000, Math.min(20000, left))),
@@ -2535,8 +2537,11 @@ async function waitForEngineHealth(requestId) {
 /** L1: does the engine still hold this job? Only an explicit { known: false } is "unknown". */
 async function probeEngineJob(bridgeJobId) {
   if (!MAC_BRIDGE_URL) return "unreachable";
+  // 25 NOV: a test order sent to an engine tag is asked about at that tag.
+  const pend = PENDING_BRIDGE_JOBS.get(bridgeJobId);
+  const base = (pend && pend.engineBase) || MAC_BRIDGE_URL;
   try {
-    const r = await fetch(`${MAC_BRIDGE_URL}/jobs/${encodeURIComponent(bridgeJobId)}`, {
+    const r = await fetch(`${base}/jobs/${encodeURIComponent(bridgeJobId)}`, {
       headers: { "X-Bridge-Secret": MAC_BRIDGE_SECRET, "ngrok-skip-browser-warning": "true" },
       signal: AbortSignal.timeout(10000),
     });
@@ -2595,20 +2600,27 @@ function mapEspPlatformToTarget(espPlatform) {
   return ESP_PLATFORM_TO_TARGET[key] || "plain_html";
 }
 
-async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink, engine, priorEngineStops }) {
+async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase64, model, requestId, maveloperJobId, espPlatform, figmaFileKey, figmaNodeId, figmaDesignWidth, figmaToken, figmaCredentialLine, orderId, jobStartedAt, log, assetSink, engine, priorEngineStops, engineRoute = null }) {
   if (!MAC_BRIDGE_URL) {
     throw new Error("MAC_BRIDGE_URL not configured â€” set it to the ngrok URL of your Mac bridge");
   }
+  // 25 NOV: where this order goes. The main engine unless engine-test-route.js
+  // routed an owner's prefixed test order to a revision tag; then the tag or
+  // nothing (fail closed, never the main engine).
+  if (engineRoute && engineRoute.error) throw new Error(engineRoute.error);
+  const engineBase = engineRoute && engineRoute.routed && engineRoute.base ? engineRoute.base : MAC_BRIDGE_URL;
+  const engineTag = engineRoute && engineRoute.routed && engineRoute.base ? engineRoute.tag : null;
+  const healthLate = () => `engine${engineTag ? " tag " + engineTag : ""} did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`;
   // RUN 17: a person stopped this order while it was being prepared. Nothing is sent.
   if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
     throw new Error("stopped by a person before dispatch");
   }
   // RUN 17 L3: the engine must be up before the one dispatch is sent.
   const tDispatch = Date.now();
-  const health = await waitForEngineHealth(requestId);
+  const health = await waitForEngineHealth(requestId, engineBase);
   if (!health.ok) {
     stage("dispatch", { ms: Date.now() - tDispatch, healthMs: health.ms, healthAttempts: health.attempts, sent: false, orderId, requestId });
-    throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+    throw new Error(healthLate());
   }
   if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
     throw new Error("stopped by a person before dispatch");
@@ -2740,7 +2752,8 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     requestId,
     maveloperJobId,
     bridgeJobId,
-    bridgeUrl: MAC_BRIDGE_URL,
+    bridgeUrl: engineBase,
+    ...(engineTag ? { engineTag } : {}),
     callbackUrl,
     specSections: designSpec?.sections?.length || 0,
     hasReference: !!referenceHtml,
@@ -2763,7 +2776,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
         reject(new Error(`Bridge did not call back within ${BRIDGE_JOB_MAX_WAIT_MS / 60000} minutes`));
       }
     }, BRIDGE_JOB_MAX_WAIT_MS);
-    PENDING_BRIDGE_JOBS.set(bridgeJobId, { resolve, reject, timer, requestId, maveloperJobId: maveloperJobId || null, startedAt: Date.now() });
+    PENDING_BRIDGE_JOBS.set(bridgeJobId, { resolve, reject, timer, requestId, maveloperJobId: maveloperJobId || null, startedAt: Date.now(), ...(engineTag ? { engineBase } : {}) });
   });
   // A stop that lands while this promise is unsettled rejects it; nobody awaits
   // it until the dispatch answers, so the rejection must not go unhandled.
@@ -2784,7 +2797,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   let drainResends = 0;
   for (;;) {
   try {
-    dispatchResp = await fetch(`${MAC_BRIDGE_URL}/generate`, {
+    dispatchResp = await fetch(`${engineBase}/generate`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2828,11 +2841,11 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     forgetPending();
     throw new Error("stopped by a person before dispatch");
   }
-  const drainHealth = await waitForEngineHealth(requestId);
+  const drainHealth = await waitForEngineHealth(requestId, engineBase);
   if (!drainHealth.ok) {
     forgetPending();
     stage("dispatch", { ms: Date.now() - tAttempt, healthMs: drainHealth.ms, healthAttempts: drainHealth.attempts, sent: false, drainResends, orderId, requestId });
-    throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+    throw new Error(healthLate());
   }
   if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
     forgetPending();
@@ -2863,7 +2876,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
   stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, postMs: Date.now() - tPost, sent: true, answered: true, orderId, bridgeJobId, requestId, ...(drainResends ? { drainResends } : {}) });
   stage("accepted", { ms: jobStartedAt ? Date.now() - jobStartedAt : Date.now() - tAttempt, sinceJobStart: Boolean(jobStartedAt), orderId, bridgeJobId, requestId });
   if (maveloperJobId) {
-    await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date(tPost).toISOString(), acceptedAt: new Date().toISOString(), orderId: orderId || null } });
+    await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date(tPost).toISOString(), acceptedAt: new Date().toISOString(), orderId: orderId || null, ...(engineTag ? { engineTag } : {}) } });
   }
 
   // Wait for /bridge-callback to settle this promise.
@@ -2885,10 +2898,10 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
       throw new Error("stopped by a person before dispatch");
     }
     tAttempt = Date.now();
-    attemptHealth = await waitForEngineHealth(requestId);
+    attemptHealth = await waitForEngineHealth(requestId, engineBase);
     if (!attemptHealth.ok) {
       stage("dispatch", { ms: Date.now() - tAttempt, healthMs: attemptHealth.ms, healthAttempts: attemptHealth.attempts, sent: false, orderId, requestId });
-      throw new Error(`engine did not answer /health within ${Math.round(ENGINE_HEALTH_WAIT_MS / 1000)} s; nothing was sent`);
+      throw new Error(healthLate());
     }
     if (maveloperJobId && STOPPED_JOBS.has(maveloperJobId)) {
       throw new Error("stopped by a person before dispatch");
@@ -2897,7 +2910,7 @@ async function callClaudeCodeBridge({ designSpec, referenceHtml, designImageBase
     payload.bridgeJobId = bridgeJobId;
     if (maveloperJobId && supabaseAdmin) {
       await updateJobStatus(maveloperJobId, { progress_message: ENGINE_RESENT, error_message: `__BRIDGE__:${bridgeJobId}` }, requestId);
-      await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date().toISOString(), orderId: orderId || null } });
+      await mergeDeliveryMeta(maveloperJobId, { bridge: { bridgeJobId, dispatchedAt: new Date().toISOString(), orderId: orderId || null, ...(engineTag ? { engineTag } : {}) } });
     }
     continue;
   }
@@ -3649,6 +3662,18 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
           ? previewBufferForStage2.toString("base64")
           : null;
 
+        // 25 NOV: an owner's prefixed test order goes to the engine tag named in
+        // ENGINE_TEST_ROUTE; every other order to the main engine, as before.
+        // The owner check runs only when the prefix matches.
+        const engineRoute = await decideEngineRoute({
+          raw: process.env.ENGINE_TEST_ROUTE,
+          mainUrl: MAC_BRIDGE_URL,
+          orderId,
+          isOwner: () => isPlatformOwnerById({ db: supabaseAdmin, envOwners: platformOwners(process.env), userId: ordererId, email: req.user ? req.user.email : null }),
+        });
+        if (engineRoute.routed) {
+          log(engineRoute.error ? "error" : "info", "Engine test route", { requestId: req.id, orderId, tag: engineRoute.tag, prefix: engineRoute.prefix, routed: Boolean(engineRoute.base), error: engineRoute.error || null });
+        }
         html_raw = await callClaudeCodeBridge({
           designSpec,
           referenceHtml: referenceHtml || null,
@@ -3681,6 +3706,7 @@ app.post("/generate-from-figma", generateLimiter, ...doors.generate, async (req,
           jobStartedAt: Number(req.body?._jobStartedAt) || null,
           log,
           assetSink: compilerAssetSink,
+          engineRoute,
         });
       } catch (err) {
         // A bridge failure ALWAYS returns this 502. There is no fallback engine
